@@ -5,7 +5,8 @@ import { existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import index from "./index.html";
 
-const PORT = Number(process.env.AMT_PORT ?? 4180);
+// 1776 — a local-first declaration of independence from cloud SaaS.
+const PORT = Number(process.env.AMT_PORT ?? 1776);
 
 function findWorkspace(): string {
   if (process.env.AMT_WORKSPACE) return resolve(process.env.AMT_WORKSPACE);

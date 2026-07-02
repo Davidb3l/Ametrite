@@ -40,7 +40,7 @@ amt search token
 amt backlinks AMT-1
 
 # 4. Web UI (requires Bun)
-bun run web                      # → http://localhost:4180
+bun run web                      # → http://localhost:1776 (local-first independence 🇺🇸)
 ```
 
 ## AI agents

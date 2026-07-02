@@ -80,5 +80,5 @@ amt decide --issue AMT-7 --title "Use SQLite as source of truth" --author $AMT_A
 ## Other surfaces
 
 - MCP server (15 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
-- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:4180.
+- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776.
 - Obsidian round-trip: `amt export <dir>` / `amt import <dir>`.
