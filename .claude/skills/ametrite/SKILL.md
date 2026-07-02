@@ -1,6 +1,6 @@
 ---
 name: ametrite
-description: Track work, knowledge, and decisions in an Ametrite workspace (local Linear+Obsidian for agents). Use when asked to create/claim/update issues, take project notes, record a decision, search the workspace, or run an agent work loop — or whenever a .ametrite/ directory exists and you are starting, finishing, or making a non-obvious choice about a piece of work.
+description: Set up and drive an Ametrite workspace (local Linear+Obsidian for agents) in ANY repo. Trigger on "ametrite this", "ametrite this repo/project", "set up ametrite", "track this in ametrite" — or any request to create/claim/update issues, take project notes, record a decision, search the workspace, or run an agent work loop — or whenever a .ametrite/ directory exists and you are starting, finishing, or making a non-obvious choice about a piece of work. Handles first-time setup automatically; the user should never need manual installation steps.
 ---
 
 # Ametrite — shared task board + knowledge base + decision log
@@ -10,13 +10,33 @@ issues, Obsidian-style wikilinked notes, and first-class decision records, all i
 one link graph. You interact through the `amt` CLI (single binary). Everything
 supports `--json` — always use it when you need to parse output.
 
-## Setup / discovery
+## "ametrite this" — zero-friction bootstrap (do this automatically)
 
-- Find the binary: `amt` on PATH, or `target/release/amt` / `target/debug/amt` in this repo.
-- A workspace is a `.ametrite/` directory, found by walking up from cwd (like `.git`).
-  If none exists and the user wants one: `amt init --name <project> --prefix AMT`.
-- Identify yourself: set `AMT_AGENT=<stable-name>` (e.g. `claude-main`) or pass `--agent`.
-  Attribution matters — humans read the activity log.
+When the user says "ametrite this" (or similar) in a repo, run the whole setup
+yourself — never hand the user a list of steps:
+
+1. **Find the binary**: try `amt --version`. If missing, look for
+   `target/release/amt` in a local Ametrite checkout, or
+   `git clone https://github.com/Davidb3l/Ametrite.git && cargo build --release`
+   (ask before cloning/building), then symlink it into a writable PATH dir
+   (e.g. `~/.bun/bin` or `~/.local/bin`): `ln -sf <path>/amt <pathdir>/amt`.
+2. **Init the workspace** (if no `.ametrite/` exists): from the repo root run
+   `amt init --name <repo-name> --prefix <PREFIX>` — derive PREFIX from the repo
+   name (short, uppercase, memorable: claude-app → CLAP; confirm with the user
+   only if ambiguous). Init is fully self-contained: `.ametrite/` git-ignores
+   itself, nothing else to configure.
+3. **Seed from context**: if the user described work in the conversation, create
+   the initial issues/notes for them immediately (with priorities and labels).
+4. Mention (don't do unasked): `claude mcp add ametrite -- amt mcp` for MCP, and
+   the web board via the Ametrite repo:
+   `AMT_WORKSPACE=$PWD bun run --cwd <ametrite-repo> web` → http://localhost:1776.
+
+After bootstrap, just start working — the sections below are the conventions.
+
+## Identity
+
+Set `AMT_AGENT=<stable-name>` (e.g. `claude-main`) or pass `--agent`/`--author`
+on every command. Attribution matters — humans read the activity log.
 
 ## Core commands
 
@@ -80,5 +100,6 @@ amt decide --issue AMT-7 --title "Use SQLite as source of truth" --author $AMT_A
 ## Other surfaces
 
 - MCP server (15 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
-- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776.
+- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776
+  (point at any workspace with `AMT_WORKSPACE=<repo-path>`).
 - Obsidian round-trip: `amt export <dir>` / `amt import <dir>`.

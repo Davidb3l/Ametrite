@@ -221,6 +221,9 @@ pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
         )));
     }
     std::fs::create_dir_all(&db_dir)?;
+    // Self-ignoring: git skips the whole directory without touching the
+    // host repo's .gitignore — `amt init` needs no follow-up steps.
+    std::fs::write(db_dir.join(".gitignore"), "*\n")?;
     let conn = Connection::open(&db_path)?;
     set_pragmas(&conn)?;
     conn.execute_batch(SCHEMA)?;

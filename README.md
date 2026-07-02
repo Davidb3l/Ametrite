@@ -29,7 +29,8 @@ Bun web app (Bun.serve, vanilla TS)        amt (single Rust binary)
 # 1. Build the engine (Rust 1.75+)
 cargo build --release            # → target/release/amt (put it on your PATH)
 
-# 2. Create a workspace in any directory
+# 2. Create a workspace in any directory (fully self-contained —
+#    .ametrite/ git-ignores itself, nothing else to configure)
 amt init --name my-project --prefix AMT
 
 # 3. Use it
