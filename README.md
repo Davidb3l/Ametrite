@@ -100,6 +100,35 @@ renews the lease. See [AGENTS.md](AGENTS.md) for loop etiquette.
   dangling links resolve automatically when the target is later created (`amt doctor` lists
   the ones that haven't).
 
+## How Ametrite relates to git branches
+
+The `.ametrite/` workspace is git-ignored and **branch-invariant**: switch branches, same
+board. This is a deliberate design position — "AMT-7 is in review" is a fact about your
+*work*, not about a code snapshot. If the board forked with every feature branch, agents on
+different branches would see different claim states and the single source of truth that
+makes multi-agent coordination possible would be gone. (Nobody wants a board that's four
+branches behind main; if a branch is *truly* divergent, it should be its own repo — and
+therefore its own workspace, which the registry and workspace switcher already handle.)
+
+Branch workflows are supported at the right layer instead:
+
+| You want | Use |
+|---|---|
+| Link work to code | Issue keys in branch names/commits; `amt branch AMT-7` + merge detection → auto status *(roadmap R5)* |
+| Branch the **plan**, not the code | `amt fork` — copy the workspace, run agents against the fork, diff, merge the winner *(roadmap W1)* |
+| Workspace state in version control | `amt export` → commit the markdown vault; branches/remotes carry snapshots; `amt import` restores *(roadmap W5)* |
+| A long-lived release line with its own backlog | Model it as a **project** (`release-2.x`), or a separate workspace if truly divergent |
+
+## Projects vs labels
+
+A **project** is a first-class document (`type: project`): a slug, a title, and a markdown
+body that holds the brief. Issues attach to exactly one via `--project`; agents can run
+project-scoped loops (`amt claim --project auth-revamp`); and because it's a document it's
+wikilinkable — `[[auth-revamp]]` from any note or decision — so its backlinks panel becomes
+a live index of everything touching the effort. **Labels** are cross-cutting adjectives
+(`bug`, `backend`, as many as you like). Rule of thumb: *project = what larger effort this
+belongs to (one); labels = what kind of thing it is (many).*
+
 ## v2 (planned)
 
 - Tauri desktop wrapper — one codebase → Windows/macOS/Linux installers
