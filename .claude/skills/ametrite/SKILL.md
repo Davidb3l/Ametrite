@@ -27,9 +27,10 @@ yourself — never hand the user a list of steps:
    itself, nothing else to configure.
 3. **Seed from context**: if the user described work in the conversation, create
    the initial issues/notes for them immediately (with priorities and labels).
-4. Mention (don't do unasked): `claude mcp add ametrite -- amt mcp` for MCP, and
-   the web board via the Ametrite repo:
-   `AMT_WORKSPACE=$PWD bun run --cwd <ametrite-repo> web` → http://localhost:1776.
+4. Mention (don't do unasked): `claude mcp add ametrite -- amt mcp` for MCP. The web
+   board serves EVERY registered workspace from one port — if it's already running,
+   the new workspace just appears in its sidebar (init auto-registers); otherwise:
+   `bun run --cwd <ametrite-repo> web` → http://localhost:1776.
 
 After bootstrap, just start working — the sections below are the conventions.
 
@@ -100,6 +101,6 @@ amt decide --issue AMT-7 --title "Use SQLite as source of truth" --author $AMT_A
 ## Other surfaces
 
 - MCP server (15 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
-- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776
-  (point at any workspace with `AMT_WORKSPACE=<repo-path>`).
+- Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776 —
+  one board serves every registered workspace (sidebar switcher; `amt ws list`).
 - Obsidian round-trip: `amt export <dir>` / `amt import <dir>`.

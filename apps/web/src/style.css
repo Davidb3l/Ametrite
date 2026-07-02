@@ -165,6 +165,17 @@ kbd {
   flex-shrink: 0;
 }
 .project-link.active { background: var(--raised); color: var(--text); }
+.ws-link.active { background: var(--violet-soft); color: var(--text); }
+.ws-count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 6px;
+}
 
 .side-foot {
   display: flex;

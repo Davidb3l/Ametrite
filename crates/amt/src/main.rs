@@ -1,6 +1,6 @@
 use amt::error::Result;
 use amt::model::*;
-use amt::{db, export, mcp, store};
+use amt::{db, export, mcp, registry, store};
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -127,6 +127,25 @@ enum Cmd {
     Import { dir: PathBuf },
     /// Run as an MCP stdio server (for Claude Code and other agents)
     Mcp,
+    /// Manage the global workspace registry (~/.ametrite/registry.json)
+    Ws {
+        #[command(subcommand)]
+        cmd: WsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+    /// Register a workspace (defaults: path = current workspace root, alias = its name)
+    Add {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// List registered workspaces
+    List,
+    /// Remove a workspace from the registry (does not delete anything on disk)
+    Remove { alias: String },
 }
 
 #[derive(Subcommand)]
@@ -352,6 +371,7 @@ fn run(cli: Cli) -> Result<()> {
                     .unwrap_or_else(|| "workspace".into())
             });
             let path = db::init(&dir, &name, &prefix)?;
+            registry::try_register(&amt::wikilink::slugify(&name), &dir);
             if cli.json {
                 print_json(&serde_json::json!({ "workspace": name, "db": path }));
             } else {
@@ -811,6 +831,54 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open_workspace(&cli.workspace)?;
             mcp::serve(conn)
         }
+        Cmd::Ws { ref cmd } => match cmd {
+            WsCmd::Add { path, alias } => {
+                let root = match path {
+                    Some(p) => p.clone(),
+                    None => {
+                        let cwd = std::env::current_dir()?;
+                        let db_path = db::find_workspace(&cwd).ok_or_else(|| {
+                            amt::error::msg(
+                                "no .ametrite workspace here — pass a path or run `amt init`",
+                            )
+                        })?;
+                        db_path.parent().unwrap().parent().unwrap().to_path_buf()
+                    }
+                };
+                let alias = alias.clone().unwrap_or_else(|| {
+                    amt::wikilink::slugify(
+                        &root
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "workspace".into()),
+                    )
+                });
+                registry::add(&alias, &root)?;
+                println!("registered '{alias}' → {}", root.display());
+                Ok(())
+            }
+            WsCmd::List => {
+                let map = registry::load()?;
+                if cli.json {
+                    print_json(&map);
+                } else if map.is_empty() {
+                    println!("no workspaces registered (amt ws add [path])");
+                } else {
+                    for (alias, root) in &map {
+                        println!("{alias:<20} {root}");
+                    }
+                }
+                Ok(())
+            }
+            WsCmd::Remove { alias } => {
+                if registry::remove(alias)? {
+                    println!("removed '{alias}'");
+                } else {
+                    println!("'{alias}' was not registered");
+                }
+                Ok(())
+            }
+        },
     }
 }
 

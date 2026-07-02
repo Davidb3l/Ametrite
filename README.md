@@ -42,6 +42,7 @@ amt backlinks AMT-1
 
 # 4. Web UI (requires Bun)
 bun run web                      # → http://localhost:1776 (local-first independence 🇺🇸)
+                                 #   one board, every registered workspace (amt ws list)
 ```
 
 ## AI agents

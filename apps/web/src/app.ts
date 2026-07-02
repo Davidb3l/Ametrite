@@ -23,6 +23,8 @@ const PRIORITIES = ["urgent", "high", "medium", "low", "none"];
 const main = document.getElementById("main")!;
 let projects: DocRef[] = [];
 let boardFilter: { project?: string } = {};
+let workspaces: any[] = [];
+let currentWs = localStorage.getItem("amt-ws") ?? "";
 
 // ---------- utilities ----------
 function esc(s: string): string {
@@ -45,6 +47,9 @@ function toast(msg: string) {
 }
 
 async function api(path: string, init?: RequestInit): Promise<any> {
+  if (currentWs) {
+    path += (path.includes("?") ? "&" : "?") + "ws=" + encodeURIComponent(currentWs);
+  }
   const res = await fetch(path, init);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -523,6 +528,23 @@ function renderSearch() {
 
 // ---------- sidebar data + live updates ----------
 async function loadSidebar() {
+  workspaces = await api("/api/workspaces").catch(() => []);
+  if (workspaces.length && !workspaces.some((w) => w.alias === currentWs)) {
+    currentWs = workspaces[0].alias;
+    localStorage.setItem("amt-ws", currentWs);
+  }
+  const wsList = document.getElementById("ws-list")!;
+  wsList.innerHTML = workspaces.map((w) => `
+    <a class="project-link ws-link ${w.alias === currentWs ? "active" : ""}" href="#/board" data-ws="${esc(w.alias)}">
+      <span class="dot"></span>${esc(w.name)}<span class="ws-count">${w.open_issues}</span>
+    </a>`).join("");
+  wsList.querySelectorAll(".ws-link").forEach((el) =>
+    el.addEventListener("click", () => {
+      currentWs = (el as HTMLElement).dataset.ws!;
+      localStorage.setItem("amt-ws", currentWs);
+      boardFilter = {};
+      loadSidebar().then(render);
+    }));
   const ws = await api("/api/workspace").catch(() => null);
   if (ws) document.getElementById("ws-name")!.textContent = ws.name;
   projects = await api("/api/projects").catch(() => []);
@@ -540,9 +562,13 @@ function connectSSE() {
   const dot = document.getElementById("live-dot")!;
   es.addEventListener("hello", () => dot.classList.add("on"));
   let timer: any;
-  es.addEventListener("change", () => {
+  es.addEventListener("change", (e) => {
+    const ws = JSON.parse((e as MessageEvent).data ?? "{}").ws;
     clearTimeout(timer);
-    timer = setTimeout(() => { loadSidebar(); render(); }, 150);
+    timer = setTimeout(() => {
+      loadSidebar();
+      if (!ws || ws === currentWs) render();
+    }, 150);
   });
   es.onerror = () => {
     dot.classList.remove("on");
