@@ -104,4 +104,4 @@ renews the lease. See [AGENTS.md](AGENTS.md) for loop etiquette.
 - Live Obsidian vault mirroring (two-way file sync)
 - Configurable workflows and statuses
 
-MIT licensed. See [PRD.md](PRD.md) for the roadmap tracker.
+MIT licensed. See [PRD.md](PRD.md) for the v1 build tracker and [ROADMAP.md](ROADMAP.md) for v1.5 (multi-workspace agents, context packs, dependencies, graph view).
