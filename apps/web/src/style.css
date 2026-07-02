@@ -346,6 +346,9 @@ select { appearance: none; padding-right: 22px; background-image: linear-gradien
   cursor: grab;
   position: relative;
   overflow: hidden;
+  /* flex children shrink below content size in a full column, and
+     overflow:hidden (for the glint sweep) would clip the meta row */
+  flex-shrink: 0;
   /* top edge catches the light, like a polished facet */
   box-shadow: inset 0 1px 0 rgba(236, 231, 244, 0.04);
   transition: border-color 0.12s, transform 0.12s, box-shadow 0.12s;
