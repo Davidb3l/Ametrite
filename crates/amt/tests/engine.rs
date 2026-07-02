@@ -110,20 +110,20 @@ fn claim_orders_by_priority_and_is_exclusive() {
     store::create_issue(&mut conn, new_issue("Low prio", "", "low")).unwrap();
     store::create_issue(&mut conn, new_issue("Urgent", "", "urgent")).unwrap();
 
-    let first = store::claim_next(&mut conn, "agent-a", None, None, 900)
+    let first = store::claim_next(&mut conn, "agent-a", None, None, 900, 0)
         .unwrap()
         .unwrap();
     assert_eq!(first.id, "AMT-2", "urgent should be claimed first");
     assert_eq!(first.status, "in_progress");
     assert_eq!(first.claimed_by.as_deref(), Some("agent-a"));
 
-    let second = store::claim_next(&mut conn, "agent-b", None, None, 900)
+    let second = store::claim_next(&mut conn, "agent-b", None, None, 900, 0)
         .unwrap()
         .unwrap();
     assert_eq!(second.id, "AMT-1");
 
     // nothing left
-    assert!(store::claim_next(&mut conn, "agent-c", None, None, 900)
+    assert!(store::claim_next(&mut conn, "agent-c", None, None, 900, 0)
         .unwrap()
         .is_none());
 
@@ -139,13 +139,13 @@ fn expired_lease_is_stealable() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Task", "", "none")).unwrap();
     // claim with a lease that is already expired
-    store::claim_next(&mut conn, "crashed-agent", None, None, -10)
+    store::claim_next(&mut conn, "crashed-agent", None, None, -10, 0)
         .unwrap()
         .unwrap();
     let report = store::doctor(&conn).unwrap();
     assert_eq!(report.stale_claims.len(), 1);
 
-    let stolen = store::claim_next(&mut conn, "agent-b", None, None, 900).unwrap();
+    let stolen = store::claim_next(&mut conn, "agent-b", None, None, 900, 0).unwrap();
     assert_eq!(stolen.unwrap().claimed_by.as_deref(), Some("agent-b"));
 }
 
@@ -153,7 +153,7 @@ fn expired_lease_is_stealable() {
 fn release_sets_status_and_clears_claim() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Task", "", "none")).unwrap();
-    store::claim_next(&mut conn, "agent-a", None, None, 900)
+    store::claim_next(&mut conn, "agent-a", None, None, 900, 0)
         .unwrap()
         .unwrap();
     let released = store::release_issue(
@@ -190,7 +190,7 @@ fn concurrent_claims_never_double_claim() {
             let mut conn = db::open(&path).unwrap();
             let mut claimed = Vec::new();
             while let Some(issue) =
-                store::claim_next(&mut conn, &format!("agent-{agent}"), None, None, 900).unwrap()
+                store::claim_next(&mut conn, &format!("agent-{agent}"), None, None, 900, 0).unwrap()
             {
                 claimed.push(issue.id);
             }
@@ -384,4 +384,39 @@ fn decisions_export_import_round_trip() {
     assert_eq!(d.resolves, "AMT-1");
     assert_eq!(d.status, "accepted");
     assert_eq!(d.body.as_deref(), Some("Zero deps."));
+}
+
+#[test]
+fn requeue_cooldown_blocks_self_but_not_others() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Scope me", "", "high")).unwrap();
+
+    store::claim_next(&mut conn, "agent-a", None, None, 900, 3600)
+        .unwrap()
+        .unwrap();
+    store::release_issue(&mut conn, "AMT-1", "agent-a", "todo", None).unwrap();
+
+    // agent-a is in cooldown for its own released issue…
+    assert!(
+        store::claim_next(&mut conn, "agent-a", None, None, 900, 3600)
+            .unwrap()
+            .is_none(),
+        "agent must not be re-served the issue it just released"
+    );
+    // …but agent-b gets it immediately…
+    let by_b = store::claim_next(&mut conn, "agent-b", None, None, 900, 3600)
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_b.id, "AMT-1");
+    store::release_issue(&mut conn, "AMT-1", "agent-b", "todo", None).unwrap();
+
+    // …and cooldown 0 disables the guard entirely.
+    let again = store::claim_next(&mut conn, "agent-b", None, None, 900, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.id, "AMT-1");
+    // explicit claim of a specific issue always bypasses cooldown
+    store::release_issue(&mut conn, "AMT-1", "agent-b", "todo", None).unwrap();
+    let explicit = store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
+    assert_eq!(explicit.claimed_by.as_deref(), Some("agent-b"));
 }

@@ -472,6 +472,7 @@ pub fn claim_next(
     project: Option<&str>,
     label: Option<&str>,
     ttl_secs: i64,
+    cooldown_secs: i64,
 ) -> Result<Option<Issue>> {
     let tx = immediate(conn)?;
     let now = db::now(&tx)?;
@@ -481,6 +482,17 @@ pub fn claim_next(
                     AND i.status NOT IN ('done','canceled')))"
         .to_string();
     let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(now.clone())];
+    if cooldown_secs > 0 {
+        // Requeue cooldown: don't re-serve an issue to the agent that just
+        // released it (dogfooding finding — a scoping loop was re-claiming
+        // its own issue forever). `claim --issue KEY` bypasses this.
+        sql.push_str(
+            " AND (i.last_released_by IS NULL OR i.last_released_by != ?
+                   OR i.last_released_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' seconds'))",
+        );
+        args.push(Box::new(agent.to_string()));
+        args.push(Box::new(cooldown_secs));
+    }
     if let Some(p) = project {
         sql.push_str(" AND i.project = ?");
         args.push(Box::new(p.to_string()));
@@ -588,8 +600,10 @@ pub fn release_issue(
     }
     let doc_id = doc_id_of(&tx, &issue.id)?;
     tx.execute(
-        "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL, status = ?1 WHERE doc_id = ?2",
-        params![status, doc_id],
+        "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL, status = ?1,
+            last_released_by = ?2, last_released_at = ?3
+         WHERE doc_id = ?4",
+        params![status, agent, now, doc_id],
     )?;
     if let Some(c) = comment {
         append_activity(&tx, doc_id, agent, "comment", c)?;

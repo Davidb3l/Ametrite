@@ -45,11 +45,16 @@ Rules:
 
 1. Read the issue fully (`amt issue show`) and follow its backlinks before starting.
 2. Renew a long-running lease: `amt claim --issue AMT-7 --agent $AMT_AGENT` (same command re-claims = heartbeat).
-3. Comment when you learn something or change direction — comments are shared memory between agents.
+3. Comment when you learn something or change direction — comments are shared memory
+   between agents. Don't post a separate "done" comment: the release `-m` message below
+   IS your closing comment (posting both duplicates the activity log).
 4. Put durable knowledge in **notes**, and always wikilink: mention `[[AMT-7]]` in the note body so the graph connects work ↔ knowledge.
 5. Release when done: `amt release AMT-7 --agent $AMT_AGENT --status in_review -m "what I did"`.
    Use `in_review` unless you actually verified the work end-to-end (then `done`).
 6. Never touch issues claimed by other agents. If you find new work, create a new issue.
+7. Requeue cooldown: `claim` will not re-serve you an issue you released within the last
+   hour (`--cooldown`, default 3600s), so release-to-todo loops move on to fresh work.
+   `{"claimed": false}` may just mean everything left is your own recent work.
 
 ## Decisions (important — this is the workspace's memory of "why")
 
@@ -57,7 +62,7 @@ Whenever a non-obvious choice is made — architecture, tradeoff, scope cut, rej
 alternative — record it against the issue it resolves:
 
 ```sh
-amt decide --issue AMT-7 --title "Use SQLite as source of truth" -b "## Context
+amt decide --issue AMT-7 --title "Use SQLite as source of truth" --author $AMT_AGENT -b "## Context
 ...
 ## Decision
 ...

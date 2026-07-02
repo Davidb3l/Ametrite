@@ -54,6 +54,9 @@ enum Cmd {
         /// Lease TTL in seconds
         #[arg(long, default_value_t = 900)]
         ttl: i64,
+        /// Seconds before an issue you released can be re-served to you (0 disables)
+        #[arg(long, default_value_t = 3600)]
+        cooldown: i64,
     },
     /// Release a claimed issue with a final status
     Release {
@@ -81,6 +84,9 @@ enum Cmd {
         /// Mark an earlier decision as superseded by this one
         #[arg(long)]
         supersedes: Option<String>,
+        /// Author (default: $AMT_AGENT or $USER)
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Browse recorded decisions
     Decision {
@@ -481,14 +487,20 @@ fn run(cli: Cli) -> Result<()> {
             project,
             label,
             ttl,
+            cooldown,
         } => {
             let mut conn = open_workspace(&cli.workspace)?;
             let agent = identity(agent);
             let claimed = match issue {
                 Some(key) => Some(store::claim_issue(&mut conn, &key, &agent, ttl)?),
-                None => {
-                    store::claim_next(&mut conn, &agent, project.as_deref(), label.as_deref(), ttl)?
-                }
+                None => store::claim_next(
+                    &mut conn,
+                    &agent,
+                    project.as_deref(),
+                    label.as_deref(),
+                    ttl,
+                    cooldown,
+                )?,
             };
             match claimed {
                 Some(i) => {
@@ -535,6 +547,7 @@ fn run(cli: Cli) -> Result<()> {
             body,
             status,
             supersedes,
+            author,
         } => {
             let mut conn = open_workspace(&cli.workspace)?;
             let decision = store::record_decision(
@@ -545,7 +558,7 @@ fn run(cli: Cli) -> Result<()> {
                     resolves: issue,
                     status,
                     supersedes,
-                    author: identity(None),
+                    author: identity(author),
                 },
             )?;
             if cli.json {

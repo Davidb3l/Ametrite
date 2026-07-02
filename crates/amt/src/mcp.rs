@@ -179,12 +179,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
         "claim_next_issue" => {
             let agent = agent_of(&args);
             let ttl = opt_i(&args, "ttl_seconds").unwrap_or(900);
+            let cooldown = opt_i(&args, "cooldown_seconds").unwrap_or(3600);
             let claimed = run!(store::claim_next(
                 conn,
                 &agent,
                 opt_s(&args, "project").as_deref(),
                 opt_s(&args, "label").as_deref(),
-                ttl
+                ttl,
+                cooldown
             ));
             match claimed {
                 Some(issue) => text_result(id, &issue),
@@ -349,7 +351,8 @@ fn tool_defs() -> Vec<Value> {
         tool("claim_next_issue", "Atomically claim the highest-priority claimable issue (todo/backlog, unclaimed or expired lease). Sets status to in_progress with a lease. Race-free across agents.",
             json!({ "agent": s("Your agent name (required for meaningful attribution)"),
                     "project": s("Only from this project"), "label": s("Only with this label"),
-                    "ttl_seconds": i("Lease duration, default 900. Re-claim to renew before it expires.") }),
+                    "ttl_seconds": i("Lease duration, default 900. Re-claim to renew before it expires."),
+                    "cooldown_seconds": i("Won't re-serve an issue you released within this window (default 3600; 0 disables)") }),
             &["agent"]),
         tool("claim_issue", "Claim a specific issue, or renew your existing lease (heartbeat).",
             json!({ "id": s("Issue key"), "agent": s("Your agent name"), "ttl_seconds": i("Lease duration, default 900") }),

@@ -2,7 +2,7 @@ use crate::error::{msg, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 pub const DB_DIR: &str = ".ametrite";
 pub const DB_FILE: &str = "ametrite.db";
 
@@ -29,7 +29,9 @@ CREATE TABLE issues (
   parent_id        TEXT,
   due              TEXT,
   claimed_by       TEXT,
-  claim_expires_at TEXT
+  claim_expires_at TEXT,
+  last_released_by TEXT,
+  last_released_at TEXT
 );
 CREATE INDEX idx_issues_status   ON issues(status);
 CREATE INDEX idx_issues_assignee ON issues(assignee);
@@ -131,6 +133,15 @@ CREATE INDEX idx_decisions_resolves ON decisions(resolves);
 UPDATE meta SET value = '2' WHERE key = 'schema_version';
 "#;
 
+/// v2 -> v3: track who last released an issue so `claim` can apply a
+/// same-agent requeue cooldown (found dogfooding: a scoping loop that
+/// releases to todo was immediately re-served its own issue).
+const MIGRATE_V2_V3: &str = r#"
+ALTER TABLE issues ADD COLUMN last_released_by TEXT;
+ALTER TABLE issues ADD COLUMN last_released_at TEXT;
+UPDATE meta SET value = '3' WHERE key = 'schema_version';
+"#;
+
 /// Walk up from `start` looking for `.ametrite/ametrite.db`.
 pub fn find_workspace(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
@@ -191,6 +202,7 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
                 conn.pragma_update(None, "foreign_keys", "ON")?;
                 result?;
             }
+            2 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V2_V3}COMMIT;"))?,
             v => return Err(msg(format!("no migration path from schema v{v}"))),
         }
         version += 1;

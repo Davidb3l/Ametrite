@@ -28,7 +28,10 @@ This workspace is shared between humans and AI agents. Follow this etiquette.
    Changed your mind? Don't edit: record a new decision with `supersedes`. Check
    `list_decisions` before making a call others may have already made.
 6. **Release**: `release_issue` with a final status — `in_review` if a human should look,
-   `done` if verified — and a closing comment describing what you did.
+   `done` if verified — and a closing comment describing what you did (this IS your
+   summary comment; don't post a duplicate one).
+7. **Cooldown**: `claim_next_issue` won't re-serve you an issue you released within the
+   last hour, so loops that release to `todo` naturally move on to fresh work.
 
 ## Rules
 
