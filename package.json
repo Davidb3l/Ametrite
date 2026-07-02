@@ -1,0 +1,9 @@
+{
+  "name": "ametrite",
+  "private": true,
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "web": "bun run apps/web/server.ts",
+    "test": "bun test"
+  }
+}

@@ -1,0 +1,8 @@
+target/
+node_modules/
+.ametrite/
+*.db
+*.db-wal
+*.db-shm
+dist/
+.DS_Store
