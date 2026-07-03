@@ -119,32 +119,50 @@ pub fn for_each_workspace<T>(
     Ok(out)
 }
 
+/// Cross-workspace peek (R1 + AMT-13 `--peek`): the single best claimable
+/// issue across every registered workspace, without taking a lease. Returns
+/// `(alias, issue)` sorted by priority then age, or None if nothing is
+/// claimable anywhere.
+pub fn peek_any_workspace(
+    agent: &str,
+    cooldown_secs: i64,
+    f: &store::ClaimFilter<'_>,
+) -> Result<Option<(String, Issue)>> {
+    let mut best: Option<(String, Issue)> = None;
+    for (alias, root) in load()? {
+        let Ok(conn) = db::open(&db_path(&root)) else {
+            continue;
+        };
+        if let Some(issue) = store::peek_next(&conn, agent, cooldown_secs, f)? {
+            if best.as_ref().is_none_or(|(_, b)| beats(&issue, b)) {
+                best = Some((alias, issue));
+            }
+        }
+    }
+    Ok(best)
+}
+
 /// Cross-workspace claim (R1): peek the best claimable issue in every
 /// registered workspace, sort candidates globally by priority then age, then
 /// claim the winner — falling through to the next candidate if a race loses
 /// it. Returns `(alias, issue)`. Federated per-workspace DBs, per [[D-1]].
 pub fn claim_any_workspace(
     agent: &str,
-    project: Option<&str>,
-    label: Option<&str>,
     ttl_secs: i64,
     cooldown_secs: i64,
+    f: &store::ClaimFilter<'_>,
 ) -> Result<Option<(String, Issue)>> {
-    // (alias, root, best-claimable-candidate) for every workspace with work.
-    let mut candidates: Vec<(String, String, store::PeekCandidate)> = Vec::new();
+    // (alias, root, best-claimable candidate issue) for every workspace with work.
+    let mut candidates: Vec<(String, String, Issue)> = Vec::new();
     for (alias, root) in load()? {
         let Ok(conn) = db::open(&db_path(&root)) else {
             continue;
         };
-        if let Some(cand) = store::peek_next(&conn, agent, project, label, cooldown_secs)? {
-            candidates.push((alias, root, cand));
+        if let Some(issue) = store::peek_next(&conn, agent, cooldown_secs, f)? {
+            candidates.push((alias, root, issue));
         }
     }
-    candidates.sort_by(|a, b| {
-        priority_rank(&a.2.priority)
-            .cmp(&priority_rank(&b.2.priority))
-            .then_with(|| a.2.created_at.cmp(&b.2.created_at))
-    });
+    candidates.sort_by(|a, b| order_key(&a.2).cmp(&order_key(&b.2)));
     for (alias, root, cand) in candidates {
         // Tolerate a workspace that went unreachable between peek and claim —
         // fall through to the next candidate rather than failing the claim
@@ -152,17 +170,22 @@ pub fn claim_any_workspace(
         let Ok(mut conn) = db::open(&db_path(&root)) else {
             continue;
         };
-        if let Some(issue) = store::claim_key_guarded(
-            &mut conn,
-            &cand.key,
-            agent,
-            ttl_secs,
-            project,
-            label,
-            cooldown_secs,
-        )? {
+        if let Some(issue) =
+            store::claim_key_guarded(&mut conn, &cand.id, agent, ttl_secs, cooldown_secs, f)?
+        {
             return Ok(Some((alias, issue)));
         }
     }
     Ok(None)
+}
+
+/// Global claim ordering key: priority rank (0 = highest), then oldest first —
+/// matches the SQL `ORDER BY PRIORITY_RANK, created_at`.
+fn order_key(i: &Issue) -> (usize, &str) {
+    (priority_rank(&i.priority), &i.created_at)
+}
+
+/// True if `a` should be claimed before `b` in the global order.
+fn beats(a: &Issue, b: &Issue) -> bool {
+    order_key(a) < order_key(b)
 }

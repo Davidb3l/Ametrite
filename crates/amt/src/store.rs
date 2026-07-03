@@ -3,6 +3,7 @@ use crate::error::{msg, Result};
 use crate::model::*;
 use crate::wikilink;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior};
+use serde::Serialize;
 
 const PRIORITY_RANK: &str =
     "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
@@ -465,25 +466,50 @@ pub fn add_comment(conn: &mut Connection, id: &str, author: &str, body: &str) ->
     Ok(())
 }
 
-/// Atomically claim the best available issue. Returns None when nothing is claimable.
-/// Appends the shared "is this issue claimable by `agent` right now" WHERE
-/// body (no leading `WHERE`) used by `claim_next`, `peek_next`, and
-/// `claim_key_guarded`, pushing bind args in positional order. Uses bare `?`
-/// placeholders so it composes after any earlier bind (e.g. a `d.id = ?`).
+/// Filters that scope what an agent may claim: stage(s) (`--from`, for
+/// scoper→builder pipelines), project, and label. `None` fields mean "any".
+/// The same-agent requeue cooldown is applied separately (it needs the agent).
+#[derive(Default)]
+pub struct ClaimFilter<'a> {
+    /// Restrict claimable stages. `None`/empty = default (`CLAIMABLE_STATUSES`).
+    /// Values are validated by the caller against `CLAIMABLE_STATUSES`.
+    pub stages: Option<&'a [String]>,
+    pub project: Option<&'a str>,
+    pub label: Option<&'a str>,
+}
+
+impl ClaimFilter<'_> {
+    /// The default filter (any claimable stage, any project/label).
+    pub fn any() -> Self {
+        Self::default()
+    }
+}
+
+/// Emit the shared "is this issue claimable right now" predicate into `sql`
+/// (leading ` WHERE`), pushing binds into `args` in positional order via bare
+/// `?`. Every claim/peek/no-work path funnels through here, so "claimable" is
+/// defined in exactly one place.
 fn claimable_predicate(
-    now: &str,
-    agent: &str,
-    project: Option<&str>,
-    label: Option<&str>,
-    cooldown_secs: i64,
     sql: &mut String,
     args: &mut Vec<Box<dyn ToSql>>,
+    now: &str,
+    agent: &str,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
 ) {
-    sql.push_str(
-        "((i.status IN ('todo','backlog') AND i.claimed_by IS NULL)
-          OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?
-              AND i.status NOT IN ('done','canceled')))",
-    );
+    let stages: Vec<&str> = match f.stages {
+        Some(s) if !s.is_empty() => s.iter().map(|s| s.as_str()).collect(),
+        _ => CLAIMABLE_STATUSES.to_vec(),
+    };
+    let ph = vec!["?"; stages.len()].join(",");
+    sql.push_str(&format!(
+        " WHERE ((i.status IN ({ph}) AND i.claimed_by IS NULL)
+                OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?
+                    AND i.status NOT IN ('done','canceled')))"
+    ));
+    for s in &stages {
+        args.push(Box::new(s.to_string()));
+    }
     args.push(Box::new(now.to_string()));
     if cooldown_secs > 0 {
         // Requeue cooldown: don't re-serve an issue to the agent that just
@@ -496,11 +522,11 @@ fn claimable_predicate(
         args.push(Box::new(agent.to_string()));
         args.push(Box::new(cooldown_secs));
     }
-    if let Some(p) = project {
+    if let Some(p) = f.project {
         sql.push_str(" AND i.project = ?");
         args.push(Box::new(p.to_string()));
     }
-    if let Some(l) = label {
+    if let Some(l) = f.label {
         sql.push_str(
             " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
         );
@@ -508,29 +534,38 @@ fn claimable_predicate(
     }
 }
 
-pub fn claim_next(
-    conn: &mut Connection,
+/// The best claimable issue's key, in `claim_next`'s ordering, without taking a
+/// lease. Shared by `claim_next`, `peek_next`, and the cross-workspace fan-out.
+fn best_claimable_key(
+    conn: &Connection,
+    now: &str,
     agent: &str,
-    project: Option<&str>,
-    label: Option<&str>,
-    ttl_secs: i64,
     cooldown_secs: i64,
-) -> Result<Option<Issue>> {
-    let tx = immediate(conn)?;
-    let now = db::now(&tx)?;
-    let mut sql =
-        "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id WHERE ".to_string();
+    f: &ClaimFilter<'_>,
+) -> Result<Option<String>> {
+    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
+    claimable_predicate(&mut sql, &mut args, now, agent, cooldown_secs, f);
     sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT 1"));
-    let key: Option<String> = tx
+    Ok(conn
         .query_row(
             &sql,
             rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
             |r| r.get(0),
         )
-        .optional()?;
-    let Some(key) = key else {
+        .optional()?)
+}
+
+pub fn claim_next(
+    conn: &mut Connection,
+    agent: &str,
+    ttl_secs: i64,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
+) -> Result<Option<Issue>> {
+    let tx = immediate(conn)?;
+    let now = db::now(&tx)?;
+    let Some(key) = best_claimable_key(&tx, &now, agent, cooldown_secs, f)? else {
         return Ok(None);
     };
     do_claim(&tx, &key, agent, ttl_secs)?;
@@ -538,43 +573,20 @@ pub fn claim_next(
     Ok(Some(load_issue(conn, &key, true)?))
 }
 
-/// The best claimable issue in this workspace, without claiming it — the
-/// read-only half of a cross-workspace claim. The caller peeks every
-/// workspace, sorts candidates globally by priority then age, and only then
-/// runs `claim_key_guarded` against the winner.
-pub struct PeekCandidate {
-    pub key: String,
-    pub priority: String,
-    pub created_at: String,
-}
-
+/// Read-only: report the best claimable issue WITHOUT taking a lease or writing
+/// any activity (`claim --peek`). Returns the full issue, or None when nothing
+/// is claimable. The cross-workspace fan-out sorts these by priority then age.
 pub fn peek_next(
     conn: &Connection,
     agent: &str,
-    project: Option<&str>,
-    label: Option<&str>,
     cooldown_secs: i64,
-) -> Result<Option<PeekCandidate>> {
+    f: &ClaimFilter<'_>,
+) -> Result<Option<Issue>> {
     let now = db::now(conn)?;
-    let mut sql = "SELECT d.id, i.priority, d.created_at FROM documents d
-         JOIN issues i ON i.doc_id = d.doc_id WHERE "
-        .to_string();
-    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
-    sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT 1"));
-    conn.query_row(
-        &sql,
-        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-        |r| {
-            Ok(PeekCandidate {
-                key: r.get(0)?,
-                priority: r.get(1)?,
-                created_at: r.get(2)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
+    let Some(key) = best_claimable_key(conn, &now, agent, cooldown_secs, f)? else {
+        return Ok(None);
+    };
+    Ok(Some(load_issue(conn, &key, false)?))
 }
 
 /// Claim `key` iff it *still* satisfies the claimable predicate. Returns
@@ -586,18 +598,16 @@ pub fn claim_key_guarded(
     key: &str,
     agent: &str,
     ttl_secs: i64,
-    project: Option<&str>,
-    label: Option<&str>,
     cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
 ) -> Result<Option<Issue>> {
     let tx = immediate(conn)?;
     let now = db::now(&tx)?;
-    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id
-         WHERE d.id = ? AND "
-        .to_string();
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(key.to_string())];
-    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
-    sql.push_str(" LIMIT 1");
+    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    claimable_predicate(&mut sql, &mut args, &now, agent, cooldown_secs, f);
+    sql.push_str(" AND d.id = ? LIMIT 1");
+    args.push(Box::new(key.to_string()));
     let found: Option<String> = tx
         .query_row(
             &sql,
@@ -611,6 +621,193 @@ pub fn claim_key_guarded(
     do_claim(&tx, &found, agent, ttl_secs)?;
     tx.commit()?;
     Ok(Some(load_issue(conn, &found, true)?))
+}
+
+/// Why nothing is claimable, with enough detail for an agent loop to decide
+/// whether to back off and for how long (structured `{claimed:false}`).
+#[derive(Debug, Serialize)]
+pub struct NoWork {
+    /// Human-readable one-liner.
+    pub reason: String,
+    pub counts: NoWorkCounts,
+    /// Seconds until the soonest cooldown/lease expiry that would make
+    /// something claimable, or null if nothing is ever coming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<i64>,
+}
+
+/// Candidate issues (matching stage + project + label, ignoring lease/cooldown)
+/// bucketed by *why* they are not claimable right now.
+#[derive(Debug, Serialize)]
+pub struct NoWorkCounts {
+    /// Held under an unexpired lease by some agent.
+    pub blocked_by_lease: i64,
+    /// Excluded only by this agent's requeue cooldown.
+    pub blocked_by_cooldown: i64,
+    /// Total candidates in a claimable stage (regardless of lease/cooldown).
+    pub candidates: i64,
+}
+
+/// Compute the structured no-work report. Called only when a claim/peek came
+/// back empty, so the extra reads are off the hot path.
+pub fn no_work_reason(
+    conn: &Connection,
+    agent: &str,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
+) -> Result<NoWork> {
+    let now = db::now(conn)?;
+    let stages: Vec<String> = match f.stages {
+        Some(s) if !s.is_empty() => s.to_vec(),
+        _ => CLAIMABLE_STATUSES.iter().map(|s| s.to_string()).collect(),
+    };
+    let ph = vec!["?"; stages.len()].join(",");
+
+    // Base scope: candidates for claiming ignoring lease and cooldown,
+    // mirroring the two arms of `claimable_predicate` — (a) in a claimable
+    // stage, or (b) currently leased in a non-terminal stage (claimable once
+    // the lease expires) — plus any project/label restriction.
+    let mut scope = format!(
+        "FROM documents d JOIN issues i ON i.doc_id = d.doc_id
+         WHERE ((i.status IN ({ph}))
+                OR (i.claimed_by IS NOT NULL AND i.status NOT IN ('done','canceled')))"
+    );
+    let mut scope_args: Vec<Box<dyn ToSql>> = stages
+        .iter()
+        .map(|s| Box::new(s.clone()) as Box<dyn ToSql>)
+        .collect();
+    if let Some(p) = f.project {
+        scope.push_str(" AND i.project = ?");
+        scope_args.push(Box::new(p.to_string()));
+    }
+    if let Some(l) = f.label {
+        scope.push_str(
+            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
+        );
+        scope_args.push(Box::new(l.to_string()));
+    }
+
+    let count = |extra: &str, extra_args: &[Box<dyn ToSql>]| -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) {scope}{extra}");
+        let mut all: Vec<&dyn ToSql> = scope_args.iter().map(|a| a.as_ref()).collect();
+        all.extend(extra_args.iter().map(|a| a.as_ref()));
+        Ok(conn.query_row(&sql, rusqlite::params_from_iter(all), |r| r.get(0))?)
+    };
+
+    let candidates = count("", &[])?;
+    let lease_args: Vec<Box<dyn ToSql>> = vec![Box::new(now.clone())];
+    let blocked_by_lease = count(
+        " AND i.claimed_by IS NOT NULL AND i.claim_expires_at >= ?",
+        &lease_args,
+    )?;
+    // Excluded only by *this agent's* cooldown: unclaimed (or expired lease),
+    // released by this agent, still inside the cooldown window.
+    let blocked_by_cooldown = if cooldown_secs > 0 {
+        let cd_args: Vec<Box<dyn ToSql>> = vec![
+            Box::new(now.clone()),
+            Box::new(agent.to_string()),
+            Box::new(cooldown_secs),
+        ];
+        count(
+            " AND (i.claimed_by IS NULL OR i.claim_expires_at < ?)
+              AND i.last_released_by = ?
+              AND i.last_released_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' seconds')",
+            &cd_args,
+        )?
+    } else {
+        0
+    };
+
+    let retry_after = soonest_retry(conn, &now, agent, cooldown_secs, &scope, &scope_args)?;
+
+    let reason = if candidates == 0 {
+        "no candidate issues in a claimable stage".to_string()
+    } else if blocked_by_lease > 0 && blocked_by_cooldown > 0 {
+        format!("{blocked_by_lease} held by active leases, {blocked_by_cooldown} in your cooldown")
+    } else if blocked_by_lease > 0 {
+        format!("{blocked_by_lease} candidate(s) held by active leases")
+    } else if blocked_by_cooldown > 0 {
+        format!("{blocked_by_cooldown} candidate(s) in your requeue cooldown")
+    } else {
+        "no claimable issues match".to_string()
+    };
+
+    Ok(NoWork {
+        reason,
+        counts: NoWorkCounts {
+            blocked_by_lease,
+            blocked_by_cooldown,
+            candidates,
+        },
+        retry_after,
+    })
+}
+
+/// Seconds until the soonest lease-expiry or cooldown-expiry within `scope`
+/// that would unblock a claim, or None if nothing is pending.
+fn soonest_retry(
+    conn: &Connection,
+    now: &str,
+    agent: &str,
+    cooldown_secs: i64,
+    scope: &str,
+    scope_args: &[Box<dyn ToSql>],
+) -> Result<Option<i64>> {
+    let lease_sql = format!(
+        "SELECT MIN(i.claim_expires_at) {scope}
+         AND i.claimed_by IS NOT NULL AND i.claim_expires_at >= ?"
+    );
+    let mut lease_args: Vec<&dyn ToSql> = scope_args.iter().map(|a| a.as_ref()).collect();
+    lease_args.push(&now);
+    let lease_at: Option<String> = conn
+        .query_row(&lease_sql, rusqlite::params_from_iter(lease_args), |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+
+    let cd_at: Option<String> = if cooldown_secs > 0 {
+        let cd_sql = format!(
+            "SELECT MIN(i.last_released_at) {scope}
+             AND (i.claimed_by IS NULL OR i.claim_expires_at < ?)
+             AND i.last_released_by = ?
+             AND i.last_released_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' seconds')"
+        );
+        let mut cd_args: Vec<&dyn ToSql> = scope_args.iter().map(|a| a.as_ref()).collect();
+        let agent_s = agent.to_string();
+        cd_args.push(&now);
+        cd_args.push(&agent_s);
+        cd_args.push(&cooldown_secs);
+        conn.query_row(&cd_sql, rusqlite::params_from_iter(cd_args), |r| r.get(0))
+            .optional()?
+            .flatten()
+    } else {
+        None
+    };
+
+    let mut best: Option<i64> = None;
+    if let Some(exp) = lease_at {
+        if let Some(secs) = secs_until(conn, now, &exp, 0)? {
+            best = Some(best.map_or(secs, |b: i64| b.min(secs)));
+        }
+    }
+    if let Some(rel) = cd_at {
+        if let Some(secs) = secs_until(conn, now, &rel, cooldown_secs)? {
+            best = Some(best.map_or(secs, |b: i64| b.min(secs)));
+        }
+    }
+    Ok(best)
+}
+
+/// Whole seconds from `now` until (`instant` + `offset_secs`), clamped at 0.
+/// Uses SQLite's julianday for the diff to avoid a time crate.
+fn secs_until(conn: &Connection, now: &str, instant: &str, offset_secs: i64) -> Result<Option<i64>> {
+    let secs: f64 = conn.query_row(
+        "SELECT (julianday(?1, '+' || ?2 || ' seconds') - julianday(?3)) * 86400.0",
+        params![instant, offset_secs, now],
+        |r| r.get(0),
+    )?;
+    Ok(Some(secs.ceil().max(0.0) as i64))
 }
 
 /// Claim (or renew, when already held by `agent`) a specific issue.

@@ -77,6 +77,15 @@ fn text_result(id: Value, payload: &impl serde::Serialize) -> Value {
     rpc_ok(id, json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
+/// Structured no-work result: the `NoWork` report plus `"claimed": false`.
+fn no_work_result(id: Value, nw: &store::NoWork) -> Value {
+    let mut v = serde_json::to_value(nw).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("claimed".into(), Value::Bool(false));
+    }
+    text_result(id, &v)
+}
+
 fn tool_error(id: Value, message: &str) -> Value {
     rpc_ok(
         id,
@@ -180,20 +189,76 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             let agent = agent_of(&args);
             let ttl = opt_i(&args, "ttl_seconds").unwrap_or(900);
             let cooldown = opt_i(&args, "cooldown_seconds").unwrap_or(3600);
-            let project = opt_s(&args, "project");
-            let label = opt_s(&args, "label");
-            if args
+            let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
+            let any_ws = args
                 .get("any_workspace")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                let won = run!(crate::registry::claim_any_workspace(
-                    &agent,
-                    project.as_deref(),
-                    label.as_deref(),
-                    ttl,
-                    cooldown
-                ));
+                .unwrap_or(false);
+            // Accept "stages": [..] or a comma-list "from": "todo,backlog".
+            let mut stages = strings(&args, "stages");
+            if stages.is_empty() {
+                if let Some(from) = opt_s(&args, "from") {
+                    stages = from
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            for s in &stages {
+                if !crate::model::CLAIMABLE_STATUSES.contains(&s.as_str()) {
+                    return tool_error(
+                        id,
+                        &format!(
+                            "invalid stage '{s}' (one of {:?})",
+                            crate::model::CLAIMABLE_STATUSES
+                        ),
+                    );
+                }
+            }
+            let project = opt_s(&args, "project");
+            let label = opt_s(&args, "label");
+            let filter = store::ClaimFilter {
+                stages: if stages.is_empty() {
+                    None
+                } else {
+                    Some(&stages)
+                },
+                project: project.as_deref(),
+                label: label.as_deref(),
+            };
+
+            if peek {
+                let peeked = if any_ws {
+                    run!(crate::registry::peek_any_workspace(&agent, cooldown, &filter))
+                        .map(|(ws, issue)| (Some(ws), issue))
+                } else {
+                    run!(store::peek_next(conn, &agent, cooldown, &filter)).map(|i| (None, i))
+                };
+                return match peeked {
+                    Some((ws, issue)) => {
+                        let mut v = serde_json::to_value(&issue).unwrap_or_else(|_| json!({}));
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("peek".into(), Value::Bool(true));
+                            if let Some(ws) = ws {
+                                obj.insert("workspace".into(), json!(ws));
+                            }
+                        }
+                        text_result(id, &v)
+                    }
+                    None if any_ws => text_result(
+                        id,
+                        &json!({ "claimed": false, "reason": "no claimable issues in any workspace" }),
+                    ),
+                    None => {
+                        let nw = run!(store::no_work_reason(conn, &agent, cooldown, &filter));
+                        no_work_result(id, &nw)
+                    }
+                };
+            }
+
+            if any_ws {
+                let won = run!(crate::registry::claim_any_workspace(&agent, ttl, cooldown, &filter));
                 return match won {
                     Some((ws, issue)) => {
                         let mut v = json!(issue);
@@ -206,20 +271,13 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                     ),
                 };
             }
-            let claimed = run!(store::claim_next(
-                conn,
-                &agent,
-                project.as_deref(),
-                label.as_deref(),
-                ttl,
-                cooldown
-            ));
-            match claimed {
+
+            match run!(store::claim_next(conn, &agent, ttl, cooldown, &filter)) {
                 Some(issue) => text_result(id, &issue),
-                None => text_result(
-                    id,
-                    &json!({ "claimed": false, "reason": "no claimable issues match" }),
-                ),
+                None => {
+                    let nw = run!(store::no_work_reason(conn, &agent, cooldown, &filter));
+                    no_work_result(id, &nw)
+                }
             }
         }
         "claim_issue" => {
@@ -414,12 +472,15 @@ fn tool_defs() -> Vec<Value> {
             &[]),
         tool("get_issue", "Get one issue with body, activity log, and backlinks.",
             json!({ "id": s("Issue key, e.g. AMT-7") }), &["id"]),
-        tool("claim_next_issue", "Atomically claim the highest-priority claimable issue (todo/backlog, unclaimed or expired lease). Sets status to in_progress with a lease. Race-free across agents.",
+        tool("claim_next_issue", "Atomically claim the highest-priority claimable issue (todo/backlog, unclaimed or expired lease). Sets status to in_progress with a lease. Race-free across agents. When nothing is claimable, returns {claimed:false} with a reason, counts, and retry_after.",
             json!({ "agent": s("Your agent name (required for meaningful attribution)"),
                     "project": s("Only from this project"), "label": s("Only with this label"),
+                    "peek": b("Report the best claimable issue WITHOUT taking a lease or writing activity; result has 'peek': true"),
+                    "stages": arr("Restrict claimable stages (subset of ['backlog','todo']); default both"),
+                    "from": s("Comma-list alternative to stages, e.g. 'todo,backlog'"),
                     "ttl_seconds": i("Lease duration, default 900. Re-claim to renew before it expires."),
                     "cooldown_seconds": i("Won't re-serve an issue you released within this window (default 3600; 0 disables)"),
-                    "any_workspace": b("Claim across every registered workspace, globally priority-first; the result includes a 'workspace' field") }),
+                    "any_workspace": b("Claim (or peek) across every registered workspace, globally priority-first; the result includes a 'workspace' field") }),
             &["agent"]),
         tool("claim_issue", "Claim a specific issue, or renew your existing lease (heartbeat).",
             json!({ "id": s("Issue key"), "agent": s("Your agent name"), "ttl_seconds": i("Lease duration, default 900") }),

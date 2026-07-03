@@ -115,20 +115,20 @@ fn claim_orders_by_priority_and_is_exclusive() {
     store::create_issue(&mut conn, new_issue("Low prio", "", "low")).unwrap();
     store::create_issue(&mut conn, new_issue("Urgent", "", "urgent")).unwrap();
 
-    let first = store::claim_next(&mut conn, "agent-a", None, None, 900, 0)
+    let first = store::claim_next(&mut conn, "agent-a", 900, 0, &any())
         .unwrap()
         .unwrap();
     assert_eq!(first.id, "AMT-2", "urgent should be claimed first");
     assert_eq!(first.status, "in_progress");
     assert_eq!(first.claimed_by.as_deref(), Some("agent-a"));
 
-    let second = store::claim_next(&mut conn, "agent-b", None, None, 900, 0)
+    let second = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
         .unwrap()
         .unwrap();
     assert_eq!(second.id, "AMT-1");
 
     // nothing left
-    assert!(store::claim_next(&mut conn, "agent-c", None, None, 900, 0)
+    assert!(store::claim_next(&mut conn, "agent-c", 900, 0, &any())
         .unwrap()
         .is_none());
 
@@ -144,13 +144,13 @@ fn expired_lease_is_stealable() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Task", "", "none")).unwrap();
     // claim with a lease that is already expired
-    store::claim_next(&mut conn, "crashed-agent", None, None, -10, 0)
+    store::claim_next(&mut conn, "crashed-agent", -10, 0, &any())
         .unwrap()
         .unwrap();
     let report = store::doctor(&conn).unwrap();
     assert_eq!(report.stale_claims.len(), 1);
 
-    let stolen = store::claim_next(&mut conn, "agent-b", None, None, 900, 0).unwrap();
+    let stolen = store::claim_next(&mut conn, "agent-b", 900, 0, &any()).unwrap();
     assert_eq!(stolen.unwrap().claimed_by.as_deref(), Some("agent-b"));
 }
 
@@ -158,7 +158,7 @@ fn expired_lease_is_stealable() {
 fn release_sets_status_and_clears_claim() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Task", "", "none")).unwrap();
-    store::claim_next(&mut conn, "agent-a", None, None, 900, 0)
+    store::claim_next(&mut conn, "agent-a", 900, 0, &any())
         .unwrap()
         .unwrap();
     let released = store::release_issue(
@@ -195,7 +195,7 @@ fn concurrent_claims_never_double_claim() {
             let mut conn = db::open(&path).unwrap();
             let mut claimed = Vec::new();
             while let Some(issue) =
-                store::claim_next(&mut conn, &format!("agent-{agent}"), None, None, 900, 0).unwrap()
+                store::claim_next(&mut conn, &format!("agent-{agent}"), 900, 0, &any()).unwrap()
             {
                 claimed.push(issue.id);
             }
@@ -398,17 +398,17 @@ fn peek_does_not_claim_then_guarded_claim_takes_it() {
     store::create_issue(&mut conn, new_issue("Urgent", "", "urgent")).unwrap();
 
     // peek returns the best candidate without mutating anything…
-    let cand = store::peek_next(&conn, "agent-a", None, None, 0)
+    let cand = store::peek_next(&conn, "agent-a", 0, &any())
         .unwrap()
         .unwrap();
-    assert_eq!(cand.key, "AMT-2");
+    assert_eq!(cand.id, "AMT-2");
     assert_eq!(cand.priority, "urgent");
     let still = store::get_issue(&conn, "AMT-2").unwrap();
     assert_eq!(still.status, "backlog", "peek must not claim");
     assert!(still.claimed_by.is_none());
 
     // …and the guarded claim then takes exactly that issue.
-    let got = store::claim_key_guarded(&mut conn, "AMT-2", "agent-a", 900, None, None, 0)
+    let got = store::claim_key_guarded(&mut conn, "AMT-2", "agent-a", 900, 0, &any())
         .unwrap()
         .unwrap();
     assert_eq!(got.id, "AMT-2");
@@ -420,10 +420,10 @@ fn guarded_claim_returns_none_when_raced_away() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
     // someone else claims it between our peek and our guarded claim
-    store::claim_next(&mut conn, "winner", None, None, 900, 0)
+    store::claim_next(&mut conn, "winner", 900, 0, &any())
         .unwrap()
         .unwrap();
-    let lost = store::claim_key_guarded(&mut conn, "AMT-1", "loser", 900, None, None, 0).unwrap();
+    let lost = store::claim_key_guarded(&mut conn, "AMT-1", "loser", 900, 0, &any()).unwrap();
     assert!(lost.is_none(), "guarded claim must yield to the live lease");
 }
 
@@ -451,7 +451,7 @@ fn cross_workspace_claim_drains_both_in_global_priority_order() {
     // idle polls) until both backlogs are drained, in global priority order.
     let mut order = Vec::new();
     while let Some((ws, issue)) =
-        registry::claim_any_workspace("solo", None, None, 900, 0).unwrap()
+        registry::claim_any_workspace("solo", 900, 0, &any()).unwrap()
     {
         order.push((ws, issue.id, issue.priority));
     }
@@ -527,27 +527,27 @@ fn requeue_cooldown_blocks_self_but_not_others() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("Scope me", "", "high")).unwrap();
 
-    store::claim_next(&mut conn, "agent-a", None, None, 900, 3600)
+    store::claim_next(&mut conn, "agent-a", 900, 3600, &any())
         .unwrap()
         .unwrap();
     store::release_issue(&mut conn, "AMT-1", "agent-a", "todo", None).unwrap();
 
     // agent-a is in cooldown for its own released issue…
     assert!(
-        store::claim_next(&mut conn, "agent-a", None, None, 900, 3600)
+        store::claim_next(&mut conn, "agent-a", 900, 3600, &any())
             .unwrap()
             .is_none(),
         "agent must not be re-served the issue it just released"
     );
     // …but agent-b gets it immediately…
-    let by_b = store::claim_next(&mut conn, "agent-b", None, None, 900, 3600)
+    let by_b = store::claim_next(&mut conn, "agent-b", 900, 3600, &any())
         .unwrap()
         .unwrap();
     assert_eq!(by_b.id, "AMT-1");
     store::release_issue(&mut conn, "AMT-1", "agent-b", "todo", None).unwrap();
 
     // …and cooldown 0 disables the guard entirely.
-    let again = store::claim_next(&mut conn, "agent-b", None, None, 900, 0)
+    let again = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
         .unwrap()
         .unwrap();
     assert_eq!(again.id, "AMT-1");
@@ -626,4 +626,128 @@ fn dedupe_soft_warns_but_still_creates_while_strict_refuses() {
     // verify the signal both handlers key off of is present.
     let strict_hit = store::find_similar_notes(&conn, "Release checklist").unwrap();
     assert!(!strict_hit.is_empty());
+}
+
+/// Default claim filter (any claimable stage, any project/label).
+fn any() -> store::ClaimFilter<'static> {
+    store::ClaimFilter::any()
+}
+
+#[test]
+fn peek_reports_best_without_claiming_or_writing_activity() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Low", "", "low")).unwrap();
+    store::create_issue(&mut conn, new_issue("Urgent", "", "urgent")).unwrap();
+
+    let peeked = store::peek_next(&conn, "agent-a", 0, &any())
+        .unwrap()
+        .unwrap();
+    // Same ordering as claim_next: urgent (AMT-2) wins.
+    assert_eq!(peeked.id, "AMT-2");
+    // Peek must NOT take a lease or change status.
+    assert!(peeked.claimed_by.is_none());
+    assert_eq!(peeked.status, "backlog");
+
+    // The issue is untouched on disk: still unclaimed, still backlog…
+    let fresh = store::get_issue(&conn, "AMT-2").unwrap();
+    assert!(fresh.claimed_by.is_none());
+    assert_eq!(fresh.status, "backlog");
+    // …and no claim activity was appended (only the "created" event exists).
+    assert_eq!(fresh.activity.len(), 1);
+    assert_eq!(fresh.activity[0].body, "created");
+
+    // A real claim still works afterward and yields the same winner.
+    let claimed = store::claim_next(&mut conn, "agent-a", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, "AMT-2");
+    assert_eq!(claimed.claimed_by.as_deref(), Some("agent-a"));
+}
+
+#[test]
+fn from_todo_skips_backlog_issues() {
+    let (_d, mut conn) = workspace();
+    // AMT-1 stays backlog; AMT-2 gets promoted to todo.
+    store::create_issue(&mut conn, new_issue("Backlog item", "", "urgent")).unwrap();
+    store::create_issue(&mut conn, new_issue("Todo item", "", "low")).unwrap();
+    store::update_issue(
+        &mut conn,
+        "AMT-2",
+        store::IssuePatch {
+            status: Some("todo".into()),
+            ..Default::default()
+        },
+        "test",
+    )
+    .unwrap();
+
+    let todo_only = ["todo".to_string()];
+    let filter = store::ClaimFilter {
+        stages: Some(&todo_only),
+        ..Default::default()
+    };
+
+    // Even though the backlog item is higher priority (urgent), --from todo
+    // serves only the todo item.
+    let peeked = store::peek_next(&conn, "agent-a", 0, &filter)
+        .unwrap()
+        .unwrap();
+    assert_eq!(peeked.id, "AMT-2");
+
+    let claimed = store::claim_next(&mut conn, "agent-a", 900, 0, &filter)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, "AMT-2");
+    store::release_issue(&mut conn, "AMT-2", "agent-a", "in_review", None).unwrap();
+
+    // With only the backlog item left, --from todo finds nothing…
+    assert!(store::claim_next(&mut conn, "agent-a", 900, 0, &filter)
+        .unwrap()
+        .is_none());
+    // …but the default (both stages) still serves the backlog item.
+    let by_default = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_default.id, "AMT-1");
+}
+
+#[test]
+fn no_work_counts_distinguish_lease_from_cooldown() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Leased", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Cooling", "", "high")).unwrap();
+
+    // AMT-1: held under a live lease by agent-b.
+    store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
+    // AMT-2: claimed then released to todo by agent-a → in agent-a's cooldown.
+    store::claim_issue(&mut conn, "AMT-2", "agent-a", 900).unwrap();
+    store::release_issue(&mut conn, "AMT-2", "agent-a", "todo", None).unwrap();
+
+    // agent-a can't claim: AMT-1 is leased, AMT-2 is in its own cooldown.
+    assert!(store::claim_next(&mut conn, "agent-a", 900, 3600, &any())
+        .unwrap()
+        .is_none());
+
+    let nw = store::no_work_reason(&conn, "agent-a", 3600, &any()).unwrap();
+    assert_eq!(nw.counts.candidates, 2);
+    assert_eq!(nw.counts.blocked_by_lease, 1);
+    assert_eq!(nw.counts.blocked_by_cooldown, 1);
+    // Something becomes claimable when the cooldown/lease expires → some retry.
+    let retry = nw.retry_after.expect("retry_after should be set");
+    assert!(retry > 0 && retry <= 3600, "retry_after was {retry}");
+
+    // From agent-b's perspective there is no cooldown, only the lease it holds.
+    let nw_b = store::no_work_reason(&conn, "agent-b", 3600, &any()).unwrap();
+    assert_eq!(nw_b.counts.blocked_by_cooldown, 0);
+}
+
+#[test]
+fn no_work_with_no_candidates_has_null_retry() {
+    let (_d, conn) = workspace();
+    // No issues at all.
+    let nw = store::no_work_reason(&conn, "agent-a", 3600, &any()).unwrap();
+    assert_eq!(nw.counts.candidates, 0);
+    assert_eq!(nw.counts.blocked_by_lease, 0);
+    assert_eq!(nw.counts.blocked_by_cooldown, 0);
+    assert!(nw.retry_after.is_none(), "nothing is ever coming");
 }

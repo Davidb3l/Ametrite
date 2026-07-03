@@ -51,13 +51,19 @@ enum Cmd {
         project: Option<String>,
         #[arg(long)]
         label: Option<String>,
+        /// Report the best claimable issue without taking a lease or writing activity
+        #[arg(long)]
+        peek: bool,
+        /// Restrict claimable stages (repeatable or comma-list): backlog, todo
+        #[arg(long = "from", value_delimiter = ',')]
+        from: Vec<String>,
         /// Lease TTL in seconds
         #[arg(long, default_value_t = 900)]
         ttl: i64,
         /// Seconds before an issue you released can be re-served to you (0 disables)
         #[arg(long, default_value_t = 3600)]
         cooldown: i64,
-        /// Claim across every registered workspace, globally priority-first
+        /// Claim (or peek) across every registered workspace, globally priority-first
         #[arg(long)]
         all_workspaces: bool,
     },
@@ -322,6 +328,43 @@ fn issue_with_workspace(i: &Issue, workspace: &str) -> Result<serde_json::Value>
     Ok(v)
 }
 
+/// Render a `claim --peek` result: the issue plus `"peek": true`, optionally
+/// tagged with the workspace it came from.
+fn print_peek(json: bool, i: &Issue, workspace: Option<&str>) {
+    if json {
+        let mut v = serde_json::to_value(i).expect("serialize");
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("peek".into(), serde_json::Value::Bool(true));
+            if let Some(ws) = workspace {
+                obj.insert("workspace".into(), serde_json::json!(ws));
+            }
+        }
+        print_json(&v);
+    } else {
+        match workspace {
+            Some(ws) => println!("peekable [{ws}] {}", issue_line(i)),
+            None => println!("peekable {}", issue_line(i)),
+        }
+    }
+}
+
+/// Render the structured no-work result (reason + counts + retry_after).
+fn print_no_work(json: bool, nw: &store::NoWork) {
+    if json {
+        let mut v = serde_json::to_value(nw).expect("serialize");
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("claimed".into(), serde_json::Value::Bool(false));
+        }
+        print_json(&v);
+    } else {
+        print!("nothing claimable: {}", nw.reason);
+        match nw.retry_after {
+            Some(s) => println!(" (retry after {s}s)"),
+            None => println!(),
+        }
+    }
+}
+
 fn issue_line(i: &Issue) -> String {
     let claim = match (&i.claimed_by, &i.claim_expires_at) {
         (Some(by), Some(_)) => format!("  🔒{by}"),
@@ -553,6 +596,8 @@ fn run(cli: Cli) -> Result<()> {
             agent,
             project,
             label,
+            peek,
+            from,
             ttl,
             cooldown,
             all_workspaces,
@@ -567,17 +612,55 @@ fn run(cli: Cli) -> Result<()> {
                      drop one",
                 ));
             }
+            for s in &from {
+                if !CLAIMABLE_STATUSES.contains(&s.as_str()) {
+                    return Err(amt::error::msg(format!(
+                        "invalid --from stage '{s}' (one of {CLAIMABLE_STATUSES:?})"
+                    )));
+                }
+            }
+            let stages: Option<&[String]> = if from.is_empty() { None } else { Some(&from) };
+            let filter = store::ClaimFilter {
+                stages,
+                project: project.as_deref(),
+                label: label.as_deref(),
+            };
+
+            // --peek: read-only, never claims, never writes activity.
+            if peek {
+                if all_workspaces {
+                    match registry::peek_any_workspace(&agent, cooldown, &filter)? {
+                        Some((ws, i)) => print_peek(cli.json, &i, Some(&ws)),
+                        None => print_no_work(
+                            cli.json,
+                            &store::NoWork {
+                                reason: "no claimable issues in any registered workspace".into(),
+                                counts: store::NoWorkCounts {
+                                    blocked_by_lease: 0,
+                                    blocked_by_cooldown: 0,
+                                    candidates: 0,
+                                },
+                                retry_after: None,
+                            },
+                        ),
+                    }
+                    return Ok(());
+                }
+                let conn = open_workspace(&cli.workspace)?;
+                match store::peek_next(&conn, &agent, cooldown, &filter)? {
+                    Some(i) => print_peek(cli.json, &i, None),
+                    None => print_no_work(
+                        cli.json,
+                        &store::no_work_reason(&conn, &agent, cooldown, &filter)?,
+                    ),
+                }
+                return Ok(());
+            }
+
             // Cross-workspace claim: fan out over the registry, no local
             // workspace required.
-            if all_workspaces && issue.is_none() {
-                let won = registry::claim_any_workspace(
-                    &agent,
-                    project.as_deref(),
-                    label.as_deref(),
-                    ttl,
-                    cooldown,
-                )?;
-                match won {
+            if all_workspaces {
+                match registry::claim_any_workspace(&agent, ttl, cooldown, &filter)? {
                     Some((ws, i)) => {
                         if cli.json {
                             print_json(&issue_with_workspace(&i, &ws)?);
@@ -585,22 +668,26 @@ fn run(cli: Cli) -> Result<()> {
                             println!("claimed [{ws}] {}", issue_line(&i));
                         }
                     }
-                    None if cli.json => print_json(&serde_json::json!({ "claimed": false })),
-                    None => println!("nothing claimable in any workspace"),
+                    None => print_no_work(
+                        cli.json,
+                        &store::NoWork {
+                            reason: "no claimable issues in any registered workspace".into(),
+                            counts: store::NoWorkCounts {
+                                blocked_by_lease: 0,
+                                blocked_by_cooldown: 0,
+                                candidates: 0,
+                            },
+                            retry_after: None,
+                        },
+                    ),
                 }
                 return Ok(());
             }
+
             let mut conn = open_workspace(&cli.workspace)?;
             let claimed = match issue {
                 Some(key) => Some(store::claim_issue(&mut conn, &key, &agent, ttl)?),
-                None => store::claim_next(
-                    &mut conn,
-                    &agent,
-                    project.as_deref(),
-                    label.as_deref(),
-                    ttl,
-                    cooldown,
-                )?,
+                None => store::claim_next(&mut conn, &agent, ttl, cooldown, &filter)?,
             };
             match claimed {
                 Some(i) => {
@@ -610,13 +697,10 @@ fn run(cli: Cli) -> Result<()> {
                         println!("claimed {}", issue_line(&i));
                     }
                 }
-                None => {
-                    if cli.json {
-                        print_json(&serde_json::json!({ "claimed": false }));
-                    } else {
-                        println!("nothing claimable");
-                    }
-                }
+                None => print_no_work(
+                    cli.json,
+                    &store::no_work_reason(&conn, &agent, cooldown, &filter)?,
+                ),
             }
             Ok(())
         }
