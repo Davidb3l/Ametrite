@@ -1,7 +1,7 @@
 // Ametrite web server — one board, every registered workspace.
 // Reads: bun:sqlite per workspace. Writes: shell to `amt`. Zero npm deps.
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, dirname, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import index from "./index.html";
@@ -26,12 +26,23 @@ function addWorkspace(alias: string, root: string) {
 // AMT_WORKSPACE / cwd walk-up. Honors the same override as the `amt` engine
 // so the board and the CLI never read different registries.
 const registryPath = process.env.AMT_REGISTRY ?? join(homedir(), ".ametrite", "registry.json");
-try {
-  const reg = JSON.parse(readFileSync(registryPath, "utf8"));
-  for (const [alias, root] of Object.entries(reg.workspaces ?? {})) {
-    addWorkspace(alias, String(root));
+
+function readRegistry(): Record<string, string> {
+  try {
+    return (JSON.parse(readFileSync(registryPath, "utf8")).workspaces ?? {}) as Record<string, string>;
+  } catch {
+    return {};
   }
-} catch {}
+}
+
+// (Re-)read the registry and add any workspaces we aren't tracking yet.
+// Returns the newly-added aliases so a live update can be announced (AMT-10).
+function syncRegistry(): string[] {
+  const before = new Set(workspaces.keys());
+  for (const [alias, root] of Object.entries(readRegistry())) addWorkspace(alias, String(root));
+  return [...workspaces.keys()].filter((a) => !before.has(a));
+}
+syncRegistry();
 if (process.env.AMT_WORKSPACE) {
   const root = resolve(process.env.AMT_WORKSPACE);
   const existing = [...workspaces.values()].find((w) => w.root === root);
@@ -222,10 +233,38 @@ function search(db: Database, params: URLSearchParams): any[] {
   }
 }
 
-// ---------- SSE: poll every workspace's data_version ----------
+// ---------- SSE: poll the registry + every workspace's data_version ----------
 const sseClients = new Set<ReadableStreamDefaultController>();
 const versions = new Map<string, number>();
+
+function broadcast(event: string, data: string) {
+  for (const c of sseClients) {
+    try {
+      c.enqueue(`event: ${event}\ndata: ${data}\n\n`);
+    } catch {}
+  }
+}
+
+let registryMtime = (() => {
+  try {
+    return statSync(registryPath).mtimeMs;
+  } catch {
+    return 0;
+  }
+})();
+
 setInterval(() => {
+  // Pick up workspaces registered since boot (e.g. `amt init` in a new repo)
+  // without a restart, then tell open boards to refresh their sidebar (AMT-10).
+  try {
+    const m = statSync(registryPath).mtimeMs;
+    if (m !== registryMtime) {
+      registryMtime = m;
+      const added = syncRegistry();
+      if (added.length) broadcast("workspaces", JSON.stringify({ added }));
+    }
+  } catch {}
+
   for (const ws of workspaces.values()) {
     if (!ws.db) continue; // only poll workspaces someone has looked at
     let v: number;
@@ -235,11 +274,7 @@ setInterval(() => {
       continue;
     }
     if (versions.has(ws.alias) && versions.get(ws.alias) !== v) {
-      for (const c of sseClients) {
-        try {
-          c.enqueue(`event: change\ndata: {"ws":"${ws.alias}"}\n\n`);
-        } catch {}
-      }
+      broadcast("change", `{"ws":"${ws.alias}"}`);
     }
     versions.set(ws.alias, v);
   }

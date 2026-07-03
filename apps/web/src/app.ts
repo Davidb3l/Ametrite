@@ -632,6 +632,11 @@ function connectSSE() {
       if (!ws || ws === currentWs) render();
     }, 150);
   });
+  // A workspace was registered live (e.g. `amt init` elsewhere) — refresh the
+  // sidebar, and re-render the Inbox since it spans every workspace (AMT-10).
+  es.addEventListener("workspaces", () => {
+    loadSidebar().then(() => { if (route().view === "inbox") render(); });
+  });
   es.onerror = () => {
     dot.classList.remove("on");
     es.close();
