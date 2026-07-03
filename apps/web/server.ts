@@ -22,9 +22,12 @@ function addWorkspace(alias: string, root: string) {
   }
 }
 
-// Registry first (~/.ametrite/registry.json), then AMT_WORKSPACE / cwd walk-up.
+// Registry first (AMT_REGISTRY or ~/.ametrite/registry.json), then
+// AMT_WORKSPACE / cwd walk-up. Honors the same override as the `amt` engine
+// so the board and the CLI never read different registries.
+const registryPath = process.env.AMT_REGISTRY ?? join(homedir(), ".ametrite", "registry.json");
 try {
-  const reg = JSON.parse(readFileSync(join(homedir(), ".ametrite", "registry.json"), "utf8"));
+  const reg = JSON.parse(readFileSync(registryPath, "utf8"));
   for (const [alias, root] of Object.entries(reg.workspaces ?? {})) {
     addWorkspace(alias, String(root));
   }
@@ -265,6 +268,23 @@ Bun.serve({
           return { alias: ws.alias, name: meta.workspace_name, prefix: meta.id_prefix, root: ws.root, open_issues: open };
         })
       ),
+    // Inbox: every workspace's open issues in one globally priority-sorted
+    // list, each row tagged with its workspace (R1 cross-workspace view).
+    "/api/inbox": () => {
+        const rank: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
+        const out: any[] = [];
+        for (const ws of workspaces.values()) {
+            const db = dbOf(ws);
+            const name = (db.query("SELECT value FROM meta WHERE key = 'workspace_name'").get() as any)?.value ?? ws.alias;
+            for (const r of listIssues(db, new URLSearchParams())) {
+                r.workspace = ws.alias;
+                r.workspace_name = name;
+                out.push(r);
+            }
+        }
+        out.sort((a, b) => (rank[a.priority] ?? 9) - (rank[b.priority] ?? 9) || a.created_at.localeCompare(b.created_at));
+        return json(out);
+    },
     "/api/workspace": (req) => {
       const ws = wsOf(req);
       const meta = Object.fromEntries(

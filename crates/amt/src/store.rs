@@ -466,22 +466,25 @@ pub fn add_comment(conn: &mut Connection, id: &str, author: &str, body: &str) ->
 }
 
 /// Atomically claim the best available issue. Returns None when nothing is claimable.
-pub fn claim_next(
-    conn: &mut Connection,
+/// Appends the shared "is this issue claimable by `agent` right now" WHERE
+/// body (no leading `WHERE`) used by `claim_next`, `peek_next`, and
+/// `claim_key_guarded`, pushing bind args in positional order. Uses bare `?`
+/// placeholders so it composes after any earlier bind (e.g. a `d.id = ?`).
+fn claimable_predicate(
+    now: &str,
     agent: &str,
     project: Option<&str>,
     label: Option<&str>,
-    ttl_secs: i64,
     cooldown_secs: i64,
-) -> Result<Option<Issue>> {
-    let tx = immediate(conn)?;
-    let now = db::now(&tx)?;
-    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id
-         WHERE ((i.status IN ('todo','backlog') AND i.claimed_by IS NULL)
-                OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?1
-                    AND i.status NOT IN ('done','canceled')))"
-        .to_string();
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(now.clone())];
+    sql: &mut String,
+    args: &mut Vec<Box<dyn ToSql>>,
+) {
+    sql.push_str(
+        "((i.status IN ('todo','backlog') AND i.claimed_by IS NULL)
+          OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?
+              AND i.status NOT IN ('done','canceled')))",
+    );
+    args.push(Box::new(now.to_string()));
     if cooldown_secs > 0 {
         // Requeue cooldown: don't re-serve an issue to the agent that just
         // released it (dogfooding finding — a scoping loop was re-claiming
@@ -503,6 +506,22 @@ pub fn claim_next(
         );
         args.push(Box::new(l.to_string()));
     }
+}
+
+pub fn claim_next(
+    conn: &mut Connection,
+    agent: &str,
+    project: Option<&str>,
+    label: Option<&str>,
+    ttl_secs: i64,
+    cooldown_secs: i64,
+) -> Result<Option<Issue>> {
+    let tx = immediate(conn)?;
+    let now = db::now(&tx)?;
+    let mut sql =
+        "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id WHERE ".to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
     sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT 1"));
     let key: Option<String> = tx
         .query_row(
@@ -517,6 +536,81 @@ pub fn claim_next(
     do_claim(&tx, &key, agent, ttl_secs)?;
     tx.commit()?;
     Ok(Some(load_issue(conn, &key, true)?))
+}
+
+/// The best claimable issue in this workspace, without claiming it — the
+/// read-only half of a cross-workspace claim. The caller peeks every
+/// workspace, sorts candidates globally by priority then age, and only then
+/// runs `claim_key_guarded` against the winner.
+pub struct PeekCandidate {
+    pub key: String,
+    pub priority: String,
+    pub created_at: String,
+}
+
+pub fn peek_next(
+    conn: &Connection,
+    agent: &str,
+    project: Option<&str>,
+    label: Option<&str>,
+    cooldown_secs: i64,
+) -> Result<Option<PeekCandidate>> {
+    let now = db::now(conn)?;
+    let mut sql = "SELECT d.id, i.priority, d.created_at FROM documents d
+         JOIN issues i ON i.doc_id = d.doc_id WHERE "
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
+    sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT 1"));
+    conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+        |r| {
+            Ok(PeekCandidate {
+                key: r.get(0)?,
+                priority: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Claim `key` iff it *still* satisfies the claimable predicate. Returns
+/// `Ok(None)` when the issue was taken, closed, or cooled-down in the race
+/// window between peek and claim, so the cross-workspace caller can fall
+/// through to its next-best candidate.
+pub fn claim_key_guarded(
+    conn: &mut Connection,
+    key: &str,
+    agent: &str,
+    ttl_secs: i64,
+    project: Option<&str>,
+    label: Option<&str>,
+    cooldown_secs: i64,
+) -> Result<Option<Issue>> {
+    let tx = immediate(conn)?;
+    let now = db::now(&tx)?;
+    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id
+         WHERE d.id = ? AND "
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(key.to_string())];
+    claimable_predicate(&now, agent, project, label, cooldown_secs, &mut sql, &mut args);
+    sql.push_str(" LIMIT 1");
+    let found: Option<String> = tx
+        .query_row(
+            &sql,
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(found) = found else {
+        return Ok(None);
+    };
+    do_claim(&tx, &found, agent, ttl_secs)?;
+    tx.commit()?;
+    Ok(Some(load_issue(conn, &found, true)?))
 }
 
 /// Claim (or renew, when already held by `agent`) a specific issue.
@@ -1008,6 +1102,9 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
          JOIN documents d ON d.doc_id = l.source_doc_id
          WHERE l.target_doc_id IS NULL ORDER BY d.id",
     )?;
+    // `[[alias:KEY]]` links point into another registered workspace's DB, so
+    // they can never resolve locally — don't flag them as broken.
+    let registered = crate::registry::load().unwrap_or_default();
     let unresolved_links: Vec<UnresolvedLink> = stmt
         .query_map([], |r| {
             Ok(UnresolvedLink {
@@ -1015,7 +1112,13 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
                 target: r.get(1)?,
             })
         })?
-        .collect::<std::result::Result<_, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|l| {
+            !wikilink::cross_workspace(&l.target)
+                .is_some_and(|(alias, _)| registered.contains_key(alias))
+        })
+        .collect();
 
     let mut stmt = conn.prepare(
         "SELECT d.id, i.claimed_by, i.claim_expires_at

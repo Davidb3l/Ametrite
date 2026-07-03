@@ -1,6 +1,11 @@
-use amt::{db, export, store};
+use amt::{db, export, registry, store};
 use rusqlite::Connection;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+/// Serializes tests that touch the process-global `AMT_REGISTRY` env var so
+/// they don't race each other (Rust runs tests in parallel).
+static REGISTRY_ENV: Mutex<()> = Mutex::new(());
 
 fn workspace() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
@@ -384,6 +389,137 @@ fn decisions_export_import_round_trip() {
     assert_eq!(d.resolves, "AMT-1");
     assert_eq!(d.status, "accepted");
     assert_eq!(d.body.as_deref(), Some("Zero deps."));
+}
+
+#[test]
+fn peek_does_not_claim_then_guarded_claim_takes_it() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Low", "", "low")).unwrap();
+    store::create_issue(&mut conn, new_issue("Urgent", "", "urgent")).unwrap();
+
+    // peek returns the best candidate without mutating anything…
+    let cand = store::peek_next(&conn, "agent-a", None, None, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cand.key, "AMT-2");
+    assert_eq!(cand.priority, "urgent");
+    let still = store::get_issue(&conn, "AMT-2").unwrap();
+    assert_eq!(still.status, "backlog", "peek must not claim");
+    assert!(still.claimed_by.is_none());
+
+    // …and the guarded claim then takes exactly that issue.
+    let got = store::claim_key_guarded(&mut conn, "AMT-2", "agent-a", 900, None, None, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "AMT-2");
+    assert_eq!(got.claimed_by.as_deref(), Some("agent-a"));
+}
+
+#[test]
+fn guarded_claim_returns_none_when_raced_away() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    // someone else claims it between our peek and our guarded claim
+    store::claim_next(&mut conn, "winner", None, None, 900, 0)
+        .unwrap()
+        .unwrap();
+    let lost = store::claim_key_guarded(&mut conn, "AMT-1", "loser", 900, None, None, 0).unwrap();
+    assert!(lost.is_none(), "guarded claim must yield to the live lease");
+}
+
+#[test]
+fn cross_workspace_claim_drains_both_in_global_priority_order() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    // two repos, interleaved priorities across workspaces
+    let repo_a = TempDir::new().unwrap();
+    let repo_b = TempDir::new().unwrap();
+    {
+        let mut a = db::open(&db::init(repo_a.path(), "alpha", "ALP").unwrap()).unwrap();
+        store::create_issue(&mut a, new_issue("A urgent", "", "urgent")).unwrap();
+        store::create_issue(&mut a, new_issue("A low", "", "low")).unwrap();
+        let mut b = db::open(&db::init(repo_b.path(), "beta", "BET").unwrap()).unwrap();
+        store::create_issue(&mut b, new_issue("B high", "", "high")).unwrap();
+        store::create_issue(&mut b, new_issue("B medium", "", "medium")).unwrap();
+    }
+    registry::add("alpha", repo_a.path()).unwrap();
+    registry::add("beta", repo_b.path()).unwrap();
+
+    // one agent, cross-workspace claim loop — every poll yields work (zero
+    // idle polls) until both backlogs are drained, in global priority order.
+    let mut order = Vec::new();
+    while let Some((ws, issue)) =
+        registry::claim_any_workspace("solo", None, None, 900, 0).unwrap()
+    {
+        order.push((ws, issue.id, issue.priority));
+    }
+    let seq: Vec<(&str, &str)> = order.iter().map(|(w, i, _)| (w.as_str(), i.as_str())).collect();
+    assert_eq!(
+        seq,
+        vec![
+            ("alpha", "ALP-1"), // urgent
+            ("beta", "BET-1"),  // high
+            ("beta", "BET-2"),  // medium
+            ("alpha", "ALP-2"), // low
+        ],
+        "claims must drain in global priority order across workspaces"
+    );
+
+    std::env::remove_var("AMT_REGISTRY");
+}
+
+#[test]
+fn cross_workspace_links_are_not_flagged_by_doctor() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    let repo = TempDir::new().unwrap();
+    let mut conn = db::open(&db::init(repo.path(), "main", "AMT").unwrap()).unwrap();
+    // a link into workspace "web" and a genuinely broken local link
+    store::create_issue(
+        &mut conn,
+        new_issue("Depends on other repo", "Blocked by [[web:API-9]]; see [[Ghost Note]].", "high"),
+    )
+    .unwrap();
+
+    // with "web" unregistered, the cross-workspace link IS unresolved
+    let report = store::doctor(&conn).unwrap();
+    assert_eq!(report.unresolved_links.len(), 2);
+
+    // once "web" is a registered workspace, only the real broken link remains
+    let web = TempDir::new().unwrap();
+    db::init(web.path(), "web", "WEB").unwrap();
+    registry::add("web", web.path()).unwrap();
+    let report = store::doctor(&conn).unwrap();
+    assert_eq!(report.unresolved_links.len(), 1);
+    assert_eq!(report.unresolved_links[0].target, "Ghost Note");
+
+    std::env::remove_var("AMT_REGISTRY");
+}
+
+#[test]
+fn registry_round_trips_and_rejects_non_workspaces() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    let repo = TempDir::new().unwrap();
+    db::init(repo.path(), "proj", "PRJ").unwrap();
+    registry::add("proj", repo.path()).unwrap();
+    assert_eq!(registry::load().unwrap().get("proj").map(String::as_str),
+               Some(repo.path().canonicalize().unwrap().to_string_lossy().as_ref()));
+
+    // a directory with no .ametrite workspace is rejected
+    let empty = TempDir::new().unwrap();
+    assert!(registry::add("empty", empty.path()).is_err());
+
+    assert!(registry::remove("proj").unwrap());
+    assert!(registry::load().unwrap().is_empty());
+
+    std::env::remove_var("AMT_REGISTRY");
 }
 
 #[test]

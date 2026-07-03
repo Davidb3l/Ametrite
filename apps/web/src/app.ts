@@ -95,6 +95,13 @@ function md(src: string): string {
       .replace(/\[\[([^\[\]]+)\]\]/g, (_, inner) => {
         const [target, alias] = inner.split("|");
         const clean = target.split("#")[0].trim();
+        // [[ws:KEY]] — a link into another registered workspace's board.
+        const xw = clean.match(/^([A-Za-z0-9][\w-]*):([A-Za-z0-9][\w-]*)$/);
+        if (xw) {
+          // `inner` is already HTML-escaped by esc(s) above — do NOT re-escape
+          // the display text (the local-link branch below doesn't either).
+          return `<a class="wikilink xws" href="#/x/${encodeURIComponent(xw[1])}/${encodeURIComponent(xw[2])}" title="${xw[1]} workspace">${alias?.trim() || clean}</a>`;
+        }
         return `<a class="wikilink" href="#/doc/${encodeURIComponent(clean)}">${alias?.trim() || target.trim()}</a>`;
       })
       .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -139,14 +146,31 @@ async function render() {
     a.classList.toggle("active", (a as HTMLAnchorElement).dataset.nav === r.view));
   try {
     if (r.view === "board") await renderBoard();
+    else if (r.view === "inbox") await renderInbox();
     else if (r.view === "issue" && r.arg) await renderIssue(r.arg);
     else if (r.view === "notes") await renderNotes(r.arg);
     else if (r.view === "search") renderSearch();
     else if (r.view === "doc" && r.arg) await renderDocRedirect(r.arg);
+    else if (r.view === "x" && r.arg) await crossWorkspace(r.arg);
     else location.hash = "#/board";
   } catch (e) {
     // toast already shown by api()
   }
+}
+
+// [[ws:KEY]] follow: switch to workspace `alias`, then open `KEY`. If the
+// alias isn't registered here, fall back to the Inbox rather than 404.
+async function crossWorkspace(arg: string) {
+  const [alias, ...rest] = arg.split("/");
+  const key = rest.join("/");
+  const target = workspaces.find((w) => w.alias === alias);
+  if (!target) { toast(`workspace “${alias}” not registered`); location.hash = "#/inbox"; return; }
+  if (alias !== currentWs) {
+    currentWs = alias;
+    localStorage.setItem("amt-ws", currentWs);
+    await loadSidebar();
+  }
+  location.hash = key ? `#/doc/${encodeURIComponent(key)}` : "#/board";
 }
 
 async function renderDocRedirect(id: string) {
@@ -204,6 +228,44 @@ async function renderBoard() {
       render();
     });
     board.appendChild(col);
+  }
+}
+
+// ---------- inbox (cross-workspace) ----------
+async function renderInbox() {
+  const issues: (Issue & { workspace: string; workspace_name: string })[] = await api("/api/inbox");
+  main.innerHTML = "";
+  main.append(h(`
+    <div class="topbar">
+      <h1>Inbox</h1>
+      <span class="crumb">${issues.length} open across ${new Set(issues.map((i) => i.workspace)).size} workspace(s)</span>
+      <div class="spacer"></div>
+    </div>
+    <div class="content"><div class="inbox" id="inbox"></div></div>
+  `));
+  const box = main.querySelector("#inbox")!;
+  if (!issues.length) {
+    box.innerHTML = '<div class="empty big"><span class="facet"></span>Nothing open anywhere. Enjoy it.</div>';
+    return;
+  }
+  let lastPrio = "";
+  for (const i of issues) {
+    if (i.priority !== lastPrio) {
+      lastPrio = i.priority;
+      box.append(h(`<div class="inbox-group">${prioSvg(i.priority)}<span>${esc(i.priority)}</span></div>`));
+    }
+    const claim = i.claimed_by
+      ? `<span class="claim ${isStale(i) ? "stale" : ""}">🔒 ${esc(i.claimed_by)}</span>` : "";
+    const row = h(`
+      <a class="inbox-row" href="#/x/${encodeURIComponent(i.workspace)}/${encodeURIComponent(i.id)}">
+        <span class="ws-badge" title="${esc(i.workspace_name)}">${esc(i.workspace_name)}</span>
+        <span class="key">${esc(i.id)}</span>
+        <span class="ititle">${esc(i.title)}</span>
+        <span class="st-dot" style="background:var(--st-${i.status})" title="${esc(i.status)}"></span>
+        ${i.labels.slice(0, 2).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}
+        ${claim}
+      </a>`);
+    box.append(row);
   }
 }
 
@@ -586,6 +648,7 @@ window.addEventListener("keydown", (e) => {
     e.metaKey || e.ctrlKey || e.altKey
   ) return;
   if (e.key === "b") location.hash = "#/board";
+  else if (e.key === "i") location.hash = "#/inbox";
   else if (e.key === "n") location.hash = "#/notes";
   else if (e.key === "/") { location.hash = "#/search"; e.preventDefault(); }
   else if (e.key === "c" && route().view === "board") { issueDialog(); e.preventDefault(); }

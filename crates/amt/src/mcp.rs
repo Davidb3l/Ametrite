@@ -180,11 +180,37 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             let agent = agent_of(&args);
             let ttl = opt_i(&args, "ttl_seconds").unwrap_or(900);
             let cooldown = opt_i(&args, "cooldown_seconds").unwrap_or(3600);
+            let project = opt_s(&args, "project");
+            let label = opt_s(&args, "label");
+            if args
+                .get("any_workspace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                let won = run!(crate::registry::claim_any_workspace(
+                    &agent,
+                    project.as_deref(),
+                    label.as_deref(),
+                    ttl,
+                    cooldown
+                ));
+                return match won {
+                    Some((ws, issue)) => {
+                        let mut v = json!(issue);
+                        v["workspace"] = json!(ws);
+                        text_result(id, &v)
+                    }
+                    None => text_result(
+                        id,
+                        &json!({ "claimed": false, "reason": "no claimable issues in any workspace" }),
+                    ),
+                };
+            }
             let claimed = run!(store::claim_next(
                 conn,
                 &agent,
-                opt_s(&args, "project").as_deref(),
-                opt_s(&args, "label").as_deref(),
+                project.as_deref(),
+                label.as_deref(),
                 ttl,
                 cooldown
             ));
@@ -352,7 +378,8 @@ fn tool_defs() -> Vec<Value> {
             json!({ "agent": s("Your agent name (required for meaningful attribution)"),
                     "project": s("Only from this project"), "label": s("Only with this label"),
                     "ttl_seconds": i("Lease duration, default 900. Re-claim to renew before it expires."),
-                    "cooldown_seconds": i("Won't re-serve an issue you released within this window (default 3600; 0 disables)") }),
+                    "cooldown_seconds": i("Won't re-serve an issue you released within this window (default 3600; 0 disables)"),
+                    "any_workspace": b("Claim across every registered workspace, globally priority-first; the result includes a 'workspace' field") }),
             &["agent"]),
         tool("claim_issue", "Claim a specific issue, or renew your existing lease (heartbeat).",
             json!({ "id": s("Issue key"), "agent": s("Your agent name"), "ttl_seconds": i("Lease duration, default 900") }),

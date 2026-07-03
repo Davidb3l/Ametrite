@@ -75,6 +75,22 @@ pub fn extract(body: &str) -> Extracted {
     Extracted { links, tags }
 }
 
+/// A cross-workspace link target `alias:KEY` splits into `(alias, key)`.
+/// Both halves must be slug-like (alphanumerics, `-`, `_`) with no spaces, so
+/// a note title like "R1: multi-workspace" is not mistaken for a link. Mirrors
+/// the web renderer's regex exactly.
+pub fn cross_workspace(raw: &str) -> Option<(&str, &str)> {
+    let (alias, key) = raw.split_once(':')?;
+    // Must lead with an alphanumeric, then alphanumerics/`-`/`_` — exactly the
+    // web renderer's `^[A-Za-z0-9][\w-]*$`, so doctor and the board agree.
+    let slug = |s: &str| {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    (slug(alias) && slug(key)).then_some((alias, key))
+}
+
 /// Kebab-case slug for note/project ids.
 pub fn slugify(title: &str) -> String {
     let mut slug = String::new();
@@ -117,5 +133,23 @@ mod tests {
     fn slugs() {
         assert_eq!(slugify("Session Tokens & Auth!"), "session-tokens-auth");
         assert_eq!(slugify("  "), "untitled");
+    }
+
+    #[test]
+    fn cross_workspace_targets() {
+        assert_eq!(cross_workspace("web:AMT-3"), Some(("web", "AMT-3")));
+        assert_eq!(cross_workspace("my-app:CLAP-12"), Some(("my-app", "CLAP-12")));
+        // local links (no colon) are not cross-workspace
+        assert_eq!(cross_workspace("AMT-1"), None);
+        assert_eq!(cross_workspace("D-2"), None);
+        // a note title with a colon+space is not an alias:KEY link
+        assert_eq!(cross_workspace("R1: multi-workspace"), None);
+        // empty halves don't count
+        assert_eq!(cross_workspace(":AMT-1"), None);
+        assert_eq!(cross_workspace("web:"), None);
+        // must lead with an alphanumeric (mirrors the web regex) so doctor and
+        // the board never disagree on what is a cross-workspace link
+        assert_eq!(cross_workspace("_stg:BAR"), None);
+        assert_eq!(cross_workspace("-web:AMT-1"), None);
     }
 }

@@ -57,6 +57,9 @@ enum Cmd {
         /// Seconds before an issue you released can be re-served to you (0 disables)
         #[arg(long, default_value_t = 3600)]
         cooldown: i64,
+        /// Claim across every registered workspace, globally priority-first
+        #[arg(long)]
+        all_workspaces: bool,
     },
     /// Release a claimed issue with a final status
     Release {
@@ -114,6 +117,9 @@ enum Cmd {
         tag: Option<String>,
         #[arg(long)]
         project: Option<String>,
+        /// Search across every registered workspace (hits tagged with workspace)
+        #[arg(long)]
+        all_workspaces: bool,
         #[arg(long, default_value_t = 25)]
         limit: i64,
     },
@@ -182,6 +188,9 @@ enum IssueCmd {
         /// Include done/canceled issues
         #[arg(long)]
         all: bool,
+        /// List across every registered workspace (rows tagged with workspace)
+        #[arg(long)]
+        all_workspaces: bool,
         #[arg(long, default_value_t = 200)]
         limit: i64,
     },
@@ -294,6 +303,17 @@ fn print_json(value: &impl serde::Serialize) {
         "{}",
         serde_json::to_string_pretty(value).expect("serialize")
     );
+}
+
+/// Serialize an issue with a top-level `"workspace"` field so cross-workspace
+/// JSON stays a flat issue object — agents keep reading `.id` while gaining
+/// `.workspace` to know which board it came from.
+fn issue_with_workspace(i: &Issue, workspace: &str) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(i)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("workspace".into(), serde_json::json!(workspace));
+    }
+    Ok(v)
 }
 
 fn issue_line(i: &Issue) -> String {
@@ -418,27 +438,48 @@ fn run(cli: Cli) -> Result<()> {
                     project,
                     label,
                     all,
+                    all_workspaces,
                     limit,
                 } => {
-                    let issues = store::list_issues(
-                        &conn,
-                        &store::IssueFilter {
-                            status: status.clone(),
-                            assignee: assignee.clone(),
-                            project: project.clone(),
-                            label: label.clone(),
-                            claimed: None,
-                            include_closed: *all,
-                            limit: *limit,
-                        },
-                    )?;
-                    if cli.json {
-                        print_json(&issues);
-                    } else if issues.is_empty() {
-                        println!("no issues");
+                    let filter = store::IssueFilter {
+                        status: status.clone(),
+                        assignee: assignee.clone(),
+                        project: project.clone(),
+                        label: label.clone(),
+                        claimed: None,
+                        include_closed: *all,
+                        limit: *limit,
+                    };
+                    if *all_workspaces {
+                        let per =
+                            registry::for_each_workspace(|c| store::list_issues(c, &filter))?;
+                        if cli.json {
+                            let mut rows: Vec<serde_json::Value> = Vec::new();
+                            for (ws, issues) in &per {
+                                for i in issues {
+                                    rows.push(issue_with_workspace(i, ws)?);
+                                }
+                            }
+                            print_json(&rows);
+                        } else if per.iter().all(|(_, v)| v.is_empty()) {
+                            println!("no issues in any workspace");
+                        } else {
+                            for (ws, issues) in &per {
+                                for i in issues {
+                                    println!("[{ws}] {}", issue_line(i));
+                                }
+                            }
+                        }
                     } else {
-                        for i in &issues {
-                            println!("{}", issue_line(i));
+                        let issues = store::list_issues(&conn, &filter)?;
+                        if cli.json {
+                            print_json(&issues);
+                        } else if issues.is_empty() {
+                            println!("no issues");
+                        } else {
+                            for i in &issues {
+                                println!("{}", issue_line(i));
+                            }
                         }
                     }
                 }
@@ -508,9 +549,42 @@ fn run(cli: Cli) -> Result<()> {
             label,
             ttl,
             cooldown,
+            all_workspaces,
         } => {
-            let mut conn = open_workspace(&cli.workspace)?;
             let agent = identity(agent);
+            // `--issue KEY` is inherently single-workspace; combining it with
+            // --all-workspaces is a mistake, so reject it rather than silently
+            // ignoring the flag and claiming from the local workspace.
+            if all_workspaces && issue.is_some() {
+                return Err(amt::error::msg(
+                    "--all-workspaces can't combine with --issue (a key is workspace-specific); \
+                     drop one",
+                ));
+            }
+            // Cross-workspace claim: fan out over the registry, no local
+            // workspace required.
+            if all_workspaces && issue.is_none() {
+                let won = registry::claim_any_workspace(
+                    &agent,
+                    project.as_deref(),
+                    label.as_deref(),
+                    ttl,
+                    cooldown,
+                )?;
+                match won {
+                    Some((ws, i)) => {
+                        if cli.json {
+                            print_json(&issue_with_workspace(&i, &ws)?);
+                        } else {
+                            println!("claimed [{ws}] {}", issue_line(&i));
+                        }
+                    }
+                    None if cli.json => print_json(&serde_json::json!({ "claimed": false })),
+                    None => println!("nothing claimable in any workspace"),
+                }
+                return Ok(());
+            }
+            let mut conn = open_workspace(&cli.workspace)?;
             let claimed = match issue {
                 Some(key) => Some(store::claim_issue(&mut conn, &key, &agent, ttl)?),
                 None => store::claim_next(
@@ -733,20 +807,47 @@ fn run(cli: Cli) -> Result<()> {
             status,
             tag,
             project,
+            all_workspaces,
             limit,
         } => {
+            let q = query.join(" ");
+            let filter = store::SearchFilter {
+                doc_type,
+                status,
+                tag,
+                project,
+                limit,
+            };
+            if all_workspaces {
+                let per = registry::for_each_workspace(|c| store::search(c, &q, &filter))?;
+                if cli.json {
+                    let mut rows: Vec<serde_json::Value> = Vec::new();
+                    for (ws, hits) in &per {
+                        for h in hits {
+                            let mut v = serde_json::to_value(h)?;
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("workspace".into(), serde_json::json!(ws));
+                            }
+                            rows.push(v);
+                        }
+                    }
+                    print_json(&rows);
+                } else if per.iter().all(|(_, v)| v.is_empty()) {
+                    println!("no results");
+                } else {
+                    for (ws, hits) in &per {
+                        for h in hits {
+                            println!(
+                                "[{ws}] {:<12} {:<8} {}\n             {}",
+                                h.id, h.doc_type, h.title, h.snippet
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let conn = open_workspace(&cli.workspace)?;
-            let hits = store::search(
-                &conn,
-                &query.join(" "),
-                &store::SearchFilter {
-                    doc_type,
-                    status,
-                    tag,
-                    project,
-                    limit,
-                },
-            )?;
+            let hits = store::search(&conn, &q, &filter)?;
             if cli.json {
                 print_json(&hits);
             } else if hits.is_empty() {
