@@ -921,6 +921,94 @@ pub fn search(conn: &Connection, query: &str, f: &SearchFilter) -> Result<Vec<Se
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Lowercased alphanumeric tokens of a title, for cheap similarity.
+fn norm_tokens(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Jaccard overlap of two token sets: |A∩B| / |A∪B|, in [0.0, 1.0].
+fn jaccard(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let sa: std::collections::HashSet<&String> = a.iter().collect();
+    let sb: std::collections::HashSet<&String> = b.iter().collect();
+    let inter = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// A note flagged as a likely duplicate of a candidate title.
+pub struct SimilarNote {
+    pub id: String,
+    pub title: String,
+    /// Normalized-title token Jaccard similarity in (0.0, 1.0]; 1.0 = identical
+    /// after normalization.
+    pub score: f64,
+}
+
+/// Minimum normalized-title token Jaccard for two note titles to count as
+/// near-duplicates. 0.6 means the titles share ~60%+ of their significant
+/// words (e.g. "Auth token rotation" vs "Auth token rotation notes" ≈ 0.75),
+/// while distinct titles stay well below it. We use FTS only to cheaply narrow
+/// candidates (any shared term), then confirm with this overlap so an
+/// incidental one-word FTS hit is never treated as a duplicate. No fuzzy-match
+/// crate — pure std token overlap keeps deps at zero.
+const DEDUPE_JACCARD_THRESHOLD: f64 = 0.6;
+
+/// Find existing notes whose titles are near-duplicates of `title`.
+///
+/// Cheap two-stage filter: FTS5 over `title` (restricted to `type='note'`) to
+/// pull candidates sharing any term, then a normalized-token Jaccard gate.
+/// Returns matches sorted by descending similarity. Shared by the CLI
+/// `--dedupe` flag and the MCP `create_note` tool.
+pub fn find_similar_notes(conn: &Connection, title: &str) -> Result<Vec<SimilarNote>> {
+    let cand_tokens = norm_tokens(title);
+    if cand_tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    // OR the title's tokens so FTS returns any note sharing at least one term
+    // (store::search ANDs terms, which would miss a note whose title omits one
+    // word of the candidate). We then apply the Jaccard gate below; FTS is only
+    // the cheap candidate-narrowing pass.
+    let match_expr = cand_tokens
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.title
+         FROM documents_fts
+         JOIN documents d ON d.doc_id = documents_fts.rowid
+         WHERE documents_fts MATCH ?1 AND d.type = 'note'
+         ORDER BY bm25(documents_fts) LIMIT 50",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([match_expr], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut out: Vec<SimilarNote> = Vec::new();
+    for (cid, ctitle) in candidates {
+        let score = jaccard(&cand_tokens, &norm_tokens(&ctitle));
+        if score >= DEDUPE_JACCARD_THRESHOLD {
+            out.push(SimilarNote {
+                id: cid,
+                title: ctitle,
+                score,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
+}
+
 pub struct NewDecision {
     pub title: String,
     pub body: String,

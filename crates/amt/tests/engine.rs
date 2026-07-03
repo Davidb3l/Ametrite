@@ -556,3 +556,74 @@ fn requeue_cooldown_blocks_self_but_not_others() {
     let explicit = store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
     assert_eq!(explicit.claimed_by.as_deref(), Some("agent-b"));
 }
+
+fn new_note(title: &str, body: &str) -> store::NewNote {
+    store::NewNote {
+        title: title.into(),
+        body: body.into(),
+        tags: vec![],
+        doc_type: "note".into(),
+        author: "test".into(),
+    }
+}
+
+#[test]
+fn dedupe_detects_near_duplicate_title() {
+    let (_d, mut conn) = workspace();
+    store::create_doc(
+        &mut conn,
+        new_note("Auth token rotation strategy", "we rotate every 15m"),
+    )
+    .unwrap();
+    // Same significant words, minor wording change → above the Jaccard gate.
+    let dupes =
+        store::find_similar_notes(&conn, "Auth token rotation strategy notes").unwrap();
+    assert_eq!(dupes.len(), 1);
+    assert_eq!(dupes[0].title, "Auth token rotation strategy");
+    assert!(dupes[0].score >= 0.6, "score was {}", dupes[0].score);
+}
+
+#[test]
+fn dedupe_does_not_flag_distinct_title() {
+    let (_d, mut conn) = workspace();
+    store::create_doc(
+        &mut conn,
+        new_note("Auth token rotation strategy", "we rotate every 15m"),
+    )
+    .unwrap();
+    // Shares at most one incidental word — must not be flagged.
+    let dupes = store::find_similar_notes(&conn, "Kanban board CSS layout fixes").unwrap();
+    assert!(dupes.is_empty(), "unexpected dupes: {}", dupes.len());
+}
+
+#[test]
+fn dedupe_only_matches_notes_not_issues() {
+    let (_d, mut conn) = workspace();
+    // An issue with an identical title must not count as a note duplicate.
+    store::create_issue(
+        &mut conn,
+        new_issue("Database migration plan", "steps here", "high"),
+    )
+    .unwrap();
+    let dupes = store::find_similar_notes(&conn, "Database migration plan").unwrap();
+    assert!(dupes.is_empty(), "issue leaked into note dedupe");
+}
+
+#[test]
+fn dedupe_soft_warns_but_still_creates_while_strict_refuses() {
+    let (_d, mut conn) = workspace();
+    store::create_doc(&mut conn, new_note("Release checklist", "cut a tag")).unwrap();
+
+    // Soft mode: caller sees the collision but the note is still created.
+    let dupes = store::find_similar_notes(&conn, "Release checklist").unwrap();
+    assert_eq!(dupes.len(), 1);
+    let created = store::create_doc(&mut conn, new_note("Release checklist", "v2")).unwrap();
+    // Distinct id is minted (slug collision suffix), so both notes coexist.
+    assert_ne!(created.id, dupes[0].id);
+    assert_eq!(store::list_docs(&conn, "note").unwrap().len(), 2);
+
+    // Strict mode is the caller refusing when find_similar_notes is non-empty;
+    // verify the signal both handlers key off of is present.
+    let strict_hit = store::find_similar_notes(&conn, "Release checklist").unwrap();
+    assert!(!strict_hit.is_empty());
+}

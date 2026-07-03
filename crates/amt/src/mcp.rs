@@ -272,17 +272,57 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             text_result(id, &json!({ "ok": true }))
         }
         "create_note" => {
+            let title = try_arg!(req("title"));
+            let dedupe = args
+                .get("dedupe")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let strict = args
+                .get("strict")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let dupes = if dedupe || strict {
+                run!(store::find_similar_notes(conn, &title))
+            } else {
+                Vec::new()
+            };
+            if strict && !dupes.is_empty() {
+                let list = dupes
+                    .iter()
+                    .map(|d| format!("{} ({:.0}% match) {}", d.id, d.score * 100.0, d.title))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return tool_error(
+                    id,
+                    &format!("refusing to create note: near-duplicate(s) exist: {list}"),
+                );
+            }
             let doc = run!(store::create_doc(
                 conn,
                 store::NewNote {
-                    title: try_arg!(req("title")),
+                    title,
                     body: opt_s(&args, "body").unwrap_or_default(),
                     tags: strings(&args, "tags"),
                     doc_type: "note".into(),
                     author: agent_of(&args),
                 }
             ));
-            text_result(id, &doc)
+            if dupes.is_empty() {
+                text_result(id, &doc)
+            } else {
+                let duplicates: Vec<Value> = dupes
+                    .iter()
+                    .map(|d| json!({ "id": d.id, "title": d.title, "score": d.score }))
+                    .collect();
+                text_result(
+                    id,
+                    &json!({
+                        "doc": doc,
+                        "warning": "near-duplicate note(s) already exist",
+                        "duplicates": duplicates,
+                    }),
+                )
+            }
         }
         "append_to_note" => {
             let doc = run!(store::append_to_doc(
@@ -397,8 +437,10 @@ fn tool_defs() -> Vec<Value> {
         tool("add_comment", "Append a comment to an issue's (or note's) activity log.",
             json!({ "id": s("Issue key or doc id"), "body": s("Comment markdown"), "agent": s("Author") }),
             &["id", "body"]),
-        tool("create_note", "Create a knowledge-base note. Body wikilinks and #tags are indexed.",
-            json!({ "title": s("Note title"), "body": s("Markdown body"), "tags": arr("Tags"), "agent": s("Author") }),
+        tool("create_note", "Create a knowledge-base note. Body wikilinks and #tags are indexed. With dedupe, checks existing note titles for a near-duplicate first: soft mode still creates but returns a 'warning'+'duplicates' field; strict refuses with a tool error listing the collisions.",
+            json!({ "title": s("Note title"), "body": s("Markdown body"), "tags": arr("Tags"), "agent": s("Author"),
+                    "dedupe": b("Check for a near-duplicate note title; on a hit, still create but include warning+duplicates"),
+                    "strict": b("With dedupe: refuse to create (tool error) if a near-duplicate exists") }),
             &["title"]),
         tool("append_to_note", "Append a markdown section to an existing note.",
             json!({ "id": s("Note id or title"), "body": s("Markdown to append"), "agent": s("Author") }),

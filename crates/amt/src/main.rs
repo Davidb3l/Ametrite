@@ -255,6 +255,12 @@ enum NoteCmd {
         body: String,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Warn if a near-duplicate note already exists (still creates it).
+        #[arg(long)]
+        dedupe: bool,
+        /// With --dedupe: refuse and exit non-zero on a near-duplicate.
+        #[arg(long)]
+        strict: bool,
     },
     Show {
         id: String,
@@ -710,7 +716,30 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Note { ref cmd } => {
             let mut conn = open_workspace(&cli.workspace)?;
             match cmd {
-                NoteCmd::Create { title, body, tags } => {
+                NoteCmd::Create {
+                    title,
+                    body,
+                    tags,
+                    dedupe,
+                    strict,
+                } => {
+                    let dupes = if *dedupe || *strict {
+                        store::find_similar_notes(&conn, title)?
+                    } else {
+                        Vec::new()
+                    };
+                    // --strict implies dedupe checking; on a hit, refuse (the
+                    // Err becomes exit code 1 via main()).
+                    if *strict && !dupes.is_empty() {
+                        let list = dupes
+                            .iter()
+                            .map(|d| format!("{} ({:.0}% match) {}", d.id, d.score * 100.0, d.title))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(amt::error::msg(format!(
+                            "refusing to create note: near-duplicate(s) exist: {list}"
+                        )));
+                    }
                     let doc = store::create_doc(
                         &mut conn,
                         store::NewNote {
@@ -722,9 +751,36 @@ fn run(cli: Cli) -> Result<()> {
                         },
                     )?;
                     if cli.json {
-                        print_json(&doc);
+                        if dupes.is_empty() {
+                            print_json(&doc);
+                        } else {
+                            let duplicates: Vec<_> = dupes
+                                .iter()
+                                .map(|d| {
+                                    serde_json::json!({
+                                        "id": d.id, "title": d.title, "score": d.score
+                                    })
+                                })
+                                .collect();
+                            print_json(&serde_json::json!({
+                                "doc": doc,
+                                "warning": "near-duplicate note(s) already exist",
+                                "duplicates": duplicates,
+                            }));
+                        }
                     } else {
                         println!("created note '{}' ({})", doc.title, doc.id);
+                        if !dupes.is_empty() {
+                            eprintln!("warning: near-duplicate note(s) already exist:");
+                            for d in &dupes {
+                                eprintln!(
+                                    "  {} ({:.0}% match) {}",
+                                    d.id,
+                                    d.score * 100.0,
+                                    d.title
+                                );
+                            }
+                        }
                     }
                 }
                 NoteCmd::Show { id } => {
