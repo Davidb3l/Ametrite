@@ -28,8 +28,10 @@ yourself — never hand the user a list of steps:
 3. **Seed from context**: if the user described work in the conversation, create
    the initial issues/notes for them immediately (with priorities and labels).
 4. Mention (don't do unasked): `claude mcp add ametrite -- amt mcp` for MCP. The web
-   board serves EVERY registered workspace from one port — if it's already running,
-   the new workspace just appears in its sidebar (init auto-registers); otherwise:
+   board serves EVERY registered workspace from one port. **If it's already running,
+   do NOT restart it** — the server watches the registry and picks up a newly
+   `init`ed workspace live (it appears in the sidebar within ~1s, no restart, no
+   refresh needed). Only start one if none is running:
    `bun run --cwd <ametrite-repo> web` → http://localhost:1776.
 
 After bootstrap, just start working — the sections below are the conventions.
