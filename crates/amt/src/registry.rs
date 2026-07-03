@@ -179,6 +179,44 @@ pub fn claim_any_workspace(
     Ok(None)
 }
 
+/// Aggregate structured no-work across every registered workspace: sum the
+/// candidate/lease/cooldown buckets and take the soonest retry_after, so the
+/// cross-workspace `{claimed:false}` carries the same shape and real numbers
+/// as the single-workspace path (not fabricated zeros).
+pub fn no_work_any_workspace(
+    agent: &str,
+    cooldown_secs: i64,
+    f: &store::ClaimFilter<'_>,
+) -> Result<store::NoWork> {
+    let mut counts = store::NoWorkCounts {
+        blocked_by_lease: 0,
+        blocked_by_cooldown: 0,
+        candidates: 0,
+    };
+    let mut retry_after: Option<i64> = None;
+    for (_alias, root) in load()? {
+        let Ok(conn) = db::open(&db_path(&root)) else {
+            continue;
+        };
+        let nw = store::no_work_reason(&conn, agent, cooldown_secs, f)?;
+        counts.candidates += nw.counts.candidates;
+        counts.blocked_by_lease += nw.counts.blocked_by_lease;
+        counts.blocked_by_cooldown += nw.counts.blocked_by_cooldown;
+        if let Some(r) = nw.retry_after {
+            retry_after = Some(retry_after.map_or(r, |cur| cur.min(r)));
+        }
+    }
+    Ok(store::NoWork {
+        reason: store::no_work_reason_text(
+            counts.candidates,
+            counts.blocked_by_lease,
+            counts.blocked_by_cooldown,
+        ),
+        counts,
+        retry_after,
+    })
+}
+
 /// Global claim ordering key: priority rank (0 = highest), then oldest first —
 /// matches the SQL `ORDER BY PRIORITY_RANK, created_at`.
 fn order_key(i: &Issue) -> (usize, &str) {

@@ -612,6 +612,11 @@ fn run(cli: Cli) -> Result<()> {
                      drop one",
                 ));
             }
+            if peek && issue.is_some() {
+                return Err(amt::error::msg(
+                    "--peek reports the best claimable issue; it can't combine with --issue",
+                ));
+            }
             for s in &from {
                 if !CLAIMABLE_STATUSES.contains(&s.as_str()) {
                     return Err(amt::error::msg(format!(
@@ -633,15 +638,7 @@ fn run(cli: Cli) -> Result<()> {
                         Some((ws, i)) => print_peek(cli.json, &i, Some(&ws)),
                         None => print_no_work(
                             cli.json,
-                            &store::NoWork {
-                                reason: "no claimable issues in any registered workspace".into(),
-                                counts: store::NoWorkCounts {
-                                    blocked_by_lease: 0,
-                                    blocked_by_cooldown: 0,
-                                    candidates: 0,
-                                },
-                                retry_after: None,
-                            },
+                            &registry::no_work_any_workspace(&agent, cooldown, &filter)?,
                         ),
                     }
                     return Ok(());
@@ -670,15 +667,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     None => print_no_work(
                         cli.json,
-                        &store::NoWork {
-                            reason: "no claimable issues in any registered workspace".into(),
-                            counts: store::NoWorkCounts {
-                                blocked_by_lease: 0,
-                                blocked_by_cooldown: 0,
-                                candidates: 0,
-                            },
-                            retry_after: None,
-                        },
+                        &registry::no_work_any_workspace(&agent, cooldown, &filter)?,
                     ),
                 }
                 return Ok(());

@@ -246,10 +246,10 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                         }
                         text_result(id, &v)
                     }
-                    None if any_ws => text_result(
-                        id,
-                        &json!({ "claimed": false, "reason": "no claimable issues in any workspace" }),
-                    ),
+                    None if any_ws => {
+                        let nw = run!(crate::registry::no_work_any_workspace(&agent, cooldown, &filter));
+                        no_work_result(id, &nw)
+                    }
                     None => {
                         let nw = run!(store::no_work_reason(conn, &agent, cooldown, &filter));
                         no_work_result(id, &nw)
@@ -265,10 +265,10 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                         v["workspace"] = json!(ws);
                         text_result(id, &v)
                     }
-                    None => text_result(
-                        id,
-                        &json!({ "claimed": false, "reason": "no claimable issues in any workspace" }),
-                    ),
+                    None => {
+                        let nw = run!(crate::registry::no_work_any_workspace(&agent, cooldown, &filter));
+                        no_work_result(id, &nw)
+                    }
                 };
             }
 

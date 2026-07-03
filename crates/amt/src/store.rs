@@ -720,7 +720,22 @@ pub fn no_work_reason(
 
     let retry_after = soonest_retry(conn, &now, agent, cooldown_secs, &scope, &scope_args)?;
 
-    let reason = if candidates == 0 {
+    Ok(NoWork {
+        reason: no_work_reason_text(candidates, blocked_by_lease, blocked_by_cooldown),
+        counts: NoWorkCounts {
+            blocked_by_lease,
+            blocked_by_cooldown,
+            candidates,
+        },
+        retry_after,
+    })
+}
+
+/// The human-readable no-work one-liner for a set of bucket counts. Shared by
+/// the single-workspace `no_work_reason` and the cross-workspace aggregator so
+/// the CLI and MCP emit identical phrasing for the same situation.
+pub fn no_work_reason_text(candidates: i64, blocked_by_lease: i64, blocked_by_cooldown: i64) -> String {
+    if candidates == 0 {
         "no candidate issues in a claimable stage".to_string()
     } else if blocked_by_lease > 0 && blocked_by_cooldown > 0 {
         format!("{blocked_by_lease} held by active leases, {blocked_by_cooldown} in your cooldown")
@@ -730,17 +745,7 @@ pub fn no_work_reason(
         format!("{blocked_by_cooldown} candidate(s) in your requeue cooldown")
     } else {
         "no claimable issues match".to_string()
-    };
-
-    Ok(NoWork {
-        reason,
-        counts: NoWorkCounts {
-            blocked_by_lease,
-            blocked_by_cooldown,
-            candidates,
-        },
-        retry_after,
-    })
+    }
 }
 
 /// Seconds until the soonest lease-expiry or cooldown-expiry within `scope`
