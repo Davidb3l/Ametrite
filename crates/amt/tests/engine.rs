@@ -1319,3 +1319,37 @@ fn agents_completed_dedupes_reopened_issue() {
     let alice = roster.iter().find(|a| a.name == "alice").unwrap();
     assert_eq!(alice.completed, 1, "a reopened+redone issue counts once");
 }
+
+#[test]
+fn events_stream_cursor_and_since_catchup() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("a", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+
+    // Full dump from 0: created + claimed + status-change, monotonic cursors.
+    let all = store::events(&conn, 0, 100).unwrap();
+    assert!(all.len() >= 3);
+    for w in all.windows(2) {
+        assert!(w[0].cursor < w[1].cursor, "cursors strictly increase");
+    }
+    assert_eq!(all[0].id, "AMT-1");
+    assert_eq!(all[0].body, "created");
+
+    // --since excludes everything at/before the cursor.
+    let after = store::events(&conn, all[0].cursor, 100).unwrap();
+    assert_eq!(after.len(), all.len() - 1);
+    assert!(after.iter().all(|e| e.cursor > all[0].cursor));
+
+    // Tip cursor = last event; a follower parked at the tip sees nothing…
+    let tip = store::events_cursor(&conn).unwrap();
+    assert_eq!(tip, all.last().unwrap().cursor);
+    assert!(store::events(&conn, tip, 100).unwrap().is_empty());
+
+    // …until new activity arrives, which the follower then picks up.
+    store::add_comment(&mut conn, "AMT-1", "bob", "hi").unwrap();
+    let fresh = store::events(&conn, tip, 100).unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].kind, "comment");
+    assert_eq!(fresh[0].author, "bob");
+    assert!(fresh[0].cursor > tip);
+}

@@ -450,6 +450,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             let stats = run!(store::stats(conn, opt_s(&args, "since").as_deref()));
             text_result(id, &stats)
         }
+        "get_events" => {
+            let events = run!(store::events(
+                conn,
+                opt_i(&args, "since").unwrap_or(0),
+                opt_i(&args, "limit").unwrap_or(100)
+            ));
+            text_result(id, &events)
+        }
         "add_dependency" => {
             run!(store::add_block(
                 conn,
@@ -577,6 +585,8 @@ fn tool_defs() -> Vec<Value> {
             json!({}), &[]),
         tool("get_stats", "Throughput, cycle time (first-claim → done), and a claim-integrity audit that replays the activity log to assert no two agents ever held the same issue at once. Optional 'since' window.",
             json!({ "since": s("Only count work completed at/after this ISO-8601 instant") }), &[]),
+        tool("get_events", "Catch up on the activity event stream since a cursor. Returns events oldest-first, each with a monotonic 'cursor'; poll again with the highest cursor seen to get only new events (a supervisor reacting to releases/claims without polling the whole issue list).",
+            json!({ "since": i("Resume after this cursor (0 or omitted = from the start)"), "limit": i("Max events (default 100)") }), &[]),
         tool("add_dependency", "Declare that 'blocker' must reach a terminal status (done/canceled) before 'blocked' can be claimed. Claim/peek skip an issue with any open blocker. Rejects self-blocks and edges that would form a cycle.",
             json!({ "blocker": s("Issue key that must close first"), "blocked": s("Issue key that waits on the blocker"),
                     "agent": s("Acting agent name") }),

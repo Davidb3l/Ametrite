@@ -190,6 +190,25 @@ pub struct MissingRef {
     pub references: String,
 }
 
+/// One row of the activity event stream (`amt events`). R4. Emitted as NDJSON
+/// (one compact JSON object per line) so supervisors can react in real time.
+#[derive(Debug, Serialize)]
+pub struct EventRow {
+    /// Global monotonic cursor (the activity rowid). Pass the highest one seen
+    /// back as `--since` to resume exactly where you left off.
+    pub cursor: i64,
+    /// Document the event belongs to (issue key, note id, …).
+    pub id: String,
+    #[serde(rename = "type")]
+    pub doc_type: String,
+    pub seq: i64,
+    pub at: String,
+    pub author: String,
+    /// "comment" | "event".
+    pub kind: String,
+    pub body: String,
+}
+
 /// One agent's fleet-visibility row (`amt agents`). R9.
 #[derive(Debug, Serialize)]
 pub struct AgentRow {

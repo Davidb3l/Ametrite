@@ -157,6 +157,18 @@ enum Cmd {
         #[arg(long)]
         since: Option<String>,
     },
+    /// Stream activity events as NDJSON (one JSON object per line)
+    Events {
+        /// Resume after this cursor (the `cursor` field of the last event seen)
+        #[arg(long)]
+        since: Option<i64>,
+        /// Keep the stream open and emit new events as they arrive
+        #[arg(long)]
+        follow: bool,
+        /// Max events per batch
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+    },
     /// Export the workspace as Obsidian-compatible markdown files
     Export { dir: PathBuf },
     /// Import markdown files (previously exported or Obsidian-authored)
@@ -1319,6 +1331,41 @@ fn run(cli: Cli) -> Result<()> {
                             o.issue, o.claimant, o.holder, o.at
                         );
                     }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Events {
+            since,
+            follow,
+            limit,
+        } => {
+            use std::io::Write;
+            let conn = open_workspace(&cli.workspace)?;
+            // Start cursor: explicit --since wins; otherwise a follower tails
+            // from the current tip (new events only), while a one-shot dump
+            // replays the whole log.
+            let mut cursor = match since {
+                Some(c) => c,
+                None if follow => store::events_cursor(&conn)?,
+                None => 0,
+            };
+            let mut out = std::io::stdout();
+            let mut emit = |cursor: &mut i64| -> Result<()> {
+                for e in store::events(&conn, *cursor, limit)? {
+                    // NDJSON: one compact JSON object per line.
+                    writeln!(out, "{}", serde_json::to_string(&e).expect("serialize"))
+                        .map_err(|e| amt::error::msg(e.to_string()))?;
+                    *cursor = e.cursor;
+                }
+                out.flush().ok();
+                Ok(())
+            };
+            emit(&mut cursor)?;
+            if follow {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    emit(&mut cursor)?;
                 }
             }
             Ok(())

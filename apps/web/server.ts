@@ -279,6 +279,22 @@ let registryMtime = (() => {
   }
 })();
 
+// Activity events with rowid > since (the R4 event stream), oldest first.
+// `activity.rowid` is a global monotonic cursor, matching store::events.
+function eventsSince(db: Database, since: number, limit: number): any[] {
+  return db
+    .query(
+      `SELECT a.rowid AS cursor, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body
+       FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+       WHERE a.rowid > ? ORDER BY a.rowid LIMIT ?`
+    )
+    .all(since, limit);
+}
+function eventsTip(db: Database): number {
+  return (db.query("SELECT COALESCE(MAX(rowid),0) AS c FROM activity").get() as any).c;
+}
+const cursors = new Map<string, number>(); // per-workspace last-emitted event cursor
+
 setInterval(() => {
   // Pick up workspaces registered since boot (e.g. `amt init` in a new repo)
   // without a restart, then tell open boards to refresh their sidebar (AMT-10).
@@ -299,8 +315,17 @@ setInterval(() => {
     } catch {
       continue;
     }
+    if (!cursors.has(ws.alias)) cursors.set(ws.alias, eventsTip(ws.db)); // start at tip
     if (versions.has(ws.alias) && versions.get(ws.alias) !== v) {
       broadcast("change", `{"ws":"${ws.alias}"}`);
+      // Push the actual new activity rows so live consumers (R4 event stream)
+      // react without re-fetching the whole board.
+      try {
+        for (const e of eventsSince(ws.db, cursors.get(ws.alias)!, 200)) {
+          broadcast("activity", JSON.stringify({ ws: ws.alias, ...e }));
+          cursors.set(ws.alias, e.cursor);
+        }
+      } catch {}
     }
     versions.set(ws.alias, v);
   }
@@ -438,7 +463,15 @@ Bun.serve({
       const since = new URL(req.url).searchParams.get("since");
       return amt(wsOf(req), ["stats", ...(since ? ["--since", since] : [])]);
     },
-    "/api/events": () => {
+    "/api/events": (req) => {
+      // REST catch-up: `?since=<cursor>` returns the events after that cursor as
+      // a JSON array (poll with the highest cursor to resume). No `since` opens
+      // the live SSE stream (hello + change/activity/workspaces frames).
+      const sinceParam = new URL(req.url).searchParams.get("since");
+      if (sinceParam !== null) {
+        const since = Number(sinceParam) || 0;
+        return json(eventsSince(dbOf(wsOf(req)), since, 500));
+      }
       let ctrl: ReadableStreamDefaultController;
       const stream = new ReadableStream({
         start(c) {

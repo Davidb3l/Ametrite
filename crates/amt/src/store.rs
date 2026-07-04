@@ -1853,6 +1853,38 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
     })
 }
 
+// ---------- event stream (R4) ----------
+
+/// The current tip of the event stream (max activity rowid, 0 if empty). A
+/// follower with no `--since` starts here so it only sees *new* events.
+pub fn events_cursor(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM activity", [], |r| r.get(0))?)
+}
+
+/// Activity events with cursor strictly greater than `since`, oldest first,
+/// capped at `limit`. `activity.rowid` is a global monotonic insertion order,
+/// so it's a stable cross-document cursor for tailing and catch-up.
+pub fn events(conn: &Connection, since: i64, limit: i64) -> Result<Vec<EventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.rowid, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body
+         FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+         WHERE a.rowid > ?1 ORDER BY a.rowid LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![since, limit], |r| {
+        Ok(EventRow {
+            cursor: r.get(0)?,
+            id: r.get(1)?,
+            doc_type: r.get(2)?,
+            seq: r.get(3)?,
+            at: r.get(4)?,
+            author: r.get(5)?,
+            kind: r.get(6)?,
+            body: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 // ---------- fleet visibility (R9) ----------
 
 /// Parse the lease TTL out of a claim event body like "claimed (+900s)" or
