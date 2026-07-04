@@ -1282,3 +1282,40 @@ fn stats_integrity_flags_overlapping_claims() {
     assert_eq!(o.holder, "alice");
     assert_eq!(o.claimant, "bob");
 }
+
+#[test]
+fn stats_survives_negative_ttl_claim() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    // An already-expired lease writes a "claimed (+-10s)" event. The integrity
+    // replay must handle the negative ttl instead of erroring on an invalid
+    // SQLite '+-10 seconds' modifier.
+    store::claim_issue(&mut conn, "AMT-1", "alice", -10).unwrap();
+    let s = store::stats(&conn, None).unwrap();
+    assert!(s.integrity.ok);
+}
+
+#[test]
+fn agents_completed_dedupes_reopened_issue() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    // reopen, then complete again → two '→ done' events for one issue.
+    store::update_issue(
+        &mut conn,
+        "AMT-1",
+        store::IssuePatch {
+            status: Some("todo".into()),
+            ..Default::default()
+        },
+        "alice",
+    )
+    .unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+
+    let roster = store::agents(&conn).unwrap();
+    let alice = roster.iter().find(|a| a.name == "alice").unwrap();
+    assert_eq!(alice.completed, 1, "a reopened+redone issue counts once");
+}

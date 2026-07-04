@@ -1871,11 +1871,14 @@ fn is_claim_event(body: &str) -> bool {
 }
 
 /// `at` + `secs` as an ISO-8601 (Z) timestamp, computed by SQLite so the format
-/// matches `db::now` and comparisons stay lexicographic.
+/// matches `db::now` and comparisons stay lexicographic. `secs` may be negative
+/// (an already-expired lease); the sign is baked into the modifier so SQLite
+/// never sees an invalid `+-N seconds` (which would return NULL and error).
 fn iso_plus_secs(conn: &Connection, at: &str, secs: i64) -> Result<String> {
+    let modifier = format!("{secs:+} seconds"); // "+900 seconds" / "-10 seconds"
     Ok(conn.query_row(
-        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '+' || ?2 || ' seconds')",
-        params![at, secs],
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, ?2)",
+        params![at, modifier],
         |r| r.get(0),
     )?)
 }
@@ -1922,8 +1925,10 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
             [&name],
             |r| r.get(0),
         )?;
+        // COUNT DISTINCT doc_id so an issue done → reopened → done counts once.
         let completed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM activity WHERE author = ?1 AND kind = 'event' AND body LIKE '%→ done'",
+            "SELECT COUNT(DISTINCT doc_id) FROM activity
+             WHERE author = ?1 AND kind = 'event' AND body LIKE '%→ done'",
             [&name],
             |r| r.get(0),
         )?;
@@ -1967,10 +1972,15 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
         })?
         .collect::<std::result::Result<_, _>>()?;
     let throughput = cycles.len() as i64;
+    // Keep only non-negative cycles for avg/median: an inverted interval
+    // (done recorded before the first claim, e.g. a reopened issue) isn't a
+    // real cycle — exclude it rather than clamp it to 0 and skew the stats.
+    // Throughput still counts every completed issue above.
     let mut vals: Vec<i64> = cycles
         .into_iter()
         .flatten()
-        .map(|c| c.max(0.0).round() as i64)
+        .filter(|c| *c >= 0.0)
+        .map(|c| c.round() as i64)
         .collect();
     let avg_cycle_secs = if vals.is_empty() {
         None
@@ -1995,23 +2005,19 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
 /// means the log was tampered with or imported inconsistently. Automates the
 /// manual "no overlapping claims" verification from dogfooding run #1.
 fn claim_integrity(conn: &Connection, since: Option<&str>) -> Result<Integrity> {
-    let mut sql = "SELECT d.id, a.author, a.at, a.body
+    // Replay the FULL history — `since` must NOT filter the events here, because
+    // the replay is stateful: dropping a lease's opening claim (before the
+    // window) would reset the holder and mask an overlap that lands inside it.
+    // The window is applied only to the *reported* overlaps, below.
+    let sql = "SELECT d.id, a.author, a.at, a.body
         FROM documents d JOIN activity a ON a.doc_id = d.doc_id
         WHERE d.type = 'issue' AND a.kind = 'event'
           AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim renewed%'
-               OR a.body LIKE 'claim taken over from%' OR a.body LIKE 'released; status:%')"
-        .to_string();
-    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    if let Some(s) = since {
-        sql.push_str(" AND a.at >= ?");
-        args.push(Box::new(s.to_string()));
-    }
-    sql.push_str(" ORDER BY d.id, a.seq");
-    let mut stmt = conn.prepare(&sql)?;
+               OR a.body LIKE 'claim taken over from%' OR a.body LIKE 'released; status:%')
+        ORDER BY d.id, a.seq";
+    let mut stmt = conn.prepare(sql)?;
     let events: Vec<(String, String, String, String)> = stmt
-        .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<std::result::Result<_, _>>()?;
 
     let mut overlaps = Vec::new();
@@ -2042,10 +2048,20 @@ fn claim_integrity(conn: &Connection, since: Option<&str>) -> Result<Integrity> 
                     });
                 }
             }
-            let ttl = parse_ttl(&body).unwrap_or(0);
-            expiry = Some(iso_plus_secs(conn, &at, ttl)?);
+            // A claim event with an unparseable ttl is itself an anomaly; hold
+            // it as a far-future lease so a later different-agent claim IS
+            // flagged (fail toward surfacing overlaps in an audit) rather than
+            // treating it as a zero-length lease that silently masks them.
+            expiry = Some(match parse_ttl(&body) {
+                Some(ttl) => iso_plus_secs(conn, &at, ttl)?,
+                None => "9999-12-31T23:59:59.999Z".to_string(),
+            });
             holder = Some(author);
         }
+    }
+    // Scope the *report* to the window (the replay above stayed full-history).
+    if let Some(s) = since {
+        overlaps.retain(|o| o.at.as_str() >= s);
     }
     Ok(Integrity {
         ok: overlaps.is_empty(),
