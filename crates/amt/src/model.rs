@@ -72,7 +72,7 @@ pub struct ActivityEntry {
     pub body: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DocRef {
     pub id: String,
     #[serde(rename = "type")]
@@ -111,7 +111,7 @@ pub struct SearchHit {
 /// are surfaced separately (in `ContextPack.decisions`), so these are the
 /// note/project/issue docs that link to the issue.
 #[derive(Debug, Serialize)]
-pub struct BacklinkDoc {
+pub struct LinkedDoc {
     pub id: String,
     #[serde(rename = "type")]
     pub doc_type: String,
@@ -134,7 +134,7 @@ pub struct BacklinkDoc {
 pub struct ContextPack {
     pub issue: Issue,
     pub decisions: Vec<Decision>,
-    pub backlink_docs: Vec<BacklinkDoc>,
+    pub linked_docs: Vec<LinkedDoc>,
     pub fts_hits: Vec<SearchHit>,
     /// Char budget applied, if any (echoed for the agent's benefit).
     #[serde(skip_serializing_if = "Option::is_none")]

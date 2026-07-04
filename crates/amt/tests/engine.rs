@@ -822,11 +822,11 @@ fn context_pack_bundles_issue_decision_backlink_and_fts() {
     assert_eq!(pack.decisions[0].id, "D-1");
     assert!(pack.decisions[0].body.is_some());
     // The backlinked note's body is bundled; the decision is NOT duplicated
-    // into backlink_docs.
-    assert_eq!(pack.backlink_docs.len(), 1);
-    assert_eq!(pack.backlink_docs[0].id, "token-notes");
-    assert!(pack.backlink_docs[0].body.contains("Rotation cadence"));
-    assert!(pack.backlink_docs.iter().all(|b| b.doc_type != "decision"));
+    // into linked_docs.
+    assert_eq!(pack.linked_docs.len(), 1);
+    assert_eq!(pack.linked_docs[0].id, "token-notes");
+    assert!(pack.linked_docs[0].body.contains("Rotation cadence"));
+    assert!(pack.linked_docs.iter().all(|b| b.doc_type != "decision"));
     // The sibling issue shows up as a related FTS hit; AMT-1 itself does not.
     assert!(pack.fts_hits.iter().any(|h| h.id == "AMT-2"));
     assert!(pack.fts_hits.iter().all(|h| h.id != "AMT-1"));
@@ -840,7 +840,7 @@ fn context_pack_trims_fts_before_backlinks_before_activity() {
     let (_d, conn) = context_fixture();
     let full = store::context_pack(&conn, "AMT-1", None).unwrap();
     assert!(!full.fts_hits.is_empty());
-    assert_eq!(full.backlink_docs.len(), 1);
+    assert_eq!(full.linked_docs.len(), 1);
     assert!(!full.issue.activity.is_empty());
 
     // Budget between "issue+decisions alone" and the full pack, tight enough to
@@ -851,14 +851,14 @@ fn context_pack_trims_fts_before_backlinks_before_activity() {
         // everything that must survive, gives us a floor to pick a budget above.
         let mut p = store::context_pack(&conn, "AMT-1", None).unwrap();
         p.fts_hits.clear();
-        p.backlink_docs.clear();
+        p.linked_docs.clear();
         serde_json::to_string(&p).unwrap().len()
     };
     let pack = store::context_pack(&conn, "AMT-1", Some(baseline as i64 + 50)).unwrap();
 
     // FTS hits go first, then the backlink body — both gone.
     assert!(pack.fts_hits.is_empty(), "FTS hits should drop first");
-    assert!(pack.backlink_docs.is_empty(), "backlink bodies drop after FTS");
+    assert!(pack.linked_docs.is_empty(), "backlink bodies drop after FTS");
     // The issue body, decisions, and (at this budget) activity survive.
     assert!(pack.issue.body.is_some(), "issue body is never dropped");
     assert_eq!(pack.decisions.len(), 1, "decisions are never dropped");
@@ -880,12 +880,36 @@ fn context_pack_truncates_activity_but_keeps_issue_body_and_decisions() {
     // and decisions must still be present regardless.
     let pack = store::context_pack(&conn, "AMT-1", Some(200)).unwrap();
     assert!(pack.fts_hits.is_empty());
-    assert!(pack.backlink_docs.is_empty());
+    assert!(pack.linked_docs.is_empty());
     assert!(pack.issue.body.is_some(), "issue body is never dropped");
     assert_eq!(pack.decisions.len(), 1, "decisions are never dropped");
     // Activity was truncated (recorded in the manifest).
     assert!(pack.issue.activity.len() < 3);
     assert!(pack.dropped.iter().any(|x| x.starts_with("activity")));
+}
+
+#[test]
+fn context_pack_includes_forward_linked_docs() {
+    let (_d, mut conn) = workspace();
+    // An issue that links OUT to a design note which never links back — the
+    // primary context an agent needs when it claims the issue.
+    store::create_issue(
+        &mut conn,
+        new_issue("Build login", "Implement per [[Login Design]].", "high"),
+    )
+    .unwrap();
+    store::create_doc(&mut conn, new_note("Login Design", "OAuth PKCE flow, 15m tokens.")).unwrap();
+
+    let pack = store::context_pack(&conn, "AMT-1", None).unwrap();
+    // The forward-linked note is bundled even though it has no backlink to the
+    // issue (the old behavior only captured inbound backlinks and missed this).
+    assert!(
+        pack.linked_docs
+            .iter()
+            .any(|d| d.id == "login-design" && d.body.contains("PKCE")),
+        "forward-linked doc must be in the pack: {:?}",
+        pack.linked_docs.iter().map(|d| &d.id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -902,7 +926,7 @@ fn context_pack_mcp_matches_store_serialization() {
     assert_eq!(cli_json, mcp_json);
     // And the shape the agent depends on is stable.
     let v: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
-    for field in ["issue", "decisions", "backlink_docs", "fts_hits", "dropped"] {
+    for field in ["issue", "decisions", "linked_docs", "fts_hits", "dropped"] {
         assert!(v.get(field).is_some(), "missing field {field}");
     }
 }

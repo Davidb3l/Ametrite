@@ -454,9 +454,9 @@ fn print_context_pack(pack: &ContextPack) {
             }
         }
     }
-    if !pack.backlink_docs.is_empty() {
+    if !pack.linked_docs.is_empty() {
         println!("\n=== backlinked docs ===");
-        for b in &pack.backlink_docs {
+        for b in &pack.linked_docs {
             println!("\n{} ({}) — {}", b.id, b.doc_type, b.title);
             if !b.body.trim().is_empty() {
                 println!("{}", b.body.trim_end());

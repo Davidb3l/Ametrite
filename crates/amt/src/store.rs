@@ -168,6 +168,24 @@ fn backlinks_of(conn: &Connection, doc_id: i64) -> Result<Vec<DocRef>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Docs this doc links *out* to (resolved forward wikilinks) — the notes/issues
+/// an issue references. Complements `backlinks_of` (inbound) for context packs.
+fn forward_links_of(conn: &Connection, doc_id: i64) -> Result<Vec<DocRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT d.id, d.type, d.title
+         FROM links l JOIN documents d ON d.doc_id = l.target_doc_id
+         WHERE l.source_doc_id = ?1 AND l.target_doc_id IS NOT NULL ORDER BY d.id",
+    )?;
+    let rows = stmt.query_map([doc_id], |r| {
+        Ok(DocRef {
+            id: r.get(0)?,
+            doc_type: r.get(1)?,
+            title: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 fn activity_of(conn: &Connection, doc_id: i64) -> Result<Vec<ActivityEntry>> {
     let mut stmt = conn.prepare(
         "SELECT seq, at, author, kind, body FROM activity WHERE doc_id = ?1 ORDER BY seq",
@@ -1410,22 +1428,30 @@ pub fn context_pack(conn: &Connection, key: &str, budget: Option<i64>) -> Result
         }
     }
 
-    // Backlinked docs' bodies. Decisions are surfaced separately above, and the
-    // issue links to itself via decision edges, so exclude decisions and the
-    // issue itself here. FTS hits below also exclude these ids.
+    // Linked docs' bodies, in BOTH directions: the notes/issues this issue
+    // references (forward links — the primary context an agent needs) and the
+    // docs that reference it (inbound backlinks). Decisions are surfaced in
+    // their own field, and the issue links to itself via decision edges, so
+    // exclude decisions and the issue itself. FTS hits below also skip these.
     let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
     excluded.insert(issue.id.clone());
     for d in &decisions {
         excluded.insert(d.id.clone());
     }
-    let mut backlink_docs: Vec<BacklinkDoc> = Vec::new();
-    for b in &issue.backlinks {
-        if b.doc_type == "decision" || b.id == issue.id {
+    let doc_id = doc_id_of(conn, &issue.id)?;
+    let mut linked_docs: Vec<LinkedDoc> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Forward links first (what the issue points at), then inbound backlinks.
+    let candidates = forward_links_of(conn, doc_id)?
+        .into_iter()
+        .chain(issue.backlinks.iter().cloned());
+    for b in candidates {
+        if b.doc_type == "decision" || excluded.contains(&b.id) || !seen.insert(b.id.clone()) {
             continue;
         }
         let doc = get_doc(conn, &b.id)?;
         excluded.insert(doc.id.clone());
-        backlink_docs.push(BacklinkDoc {
+        linked_docs.push(LinkedDoc {
             id: doc.id,
             doc_type: doc.doc_type,
             title: doc.title,
@@ -1453,7 +1479,7 @@ pub fn context_pack(conn: &Connection, key: &str, budget: Option<i64>) -> Result
     let mut pack = ContextPack {
         issue,
         decisions,
-        backlink_docs,
+        linked_docs,
         fts_hits,
         budget,
         dropped: Vec::new(),
@@ -1482,14 +1508,14 @@ fn trim_to_budget(pack: &mut ContextPack, cap: i64) {
     }
 
     // (2) Backlink bodies: oldest first (ascending updated_at).
-    if pack_size(pack) > cap && !pack.backlink_docs.is_empty() {
-        pack.backlink_docs
+    if pack_size(pack) > cap && !pack.linked_docs.is_empty() {
+        pack.linked_docs
             .sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
         while pack_size(pack) > cap {
-            if pack.backlink_docs.is_empty() {
+            if pack.linked_docs.is_empty() {
                 break;
             }
-            let doc = pack.backlink_docs.remove(0);
+            let doc = pack.linked_docs.remove(0);
             pack.dropped.push(format!("backlink {}", doc.id));
         }
     }
