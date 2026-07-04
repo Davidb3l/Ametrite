@@ -1221,3 +1221,64 @@ fn doctor_handles_large_acyclic_dependency_graph() {
         "a forward-only DAG has no cycles"
     );
 }
+
+#[test]
+fn agents_roster_reports_leases_and_counts() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("a", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("b", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    store::claim_issue(&mut conn, "AMT-2", "alice", 900).unwrap(); // still held
+
+    let roster = store::agents(&conn).unwrap();
+    let alice = roster.iter().find(|a| a.name == "alice").unwrap();
+    assert_eq!(alice.active_leases, vec!["AMT-2".to_string()]);
+    assert_eq!(alice.claims, 2, "two fresh claims");
+    assert_eq!(alice.completed, 1, "one issue moved to done");
+    assert!(alice.next_expiry.is_some());
+    assert!(!alice.has_stale_lease);
+}
+
+#[test]
+fn stats_throughput_cycle_and_clean_integrity() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "alice-agent", "alice", 900).unwrap_err(); // wrong key, ignored
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+
+    let s = store::stats(&conn, None).unwrap();
+    assert_eq!(s.throughput, 1);
+    assert!(s.avg_cycle_secs.is_some(), "a claimed+done issue has a cycle time");
+    assert!(s.integrity.ok, "no overlaps in a normal run");
+    assert!(s.integrity.overlaps.is_empty());
+}
+
+#[test]
+fn stats_integrity_flags_overlapping_claims() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Contended", "", "high")).unwrap();
+    // alice holds a live 900s lease.
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    // Tamper the log: inject a bob claim WHILE alice's lease is still live —
+    // an overlap the engine would never allow. The audit must catch it.
+    let doc_id: i64 = conn
+        .query_row("SELECT doc_id FROM documents WHERE id = 'AMT-1'", [], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO activity(doc_id, seq, at, author, kind, body)
+         VALUES (?1, (SELECT COALESCE(MAX(seq),0)+1 FROM activity WHERE doc_id = ?1),
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'bob', 'event', 'claimed (+900s)')",
+        [doc_id],
+    )
+    .unwrap();
+
+    let s = store::stats(&conn, None).unwrap();
+    assert!(!s.integrity.ok, "overlap must be detected");
+    assert_eq!(s.integrity.overlaps.len(), 1);
+    let o = &s.integrity.overlaps[0];
+    assert_eq!(o.issue, "AMT-1");
+    assert_eq!(o.holder, "alice");
+    assert_eq!(o.claimant, "bob");
+}

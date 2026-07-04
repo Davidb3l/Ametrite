@@ -442,6 +442,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             id.clone(),
             &run!(store::backlinks(conn, &try_arg!(req("id")))),
         ),
+        "list_agents" => {
+            let roster = run!(store::agents(conn));
+            text_result(id, &roster)
+        }
+        "get_stats" => {
+            let stats = run!(store::stats(conn, opt_s(&args, "since").as_deref()));
+            text_result(id, &stats)
+        }
         "add_dependency" => {
             run!(store::add_block(
                 conn,
@@ -565,6 +573,10 @@ fn tool_defs() -> Vec<Value> {
             &["id"]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
+        tool("list_agents", "Agent roster (fleet visibility): each agent's live leases, soonest lease expiry, last activity time, and lifetime claim/completion counts.",
+            json!({}), &[]),
+        tool("get_stats", "Throughput, cycle time (first-claim → done), and a claim-integrity audit that replays the activity log to assert no two agents ever held the same issue at once. Optional 'since' window.",
+            json!({ "since": s("Only count work completed at/after this ISO-8601 instant") }), &[]),
         tool("add_dependency", "Declare that 'blocker' must reach a terminal status (done/canceled) before 'blocked' can be claimed. Claim/peek skip an issue with any open blocker. Rejects self-blocks and edges that would form a cycle.",
             json!({ "blocker": s("Issue key that must close first"), "blocked": s("Issue key that waits on the blocker"),
                     "agent": s("Acting agent name") }),

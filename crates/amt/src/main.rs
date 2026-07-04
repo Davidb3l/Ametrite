@@ -149,6 +149,14 @@ enum Cmd {
     Backlinks { id: String },
     /// Check workspace health (unresolved links, stale claims, missing refs)
     Doctor,
+    /// Show the agent roster: live leases, expiry, last activity, per-agent counts
+    Agents,
+    /// Throughput, cycle time, and a claim-integrity audit over an optional window
+    Stats {
+        /// Only count work completed at/after this ISO-8601 instant
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Export the workspace as Obsidian-compatible markdown files
     Export { dir: PathBuf },
     /// Import markdown files (previously exported or Obsidian-authored)
@@ -407,6 +415,29 @@ fn print_no_work(json: bool, nw: &store::NoWork) {
         match nw.retry_after {
             Some(s) => println!(" (retry after {s}s)"),
             None => println!(),
+        }
+    }
+}
+
+/// Compact human duration: "45s", "12m", "3h 20m", "2d 4h".
+fn fmt_secs(s: i64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        let (h, m) = (s / 3600, (s % 3600) / 60);
+        if m > 0 {
+            format!("{h}h {m}m")
+        } else {
+            format!("{h}h")
+        }
+    } else {
+        let (d, h) = (s / 86400, (s % 86400) / 3600);
+        if h > 0 {
+            format!("{d}d {h}h")
+        } else {
+            format!("{d}d")
         }
     }
 }
@@ -1218,6 +1249,76 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 for c in &report.dependency_cycles {
                     println!("dependency cycle: {}", c.cycle.join(" → "));
+                }
+            }
+            Ok(())
+        }
+        Cmd::Agents => {
+            let conn = open_workspace(&cli.workspace)?;
+            let roster = store::agents(&conn)?;
+            if cli.json {
+                print_json(&roster);
+            } else if roster.is_empty() {
+                println!("no agents have acted yet");
+            } else {
+                println!(
+                    "{:<18} {:>7} {:>6} {:>5}  LAST ACTIVITY",
+                    "AGENT", "LEASES", "CLAIMS", "DONE"
+                );
+                for a in &roster {
+                    let leases = if a.active_leases.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!(
+                            "{}{}",
+                            a.active_leases.len(),
+                            if a.has_stale_lease { "⚠" } else { "🔒" }
+                        )
+                    };
+                    println!(
+                        "{:<18} {:>7} {:>6} {:>5}  {}",
+                        a.name,
+                        leases,
+                        a.claims,
+                        a.completed,
+                        a.last_activity.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            Ok(())
+        }
+        Cmd::Stats { since } => {
+            let conn = open_workspace(&cli.workspace)?;
+            let stats = store::stats(&conn, since.as_deref())?;
+            if cli.json {
+                print_json(&stats);
+            } else {
+                println!(
+                    "Stats ({})",
+                    stats.since.as_deref().unwrap_or("all time")
+                );
+                println!("  throughput:  {} issue(s) done", stats.throughput);
+                match (stats.avg_cycle_secs, stats.median_cycle_secs) {
+                    (Some(a), Some(m)) => println!(
+                        "  cycle time:  avg {}, median {}",
+                        fmt_secs(a),
+                        fmt_secs(m)
+                    ),
+                    _ => println!("  cycle time:  —"),
+                }
+                if stats.integrity.ok {
+                    println!("  integrity:   ✓ no overlapping claims");
+                } else {
+                    println!(
+                        "  integrity:   ✗ {} overlapping claim(s):",
+                        stats.integrity.overlaps.len()
+                    );
+                    for o in &stats.integrity.overlaps {
+                        println!(
+                            "    {} — {} claimed while {} held the lease (at {})",
+                            o.issue, o.claimant, o.holder, o.at
+                        );
+                    }
                 }
             }
             Ok(())

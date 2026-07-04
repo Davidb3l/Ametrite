@@ -1853,6 +1853,206 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
     })
 }
 
+// ---------- fleet visibility (R9) ----------
+
+/// Parse the lease TTL out of a claim event body like "claimed (+900s)" or
+/// "claim taken over from x (expired lease, +900s)". Returns the seconds.
+fn parse_ttl(body: &str) -> Option<i64> {
+    let plus = body.rfind('+')?;
+    let rest = &body[plus + 1..];
+    let end = rest.find('s')?;
+    rest[..end].parse::<i64>().ok()
+}
+
+fn is_claim_event(body: &str) -> bool {
+    body.starts_with("claimed (")
+        || body.starts_with("claim renewed")
+        || body.starts_with("claim taken over from")
+}
+
+/// `at` + `secs` as an ISO-8601 (Z) timestamp, computed by SQLite so the format
+/// matches `db::now` and comparisons stay lexicographic.
+fn iso_plus_secs(conn: &Connection, at: &str, secs: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '+' || ?2 || ' seconds')",
+        params![at, secs],
+        |r| r.get(0),
+    )?)
+}
+
+/// Roster of every agent that has acted or holds a lease, with their live
+/// leases, soonest expiry, last activity, and lifetime claim/completion counts.
+pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
+    let now = db::now(conn)?;
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    {
+        let mut s = conn.prepare("SELECT DISTINCT author FROM activity")?;
+        for r in s.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(r?);
+        }
+        let mut s =
+            conn.prepare("SELECT DISTINCT claimed_by FROM issues WHERE claimed_by IS NOT NULL")?;
+        for r in s.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(r?);
+        }
+    }
+    let mut out = Vec::new();
+    for name in names {
+        let mut ls = conn.prepare(
+            "SELECT d.id, i.claim_expires_at FROM issues i JOIN documents d ON d.doc_id = i.doc_id
+             WHERE i.claimed_by = ?1 ORDER BY i.claim_expires_at",
+        )?;
+        let leases: Vec<(String, Option<String>)> = ls
+            .query_map([&name], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let active_leases: Vec<String> = leases.iter().map(|(k, _)| k.clone()).collect();
+        let next_expiry = leases.iter().filter_map(|(_, e)| e.clone()).min();
+        let has_stale_lease = leases
+            .iter()
+            .any(|(_, e)| matches!(e, Some(exp) if exp.as_str() < now.as_str()));
+        let last_activity: Option<String> = conn
+            .query_row("SELECT MAX(at) FROM activity WHERE author = ?1", [&name], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        let claims: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM activity WHERE author = ?1 AND kind = 'event'
+             AND (body LIKE 'claimed (%' OR body LIKE 'claim taken over from%')",
+            [&name],
+            |r| r.get(0),
+        )?;
+        let completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM activity WHERE author = ?1 AND kind = 'event' AND body LIKE '%→ done'",
+            [&name],
+            |r| r.get(0),
+        )?;
+        out.push(AgentRow {
+            name,
+            active_leases,
+            next_expiry,
+            has_stale_lease,
+            last_activity,
+            claims,
+            completed,
+        });
+    }
+    Ok(out)
+}
+
+/// Throughput, cycle time, and the claim-integrity audit over an optional
+/// `--since` window (ISO-8601 lower bound on the completion time).
+pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
+    // Per issue: its done-time (latest '→ done' event) and first-claim time.
+    let mut sql = "SELECT cycle FROM (
+        SELECT (julianday(MAX(CASE WHEN a.body LIKE '%→ done' THEN a.at END))
+                - julianday(MIN(CASE WHEN a.kind='event'
+                       AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
+                     THEN a.at END))) * 86400.0 AS cycle,
+               MAX(CASE WHEN a.body LIKE '%→ done' THEN a.at END) AS done_at
+        FROM documents d JOIN activity a ON a.doc_id = d.doc_id
+        WHERE d.type = 'issue'
+        GROUP BY d.doc_id)
+        WHERE done_at IS NOT NULL"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    if let Some(s) = since {
+        sql.push_str(" AND done_at >= ?");
+        args.push(Box::new(s.to_string()));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let cycles: Vec<Option<f64>> = stmt
+        .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
+            r.get::<_, Option<f64>>(0)
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let throughput = cycles.len() as i64;
+    let mut vals: Vec<i64> = cycles
+        .into_iter()
+        .flatten()
+        .map(|c| c.max(0.0).round() as i64)
+        .collect();
+    let avg_cycle_secs = if vals.is_empty() {
+        None
+    } else {
+        Some((vals.iter().sum::<i64>() as f64 / vals.len() as f64).round() as i64)
+    };
+    vals.sort_unstable();
+    let median_cycle_secs = vals.get(vals.len() / 2).copied();
+    let integrity = claim_integrity(conn, since)?;
+    Ok(Stats {
+        since: since.map(String::from),
+        throughput,
+        avg_cycle_secs,
+        median_cycle_secs,
+        integrity,
+    })
+}
+
+/// Replay the claim/release events per issue and flag any claim that landed
+/// while another agent's recorded lease was still live — an overlapping claim
+/// that should be impossible (the engine refuses it), so a non-empty result
+/// means the log was tampered with or imported inconsistently. Automates the
+/// manual "no overlapping claims" verification from dogfooding run #1.
+fn claim_integrity(conn: &Connection, since: Option<&str>) -> Result<Integrity> {
+    let mut sql = "SELECT d.id, a.author, a.at, a.body
+        FROM documents d JOIN activity a ON a.doc_id = d.doc_id
+        WHERE d.type = 'issue' AND a.kind = 'event'
+          AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim renewed%'
+               OR a.body LIKE 'claim taken over from%' OR a.body LIKE 'released; status:%')"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    if let Some(s) = since {
+        sql.push_str(" AND a.at >= ?");
+        args.push(Box::new(s.to_string()));
+    }
+    sql.push_str(" ORDER BY d.id, a.seq");
+    let mut stmt = conn.prepare(&sql)?;
+    let events: Vec<(String, String, String, String)> = stmt
+        .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut overlaps = Vec::new();
+    let mut cur_issue = String::new();
+    let mut holder: Option<String> = None;
+    let mut expiry: Option<String> = None;
+    for (issue, author, at, body) in events {
+        if issue != cur_issue {
+            cur_issue = issue.clone();
+            holder = None;
+            expiry = None;
+        }
+        if body.starts_with("released; status:") {
+            holder = None;
+            expiry = None;
+            continue;
+        }
+        if is_claim_event(&body) {
+            // Overlap: a different agent claims while the holder's lease is still
+            // live (its recorded expiry is strictly after this claim's time).
+            if let (Some(h), Some(exp)) = (&holder, &expiry) {
+                if h != &author && at.as_str() < exp.as_str() {
+                    overlaps.push(ClaimOverlap {
+                        issue: issue.clone(),
+                        holder: h.clone(),
+                        claimant: author.clone(),
+                        at: at.clone(),
+                    });
+                }
+            }
+            let ttl = parse_ttl(&body).unwrap_or(0);
+            expiry = Some(iso_plus_secs(conn, &at, ttl)?);
+            holder = Some(author);
+        }
+    }
+    Ok(Integrity {
+        ok: overlaps.is_empty(),
+        overlaps,
+    })
+}
+
 /// Find every cycle in the `blocks` graph via DFS, reporting each distinct ring
 /// once (canonicalized by its lexicographically smallest rotation). `add_block`
 /// already refuses to introduce cycles, so this is a safety net for edges that

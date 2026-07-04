@@ -189,3 +189,60 @@ pub struct MissingRef {
     pub id: String,
     pub references: String,
 }
+
+/// One agent's fleet-visibility row (`amt agents`). R9.
+#[derive(Debug, Serialize)]
+pub struct AgentRow {
+    pub name: String,
+    /// Issue keys currently held by this agent (claimed_by = name).
+    pub active_leases: Vec<String>,
+    /// Soonest lease expiry among active leases (ISO-8601), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_expiry: Option<String>,
+    /// True if any held lease has already expired (claimable by others).
+    pub has_stale_lease: bool,
+    /// Most recent activity timestamp by this agent (ISO-8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    /// Lifetime count of fresh claims (excludes renewals).
+    pub claims: i64,
+    /// Issues this agent moved to `done`.
+    pub completed: i64,
+}
+
+/// Throughput / cycle-time / integrity summary (`amt stats --since`). R9.
+#[derive(Debug, Serialize)]
+pub struct Stats {
+    /// Window start (ISO-8601), or None for all-time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Issues moved to `done` within the window.
+    pub throughput: i64,
+    /// Mean first-claim → done duration over completed issues, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_cycle_secs: Option<i64>,
+    /// Median first-claim → done duration, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_cycle_secs: Option<i64>,
+    /// Claim-overlap audit reconstructed from the activity log.
+    pub integrity: Integrity,
+}
+
+/// Result of replaying the activity log to assert no two agents ever held the
+/// same issue at once (automates the manual run-#1 verification). R9.
+#[derive(Debug, Serialize)]
+pub struct Integrity {
+    pub overlaps: Vec<ClaimOverlap>,
+    pub ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimOverlap {
+    pub issue: String,
+    /// Agent whose live lease was violated.
+    pub holder: String,
+    /// Agent that claimed while `holder`'s lease was still live.
+    pub claimant: String,
+    /// When the overlapping claim happened (ISO-8601).
+    pub at: String,
+}

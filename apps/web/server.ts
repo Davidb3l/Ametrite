@@ -431,6 +431,13 @@ Bun.serve({
       return doc ? json(doc) : json({ error: "not found" }, 404);
     },
     "/api/search": (req) => json(search(dbOf(wsOf(req)), new URL(req.url).searchParams)),
+    // Fleet visibility (R9) — reuse the engine so the roster/stats logic lives
+    // in exactly one place. `amt` shells out and already emits JSON.
+    "/api/agents": (req) => amt(wsOf(req), ["agents"]),
+    "/api/stats": (req) => {
+      const since = new URL(req.url).searchParams.get("since");
+      return amt(wsOf(req), ["stats", ...(since ? ["--since", since] : [])]);
+    },
     "/api/events": () => {
       let ctrl: ReadableStreamDefaultController;
       const stream = new ReadableStream({

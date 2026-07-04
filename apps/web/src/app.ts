@@ -160,6 +160,7 @@ async function render() {
     else if (r.view === "issue" && r.arg) await renderIssue(r.arg);
     else if (r.view === "notes") await renderNotes(r.arg);
     else if (r.view === "search") renderSearch();
+    else if (r.view === "agents") await renderAgents();
     else if (r.view === "doc" && r.arg) await renderDocRedirect(r.arg);
     else if (r.view === "x" && r.arg) await crossWorkspace(r.arg);
     else location.hash = "#/board";
@@ -276,6 +277,72 @@ async function renderInbox() {
         ${claim}
       </a>`);
     box.append(row);
+  }
+}
+
+// Collapse consecutive lease-heartbeat events (same author, "claim renewed")
+// into one row with a ×N count, so a long agent loop doesn't flood the timeline.
+function compactActivity(activity: Activity[]): (Activity & { n?: number })[] {
+  const out: (Activity & { n?: number })[] = [];
+  for (const a of activity) {
+    const prev = out[out.length - 1];
+    const beat = a.kind === "event" && a.body.startsWith("claim renewed");
+    if (beat && prev && prev.kind === "event" && prev.author === a.author && prev.body.startsWith("claim renewed")) {
+      prev.n = (prev.n ?? 1) + 1;
+      prev.at = a.at; // surface the most recent heartbeat time
+    } else {
+      out.push({ ...a, n: 1 });
+    }
+  }
+  return out;
+}
+
+// ---------- agents / fleet visibility (R9) ----------
+function fmtSecs(s: number): string {
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+async function renderAgents() {
+  const [roster, stats] = await Promise.all([
+    api("/api/agents").catch(() => []),
+    api("/api/stats").catch(() => null),
+  ]);
+  main.innerHTML = "";
+  const integ = stats?.integrity;
+  main.append(h(`
+    <div class="topbar"><h1>Agents</h1><div class="spacer"></div></div>
+    <div class="content">
+      ${stats ? `<div class="stats-bar">
+        <div class="stat"><span class="n">${stats.throughput}</span><span class="l">completed</span></div>
+        <div class="stat"><span class="n">${stats.avg_cycle_secs != null ? fmtSecs(stats.avg_cycle_secs) : "—"}</span><span class="l">avg cycle</span></div>
+        <div class="stat"><span class="n">${stats.median_cycle_secs != null ? fmtSecs(stats.median_cycle_secs) : "—"}</span><span class="l">median cycle</span></div>
+        <div class="stat ${integ?.ok ? "ok" : "bad"}"><span class="n">${integ?.ok ? "✓" : "✗ " + integ.overlaps.length}</span><span class="l">claim integrity</span></div>
+      </div>` : ""}
+      <div class="agents" id="agents"></div>
+    </div>`));
+
+  const box = main.querySelector("#agents")!;
+  if (!roster.length) {
+    box.innerHTML = '<div class="empty big"><span class="facet"></span>No agents have acted yet.</div>';
+    return;
+  }
+  box.append(h(`<div class="agent-row head">
+    <span class="who">Agent</span><span class="leases">Leases</span>
+    <span class="num">Claims</span><span class="num">Done</span><span class="last">Last active</span></div>`));
+  for (const a of roster) {
+    const lease = a.active_leases.length
+      ? `<span class="claim ${a.has_stale_lease ? "stale" : ""}" title="${a.active_leases.join(", ")}">${a.has_stale_lease ? "⚠" : "🔒"} ${a.active_leases.length}</span>`
+      : '<span class="muted">—</span>';
+    box.append(h(`<div class="agent-row">
+      <span class="who">${esc(a.name)}</span>
+      <span class="leases">${lease}</span>
+      <span class="num">${a.claims}</span>
+      <span class="num">${a.completed}</span>
+      <span class="last">${a.last_activity ? ago(a.last_activity) + " ago" : "—"}</span>
+    </div>`));
   }
 }
 
@@ -424,12 +491,12 @@ async function renderIssue(id: string) {
     : '<div class="empty" style="padding:6px 0">Nothing links here yet.</div>';
 
   const act = main.querySelector("#activity")!;
-  act.innerHTML = (i.activity ?? []).map((a) =>
+  act.innerHTML = compactActivity(i.activity ?? []).map((a) =>
     a.kind === "comment"
       ? `<div class="activity-entry comment"><div><span class="who">@${esc(a.author)}</span>
            <span class="when">${ago(a.at)} ago</span><div class="prose">${md(a.body)}</div></div></div>`
       : `<div class="activity-entry event"><span class="when">${ago(a.at)}</span>
-           <span class="what"><span class="who">@${esc(a.author)}</span> ${esc(a.body)}</span></div>`
+           <span class="what"><span class="who">@${esc(a.author)}</span> ${esc(a.body)}${(a as any).n > 1 ? ` <span class="xn">×${(a as any).n}</span>` : ""}</span></div>`
   ).join("") || '<div class="empty" style="padding:6px 0">No activity.</div>';
 
   main.querySelector("#send-comment")!.addEventListener("click", async () => {
@@ -664,6 +731,7 @@ window.addEventListener("keydown", (e) => {
   ) return;
   if (e.key === "b") location.hash = "#/board";
   else if (e.key === "i") location.hash = "#/inbox";
+  else if (e.key === "a") location.hash = "#/agents";
   else if (e.key === "n") location.hash = "#/notes";
   else if (e.key === "/") { location.hash = "#/search"; e.preventDefault(); }
   else if (e.key === "c" && route().view === "board") { issueDialog(); e.preventDefault(); }
