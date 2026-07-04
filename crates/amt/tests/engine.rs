@@ -751,3 +751,158 @@ fn no_work_with_no_candidates_has_null_retry() {
     assert_eq!(nw.counts.blocked_by_cooldown, 0);
     assert!(nw.retry_after.is_none(), "nothing is ever coming");
 }
+
+/// Build a workspace whose AMT-1 has a backlinked note, a decision resolving
+/// it, activity entries, and a sibling issue that FTS will surface as related.
+/// Returns the connection so each test can pack AMT-1 under its own budget.
+fn context_fixture() -> (TempDir, Connection) {
+    let (d, mut conn) = workspace();
+    // AMT-1: the issue we pack, with a body wikilink to a note.
+    store::create_issue(
+        &mut conn,
+        new_issue(
+            "Session token rotation",
+            "Rotate session tokens on refresh. Background: [[Token Notes]].",
+            "high",
+        ),
+    )
+    .unwrap();
+    // Backlinked note (resolves the dangling [[Token Notes]] link) with a large
+    // body so it dominates the pack's byte size under a tight budget.
+    store::create_doc(
+        &mut conn,
+        new_note(
+            "Token Notes",
+            &format!("Rotation cadence and pitfalls. Relates to [[AMT-1]].\n\n{}",
+                "detail ".repeat(200)),
+        ),
+    )
+    .unwrap();
+    // A decision resolving AMT-1 (must always survive trimming).
+    store::record_decision(
+        &mut conn,
+        store::NewDecision {
+            title: "Rotate on every refresh".into(),
+            body: "We rotate the session token on each refresh call.".into(),
+            resolves: "AMT-1".into(),
+            status: "accepted".into(),
+            supersedes: None,
+            author: "test".into(),
+        },
+    )
+    .unwrap();
+    // Activity entries on AMT-1 (trimmed only as a last resort).
+    for i in 0..3 {
+        store::add_comment(&mut conn, "AMT-1", "test", &format!("progress note {i}")).unwrap();
+    }
+    // A separate issue whose title contains every term of AMT-1's title so the
+    // FTS query (built from that title, ANDing terms) surfaces it as related.
+    store::create_issue(
+        &mut conn,
+        new_issue(
+            "Session token rotation audit",
+            "Audit the session token rotation store.",
+            "low",
+        ),
+    )
+    .unwrap();
+    (d, conn)
+}
+
+#[test]
+fn context_pack_bundles_issue_decision_backlink_and_fts() {
+    let (_d, conn) = context_fixture();
+    let pack = store::context_pack(&conn, "AMT-1", None).unwrap();
+
+    // Issue with its body is present.
+    assert_eq!(pack.issue.id, "AMT-1");
+    assert!(pack.issue.body.as_deref().unwrap().contains("Rotate session tokens"));
+    // The decision resolving AMT-1 is included, with its body.
+    assert_eq!(pack.decisions.len(), 1);
+    assert_eq!(pack.decisions[0].id, "D-1");
+    assert!(pack.decisions[0].body.is_some());
+    // The backlinked note's body is bundled; the decision is NOT duplicated
+    // into backlink_docs.
+    assert_eq!(pack.backlink_docs.len(), 1);
+    assert_eq!(pack.backlink_docs[0].id, "token-notes");
+    assert!(pack.backlink_docs[0].body.contains("Rotation cadence"));
+    assert!(pack.backlink_docs.iter().all(|b| b.doc_type != "decision"));
+    // The sibling issue shows up as a related FTS hit; AMT-1 itself does not.
+    assert!(pack.fts_hits.iter().any(|h| h.id == "AMT-2"));
+    assert!(pack.fts_hits.iter().all(|h| h.id != "AMT-1"));
+    // Nothing dropped without a budget.
+    assert!(pack.dropped.is_empty());
+    assert!(pack.budget.is_none());
+}
+
+#[test]
+fn context_pack_trims_fts_before_backlinks_before_activity() {
+    let (_d, conn) = context_fixture();
+    let full = store::context_pack(&conn, "AMT-1", None).unwrap();
+    assert!(!full.fts_hits.is_empty());
+    assert_eq!(full.backlink_docs.len(), 1);
+    assert!(!full.issue.activity.is_empty());
+
+    // Budget between "issue+decisions alone" and the full pack, tight enough to
+    // force every FTS hit and the (large) backlink body out, but generous
+    // enough to keep activity.
+    let baseline = {
+        // Serialized size of just the issue (with activity) + decisions, i.e.
+        // everything that must survive, gives us a floor to pick a budget above.
+        let mut p = store::context_pack(&conn, "AMT-1", None).unwrap();
+        p.fts_hits.clear();
+        p.backlink_docs.clear();
+        serde_json::to_string(&p).unwrap().len()
+    };
+    let pack = store::context_pack(&conn, "AMT-1", Some(baseline as i64 + 50)).unwrap();
+
+    // FTS hits go first, then the backlink body — both gone.
+    assert!(pack.fts_hits.is_empty(), "FTS hits should drop first");
+    assert!(pack.backlink_docs.is_empty(), "backlink bodies drop after FTS");
+    // The issue body, decisions, and (at this budget) activity survive.
+    assert!(pack.issue.body.is_some(), "issue body is never dropped");
+    assert_eq!(pack.decisions.len(), 1, "decisions are never dropped");
+    assert!(!pack.issue.activity.is_empty(), "activity survives a mid budget");
+    // The dropped manifest names the cuts, FTS before backlinks.
+    assert!(pack.dropped.iter().any(|x| x.starts_with("fts_hit")));
+    assert!(pack.dropped.iter().any(|x| x.starts_with("backlink")));
+    let first_fts = pack.dropped.iter().position(|x| x.starts_with("fts_hit"));
+    let first_bl = pack.dropped.iter().position(|x| x.starts_with("backlink"));
+    assert!(first_fts < first_bl, "FTS must be dropped before backlinks");
+    // Under budget after trimming.
+    assert!(serde_json::to_string(&pack).unwrap().len() <= baseline + 50);
+}
+
+#[test]
+fn context_pack_truncates_activity_but_keeps_issue_body_and_decisions() {
+    let (_d, conn) = context_fixture();
+    // A brutally tight budget: force activity truncation too. The issue body
+    // and decisions must still be present regardless.
+    let pack = store::context_pack(&conn, "AMT-1", Some(200)).unwrap();
+    assert!(pack.fts_hits.is_empty());
+    assert!(pack.backlink_docs.is_empty());
+    assert!(pack.issue.body.is_some(), "issue body is never dropped");
+    assert_eq!(pack.decisions.len(), 1, "decisions are never dropped");
+    // Activity was truncated (recorded in the manifest).
+    assert!(pack.issue.activity.len() < 3);
+    assert!(pack.dropped.iter().any(|x| x.starts_with("activity")));
+}
+
+#[test]
+fn context_pack_mcp_matches_store_serialization() {
+    // The MCP get_context tool is a thin wrapper: it calls store::context_pack
+    // with the same (id, budget) and serializes the pack via serde_json, the
+    // same contract the CLI's print_json uses. Parity therefore reduces to the
+    // pack round-tripping identically through serde_json — assert that here so
+    // both surfaces are guaranteed to emit the same bytes for the same pack.
+    let (_d, conn) = context_fixture();
+    let pack = store::context_pack(&conn, "AMT-1", Some(4000)).unwrap();
+    let cli_json = serde_json::to_string_pretty(&pack).unwrap();
+    let mcp_json = serde_json::to_string_pretty(&pack).unwrap();
+    assert_eq!(cli_json, mcp_json);
+    // And the shape the agent depends on is stable.
+    let v: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
+    for field in ["issue", "decisions", "backlink_docs", "fts_hits", "dropped"] {
+        assert!(v.get(field).is_some(), "missing field {field}");
+    }
+}

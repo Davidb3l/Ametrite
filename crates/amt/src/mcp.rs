@@ -430,6 +430,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             let hits = run!(store::search(conn, &try_arg!(req("query")), &filter));
             text_result(id, &hits)
         }
+        "get_context" => {
+            let key = try_arg!(req("id"));
+            let budget = opt_i(&args, "budget");
+            text_result(
+                id.clone(),
+                &run!(store::context_pack(conn, &key, budget)),
+            )
+        }
         "get_backlinks" => text_result(
             id.clone(),
             &run!(store::backlinks(conn, &try_arg!(req("id")))),
@@ -524,6 +532,10 @@ fn tool_defs() -> Vec<Value> {
                     "status": status, "tag": s("Filter by tag/label"), "project": s("Filter by project"),
                     "limit": i("Max results, default 25") }),
             &["query"]),
+        tool("get_context", "One-bundle context read for an issue: the full issue (body, activity, backlinks), the decisions resolving it, the bodies of backlinked docs, and top-k related FTS hits — everything needed to start work in a single call. Use right after claiming. Optional budget caps total serialized chars, dropping lowest-relevance items first (FTS hits, then backlink bodies, then activity) and naming each cut in 'dropped'; the issue body and decisions are never dropped.",
+            json!({ "id": s("Issue key, e.g. AMT-7"),
+                    "budget": i("Hard cap on total serialized characters; drops lowest-relevance items first") }),
+            &["id"]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
     ]

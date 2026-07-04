@@ -107,6 +107,43 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// A backlinked document's full body, resolved for a `ContextPack`. Decisions
+/// are surfaced separately (in `ContextPack.decisions`), so these are the
+/// note/project/issue docs that link to the issue.
+#[derive(Debug, Serialize)]
+pub struct BacklinkDoc {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub doc_type: String,
+    pub title: String,
+    pub body: String,
+    /// Used only to order trimming (oldest backlink bodies drop first); not a
+    /// primary field agents read, but cheap to expose.
+    pub updated_at: String,
+}
+
+/// Everything an agent needs to start work on an issue, as one object:
+/// the full issue (body + activity + backlinks), the decisions resolving it,
+/// the bodies of backlinked docs, and top-k FTS hits for related context.
+///
+/// `claim` → `context` = 2 calls to productive work. When `--budget <chars>`
+/// is set, the lowest-relevance items are dropped (FTS hits first, then
+/// backlink bodies, then activity is truncated — never the issue body or
+/// decisions) and `dropped` names what was cut.
+#[derive(Debug, Serialize)]
+pub struct ContextPack {
+    pub issue: Issue,
+    pub decisions: Vec<Decision>,
+    pub backlink_docs: Vec<BacklinkDoc>,
+    pub fts_hits: Vec<SearchHit>,
+    /// Char budget applied, if any (echoed for the agent's benefit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<i64>,
+    /// Human-readable manifest of what budget-trimming removed, in drop order.
+    /// Empty when nothing was cut.
+    pub dropped: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub unresolved_links: Vec<UnresolvedLink>,

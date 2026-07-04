@@ -1385,6 +1385,130 @@ pub fn list_decisions(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Serialized-char size of a `ContextPack` — the metric `--budget` caps.
+fn pack_size(pack: &ContextPack) -> usize {
+    serde_json::to_string(pack).map(|s| s.len()).unwrap_or(0)
+}
+
+/// One-command context bundle for an issue: the full issue (body + activity +
+/// backlinks), the decisions resolving it, the bodies of backlinked docs, and
+/// top-k FTS hits for related context — all reusing existing store primitives.
+///
+/// `budget` (chars) is a hard cap on the serialized pack. When exceeded, whole
+/// lowest-relevance items are dropped in order — (1) FTS hits, worst-bm25
+/// first; (2) backlink bodies, oldest first; (3) truncate activity — never the
+/// issue body or decisions. Each cut is named in `pack.dropped`.
+pub fn context_pack(conn: &Connection, key: &str, budget: Option<i64>) -> Result<ContextPack> {
+    // Issue with body, activity, and backlinks already populated.
+    let issue = get_issue(conn, key)?;
+
+    // Decisions resolving this issue (non-superseded), each with its body.
+    let mut decisions = list_decisions(conn, Some(&issue.id), false)?;
+    for d in &mut decisions {
+        if d.body.is_none() {
+            d.body = get_decision(conn, &d.id)?.body;
+        }
+    }
+
+    // Backlinked docs' bodies. Decisions are surfaced separately above, and the
+    // issue links to itself via decision edges, so exclude decisions and the
+    // issue itself here. FTS hits below also exclude these ids.
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    excluded.insert(issue.id.clone());
+    for d in &decisions {
+        excluded.insert(d.id.clone());
+    }
+    let mut backlink_docs: Vec<BacklinkDoc> = Vec::new();
+    for b in &issue.backlinks {
+        if b.doc_type == "decision" || b.id == issue.id {
+            continue;
+        }
+        let doc = get_doc(conn, &b.id)?;
+        excluded.insert(doc.id.clone());
+        backlink_docs.push(BacklinkDoc {
+            id: doc.id,
+            doc_type: doc.doc_type,
+            title: doc.title,
+            body: doc.body.unwrap_or_default(),
+            updated_at: doc.updated_at,
+        });
+    }
+
+    // Top-k FTS hits by the issue title, excluding docs already in the pack.
+    let query = issue.title.clone();
+    let raw_hits = search(
+        conn,
+        &query,
+        &SearchFilter {
+            limit: 5 + excluded.len() as i64,
+            ..Default::default()
+        },
+    )?;
+    let fts_hits: Vec<SearchHit> = raw_hits
+        .into_iter()
+        .filter(|h| !excluded.contains(&h.id))
+        .take(5)
+        .collect();
+
+    let mut pack = ContextPack {
+        issue,
+        decisions,
+        backlink_docs,
+        fts_hits,
+        budget,
+        dropped: Vec::new(),
+    };
+
+    if let Some(cap) = budget {
+        trim_to_budget(&mut pack, cap);
+    }
+    Ok(pack)
+}
+
+/// Drop whole lowest-relevance items until the pack serializes under `cap`
+/// chars, recording each cut in `pack.dropped`. Order: FTS hits worst-bm25
+/// first, then backlink bodies oldest first, then truncate activity. Never
+/// drops the issue body or decisions.
+fn trim_to_budget(pack: &mut ContextPack, cap: i64) {
+    let cap = cap.max(0) as usize;
+
+    // (1) FTS hits: search returns them best-first (bm25 ascending), so the
+    // worst match is the last element — pop from the end.
+    while pack_size(pack) > cap {
+        let Some(hit) = pack.fts_hits.pop() else {
+            break;
+        };
+        pack.dropped.push(format!("fts_hit {}", hit.id));
+    }
+
+    // (2) Backlink bodies: oldest first (ascending updated_at).
+    if pack_size(pack) > cap && !pack.backlink_docs.is_empty() {
+        pack.backlink_docs
+            .sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        while pack_size(pack) > cap {
+            if pack.backlink_docs.is_empty() {
+                break;
+            }
+            let doc = pack.backlink_docs.remove(0);
+            pack.dropped.push(format!("backlink {}", doc.id));
+        }
+    }
+
+    // (3) Truncate activity (oldest entries first) as a last resort. The issue
+    // body and decisions are never touched.
+    if pack_size(pack) > cap && !pack.issue.activity.is_empty() {
+        let before = pack.issue.activity.len();
+        while pack_size(pack) > cap && !pack.issue.activity.is_empty() {
+            pack.issue.activity.remove(0);
+        }
+        let cut = before - pack.issue.activity.len();
+        if cut > 0 {
+            pack.dropped
+                .push(format!("activity ({cut} of {before} entries)"));
+        }
+    }
+}
+
 pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
     let now = db::now(conn)?;
     let mut stmt = conn.prepare(

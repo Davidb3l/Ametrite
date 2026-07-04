@@ -129,6 +129,17 @@ enum Cmd {
         #[arg(long, default_value_t = 25)]
         limit: i64,
     },
+    /// One-bundle context read for an issue: body + activity + decisions +
+    /// backlinked doc bodies + top-k related search hits (claim → context =
+    /// 2 calls to productive work)
+    Context {
+        /// Issue key, e.g. AMT-7
+        key: String,
+        /// Hard cap on total serialized chars; drops lowest-relevance items
+        /// first (FTS hits, then backlink bodies, then activity)
+        #[arg(long)]
+        budget: Option<i64>,
+    },
     /// Show documents that link to the given document
     Backlinks { id: String },
     /// Check workspace health (unresolved links, stale claims, missing refs)
@@ -427,6 +438,42 @@ fn print_issue_full(i: &Issue) {
                 _ => println!("  {} @{} {}", a.at, a.author, a.body),
             }
         }
+    }
+}
+
+fn print_context_pack(pack: &ContextPack) {
+    print_issue_full(&pack.issue);
+    if !pack.decisions.is_empty() {
+        println!("\n=== decisions ===");
+        for d in &pack.decisions {
+            println!("\n{} — {} ({})", d.id, d.title, d.status);
+            if let Some(b) = &d.body {
+                if !b.trim().is_empty() {
+                    println!("{}", b.trim_end());
+                }
+            }
+        }
+    }
+    if !pack.backlink_docs.is_empty() {
+        println!("\n=== backlinked docs ===");
+        for b in &pack.backlink_docs {
+            println!("\n{} ({}) — {}", b.id, b.doc_type, b.title);
+            if !b.body.trim().is_empty() {
+                println!("{}", b.body.trim_end());
+            }
+        }
+    }
+    if !pack.fts_hits.is_empty() {
+        println!("\n=== related (search) ===");
+        for h in &pack.fts_hits {
+            println!("{:<12} {:<8} {}\n             {}", h.id, h.doc_type, h.title, h.snippet);
+        }
+    }
+    if let Some(budget) = pack.budget {
+        println!("\nbudget: {budget} chars");
+    }
+    if !pack.dropped.is_empty() {
+        println!("dropped (over budget): {}", pack.dropped.join(", "));
     }
 }
 
@@ -988,6 +1035,16 @@ fn run(cli: Cli) -> Result<()> {
                         h.id, h.doc_type, h.title, h.snippet
                     );
                 }
+            }
+            Ok(())
+        }
+        Cmd::Context { key, budget } => {
+            let conn = open_workspace(&cli.workspace)?;
+            let pack = store::context_pack(&conn, &key, budget)?;
+            if cli.json {
+                print_json(&pack);
+            } else {
+                print_context_pack(&pack);
             }
             Ok(())
         }
