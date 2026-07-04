@@ -1176,3 +1176,48 @@ fn context_pack_mcp_matches_store_serialization() {
         assert!(v.get(field).is_some(), "missing field {field}");
     }
 }
+
+#[test]
+fn blocked_by_dep_is_disjoint_from_lease_bucket() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap(); // AMT-1
+    store::create_issue(&mut conn, new_issue("Leased+blocked", "", "high")).unwrap(); // AMT-2
+    store::create_issue(&mut conn, new_issue("Only blocked", "", "high")).unwrap(); // AMT-3
+    // AMT-1 blocks both AMT-2 and AMT-3.
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "t").unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
+    // AMT-2 is ALSO held under a live lease; AMT-1 gets claimed too.
+    store::claim_issue(&mut conn, "AMT-2", "other", 900).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "agent-a", 900).unwrap();
+
+    let nw = store::no_work_reason(&conn, "agent-b", 3600, &any()).unwrap();
+    // AMT-1 + AMT-2 are under live leases.
+    assert_eq!(nw.counts.blocked_by_lease, 2);
+    // Only AMT-3 is "blocked and otherwise claimable"; AMT-2 is a live lease, so
+    // it must NOT also be counted here (buckets stay disjoint).
+    assert_eq!(nw.counts.blocked_by_dep, 1);
+}
+
+#[test]
+fn doctor_handles_large_acyclic_dependency_graph() {
+    let (_d, mut conn) = workspace();
+    // Wide diamond DAG: node i blocks i+1 and i+2 (no cycle). The old cycle
+    // search had no fully-explored set and went exponential on exactly this
+    // shape; the 3-color DFS runs in linear time and must finish promptly.
+    let n = 40;
+    for _ in 0..n {
+        store::create_issue(&mut conn, new_issue("node", "", "none")).unwrap();
+    }
+    for i in 1..=n {
+        for j in [i + 1, i + 2] {
+            if j <= n {
+                store::add_block(&mut conn, &format!("AMT-{i}"), &format!("AMT-{j}"), "t").unwrap();
+            }
+        }
+    }
+    let report = store::doctor(&conn).unwrap();
+    assert!(
+        report.dependency_cycles.is_empty(),
+        "a forward-only DAG has no cycles"
+    );
+}

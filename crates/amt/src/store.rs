@@ -752,14 +752,27 @@ pub fn no_work_reason(
     };
 
     // Candidates unclaimable *only* because an open blocker sits in front of
-    // them — same EXISTS predicate `claimable_predicate` uses to skip them.
-    let blocked_by_dep = count(
+    // them: they'd be claimable (not under a live lease, not in this agent's
+    // cooldown) if the blocker were gone. Mirroring those guards keeps this
+    // bucket disjoint from blocked_by_lease and blocked_by_cooldown, so the
+    // buckets don't double-count an issue that is both leased and blocked.
+    let mut dep_extra = " AND (i.claimed_by IS NULL OR i.claim_expires_at < ?)".to_string();
+    let mut dep_args: Vec<Box<dyn ToSql>> = vec![Box::new(now.clone())];
+    if cooldown_secs > 0 {
+        dep_extra.push_str(
+            " AND (i.last_released_by IS NULL OR i.last_released_by != ?
+                   OR i.last_released_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' seconds'))",
+        );
+        dep_args.push(Box::new(agent.to_string()));
+        dep_args.push(Box::new(cooldown_secs));
+    }
+    dep_extra.push_str(
         " AND EXISTS(
               SELECT 1 FROM blocks b JOIN issues bi
                 ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
               WHERE b.blocked = d.id AND bi.status NOT IN ('done','canceled'))",
-        &[],
-    )?;
+    );
+    let blocked_by_dep = count(&dep_extra, &dep_args)?;
 
     let retry_after = soonest_retry(conn, &now, agent, cooldown_secs, &scope, &scope_args)?;
 
@@ -1857,17 +1870,26 @@ fn find_dependency_cycles(conn: &Connection) -> Result<Vec<DependencyCycle>> {
 
     let mut found: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut out = Vec::new();
-    // Iterative DFS tracking the current path so a back-edge reveals the ring.
+    // Iterative 3-color DFS: `black` = fully-explored nodes (their whole subtree
+    // has been walked and any cycle through them already recorded), `on_path` =
+    // the gray stack. A node is expanded at most once, so this is O(V+E) — the
+    // earlier version had no `black` set and re-walked shared subtrees, going
+    // exponential on acyclic diamond graphs and hanging `doctor`.
+    let mut black: std::collections::HashSet<String> = std::collections::HashSet::new();
     let nodes: Vec<String> = adj.keys().cloned().collect();
     for start in nodes {
+        if black.contains(&start) {
+            continue;
+        }
         let mut path: Vec<String> = Vec::new();
+        let mut on_path: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stack: Vec<(String, usize)> = vec![(start.clone(), 0)];
         while let Some((node, idx)) = stack.last().cloned() {
             if idx == 0 {
-                if let Some(pos) = path.iter().position(|n| n == &node) {
-                    // Back-edge: the ring is path[pos..].
-                    let ring = path[pos..].to_vec();
-                    if let Some(canon) = canonical_cycle(&ring) {
+                if on_path.contains(&node) {
+                    // Back-edge to a node on the current path → the ring is path[pos..].
+                    let pos = path.iter().position(|n| n == &node).unwrap();
+                    if let Some(canon) = canonical_cycle(&path[pos..]) {
                         if found.insert(canon.clone()) {
                             out.push(DependencyCycle { cycle: canon });
                         }
@@ -1875,14 +1897,23 @@ fn find_dependency_cycles(conn: &Connection) -> Result<Vec<DependencyCycle>> {
                     stack.pop();
                     continue;
                 }
+                if black.contains(&node) {
+                    // Subtree already explored (and any cycle through it found).
+                    stack.pop();
+                    continue;
+                }
                 path.push(node.clone());
+                on_path.insert(node.clone());
             }
             let neighbors = adj.get(&node).cloned().unwrap_or_default();
             if idx < neighbors.len() {
                 stack.last_mut().unwrap().1 += 1;
                 stack.push((neighbors[idx].clone(), 0));
             } else {
+                // All edges out of `node` walked — mark it fully explored.
                 path.pop();
+                on_path.remove(&node);
+                black.insert(node);
                 stack.pop();
             }
         }
