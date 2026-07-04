@@ -2,7 +2,7 @@ use crate::error::{msg, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const DB_DIR: &str = ".ametrite";
 pub const DB_FILE: &str = "ametrite.db";
 
@@ -88,6 +88,14 @@ CREATE TABLE decisions (
   superseded_by TEXT
 );
 CREATE INDEX idx_decisions_resolves ON decisions(resolves);
+
+CREATE TABLE blocks (
+  blocker TEXT NOT NULL,
+  blocked TEXT NOT NULL,
+  PRIMARY KEY (blocker, blocked)
+);
+CREATE INDEX idx_blocks_blocked ON blocks(blocked);
+CREATE INDEX idx_blocks_blocker ON blocks(blocker);
 "#;
 
 /// v1 → v2: allow the 'decision' document type (requires rebuilding the
@@ -140,6 +148,21 @@ const MIGRATE_V2_V3: &str = r#"
 ALTER TABLE issues ADD COLUMN last_released_by TEXT;
 ALTER TABLE issues ADD COLUMN last_released_at TEXT;
 UPDATE meta SET value = '3' WHERE key = 'schema_version';
+"#;
+
+/// v3 -> v4: issue dependencies (R3). A `blocks` edge (blocker → blocked) makes
+/// an issue unclaimable while its blocker is still open, so `claim`/`peek` skip
+/// it and `doctor` can flag dependency cycles. Keyed by issue keys (not doc_ids)
+/// to match how parents/projects are already referenced textually.
+const MIGRATE_V3_V4: &str = r#"
+CREATE TABLE blocks (
+  blocker TEXT NOT NULL,
+  blocked TEXT NOT NULL,
+  PRIMARY KEY (blocker, blocked)
+);
+CREATE INDEX idx_blocks_blocked ON blocks(blocked);
+CREATE INDEX idx_blocks_blocker ON blocks(blocker);
+UPDATE meta SET value = '4' WHERE key = 'schema_version';
 "#;
 
 /// Walk up from `start` looking for `.ametrite/ametrite.db`.
@@ -203,6 +226,7 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
                 result?;
             }
             2 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V2_V3}COMMIT;"))?,
+            3 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V3_V4}COMMIT;"))?,
             v => return Err(msg(format!("no migration path from schema v{v}"))),
         }
         version += 1;

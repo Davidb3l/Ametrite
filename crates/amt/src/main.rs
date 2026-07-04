@@ -39,6 +39,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IssueCmd,
     },
+    /// Manage issue dependencies (blocks / blocked-by)
+    Dep {
+        #[command(subcommand)]
+        cmd: DepCmd,
+    },
     /// Atomically claim the next available issue (agent loop primitive)
     Claim {
         /// Claim a specific issue instead of the best available
@@ -191,6 +196,12 @@ enum IssueCmd {
         parent: Option<String>,
         #[arg(long)]
         due: Option<String>,
+        /// Issue key(s) that block this new issue (repeatable)
+        #[arg(long = "blocked-by")]
+        blocked_by: Vec<String>,
+        /// Issue key(s) this new issue blocks (repeatable)
+        #[arg(long = "blocks")]
+        blocks: Vec<String>,
     },
     /// List issues
     List {
@@ -238,6 +249,12 @@ enum IssueCmd {
         add_labels: Vec<String>,
         #[arg(long = "remove-label")]
         remove_labels: Vec<String>,
+        /// Add a blocker: issue key(s) that must close before this one (repeatable)
+        #[arg(long = "blocked-by")]
+        blocked_by: Vec<String>,
+        /// Add a dependent: issue key(s) this one blocks (repeatable)
+        #[arg(long = "blocks")]
+        blocks: Vec<String>,
     },
     /// Add a comment to an issue
     Comment {
@@ -247,6 +264,24 @@ enum IssueCmd {
         #[arg(long)]
         author: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum DepCmd {
+    /// Declare that BLOCKER must close before BLOCKED can be claimed
+    Add {
+        /// The blocking issue (must close first)
+        blocker: String,
+        /// The blocked issue (waits on the blocker)
+        blocked: String,
+    },
+    /// Remove a blocker → blocked dependency edge
+    Rm {
+        blocker: String,
+        blocked: String,
+    },
+    /// List an issue's blockers (open) and the issues it blocks
+    List { id: String },
 }
 
 #[derive(Subcommand)]
@@ -413,6 +448,24 @@ fn print_issue_full(i: &Issue) {
     if let (Some(by), Some(exp)) = (&i.claimed_by, &i.claim_expires_at) {
         println!("claimed by: {by} (lease expires {exp})");
     }
+    if !i.blockers.is_empty() {
+        let list = i
+            .blockers
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("blocked by: {list}");
+    }
+    if !i.blocks.is_empty() {
+        let list = i
+            .blocks
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("blocks: {list}");
+    }
     println!("created: {}   updated: {}", i.created_at, i.updated_at);
     if let Some(body) = &i.body {
         if !body.trim().is_empty() {
@@ -507,6 +560,8 @@ fn run(cli: Cli) -> Result<()> {
                     assignee,
                     parent,
                     due,
+                    blocked_by,
+                    blocks,
                 } => {
                     let issue = store::create_issue(
                         &mut conn,
@@ -522,6 +577,14 @@ fn run(cli: Cli) -> Result<()> {
                             author: identity(None),
                         },
                     )?;
+                    let me = identity(None);
+                    for b in blocked_by {
+                        store::add_block(&mut conn, b, &issue.id, &me)?;
+                    }
+                    for b in blocks {
+                        store::add_block(&mut conn, &issue.id, b, &me)?;
+                    }
+                    let issue = store::get_issue(&conn, &issue.id)?;
                     if cli.json {
                         print_json(&issue);
                     } else {
@@ -599,6 +662,8 @@ fn run(cli: Cli) -> Result<()> {
                     due,
                     add_labels,
                     remove_labels,
+                    blocked_by,
+                    blocks,
                 } => {
                     let clearable = |v: &Option<String>| -> Option<Option<String>> {
                         v.as_ref()
@@ -621,6 +686,14 @@ fn run(cli: Cli) -> Result<()> {
                         },
                         &identity(None),
                     )?;
+                    let me = identity(None);
+                    for b in blocked_by {
+                        store::add_block(&mut conn, b, &issue.id, &me)?;
+                    }
+                    for b in blocks {
+                        store::add_block(&mut conn, &issue.id, b, &me)?;
+                    }
+                    let issue = store::get_issue(&conn, &issue.id)?;
                     if cli.json {
                         print_json(&issue);
                     } else {
@@ -633,6 +706,58 @@ fn run(cli: Cli) -> Result<()> {
                         print_json(&serde_json::json!({ "ok": true }));
                     } else {
                         println!("commented on {id}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Dep { ref cmd } => {
+            let mut conn = open_workspace(&cli.workspace)?;
+            match cmd {
+                DepCmd::Add { blocker, blocked } => {
+                    store::add_block(&mut conn, blocker, blocked, &identity(None))?;
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "ok": true, "blocker": blocker, "blocked": blocked
+                        }));
+                    } else {
+                        println!("{blocker} now blocks {blocked}");
+                    }
+                }
+                DepCmd::Rm { blocker, blocked } => {
+                    store::remove_block(&mut conn, blocker, blocked, &identity(None))?;
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "ok": true, "blocker": blocker, "blocked": blocked
+                        }));
+                    } else {
+                        println!("{blocker} no longer blocks {blocked}");
+                    }
+                }
+                DepCmd::List { id } => {
+                    let blockers = store::blockers_of(&conn, id)?;
+                    let blocks = store::blocked_by(&conn, id)?;
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "id": id, "blocked_by": blockers, "blocks": blocks
+                        }));
+                    } else {
+                        if blockers.is_empty() {
+                            println!("{id} is blocked by: (nothing open)");
+                        } else {
+                            println!(
+                                "{id} is blocked by: {}",
+                                blockers.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join(", ")
+                            );
+                        }
+                        if blocks.is_empty() {
+                            println!("{id} blocks: (nothing)");
+                        } else {
+                            println!(
+                                "{id} blocks: {}",
+                                blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join(", ")
+                            );
+                        }
                     }
                 }
             }
@@ -1090,6 +1215,9 @@ fn run(cli: Cli) -> Result<()> {
                         "dangling decision: {} resolves missing issue {}",
                         m.id, m.references
                     );
+                }
+                for c in &report.dependency_cycles {
+                    println!("dependency cycle: {}", c.cycle.join(" → "));
                 }
             }
             Ok(())

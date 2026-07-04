@@ -223,6 +223,8 @@ fn issue_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Issue)> {
             body: None,
             activity: Vec::new(),
             backlinks: Vec::new(),
+            blockers: Vec::new(),
+            blocks: Vec::new(),
         },
     ))
 }
@@ -246,6 +248,8 @@ fn load_issue(conn: &Connection, key: &str, full: bool) -> Result<Issue> {
         issue.body = Some(body);
         issue.activity = activity_of(conn, doc_id)?;
         issue.backlinks = backlinks_of(conn, doc_id)?;
+        issue.blockers = blockers_of(conn, &issue.id)?;
+        issue.blocks = blocked_by(conn, &issue.id)?;
     }
     Ok(issue)
 }
@@ -384,6 +388,10 @@ pub fn update_issue(
                 "event",
                 &format!("status: {} → {}", before.status, status),
             )?;
+            // Closing this issue may free dependents whose last blocker it was.
+            if is_terminal(status) && !is_terminal(&before.status) {
+                emit_unblock_events(&tx, &before.id, author)?;
+            }
         }
     }
     if let Some(priority) = &patch.priority {
@@ -523,7 +531,11 @@ fn claimable_predicate(
     sql.push_str(&format!(
         " WHERE ((i.status IN ({ph}) AND i.claimed_by IS NULL)
                 OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?
-                    AND i.status NOT IN ('done','canceled')))"
+                    AND i.status NOT IN ('done','canceled')))
+          AND NOT EXISTS(
+                SELECT 1 FROM blocks b JOIN issues bi
+                  ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
+                WHERE b.blocked = d.id AND bi.status NOT IN ('done','canceled'))"
     ));
     for s in &stages {
         args.push(Box::new(s.to_string()));
@@ -662,6 +674,9 @@ pub struct NoWorkCounts {
     pub blocked_by_lease: i64,
     /// Excluded only by this agent's requeue cooldown.
     pub blocked_by_cooldown: i64,
+    /// Candidates held back only because an open blocker (a `blocks` edge whose
+    /// blocker issue isn't done/canceled) sits in front of them (R3).
+    pub blocked_by_dep: i64,
     /// Total candidates in a claimable stage (regardless of lease/cooldown).
     pub candidates: i64,
 }
@@ -736,13 +751,29 @@ pub fn no_work_reason(
         0
     };
 
+    // Candidates unclaimable *only* because an open blocker sits in front of
+    // them — same EXISTS predicate `claimable_predicate` uses to skip them.
+    let blocked_by_dep = count(
+        " AND EXISTS(
+              SELECT 1 FROM blocks b JOIN issues bi
+                ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
+              WHERE b.blocked = d.id AND bi.status NOT IN ('done','canceled'))",
+        &[],
+    )?;
+
     let retry_after = soonest_retry(conn, &now, agent, cooldown_secs, &scope, &scope_args)?;
 
     Ok(NoWork {
-        reason: no_work_reason_text(candidates, blocked_by_lease, blocked_by_cooldown),
+        reason: no_work_reason_text(
+            candidates,
+            blocked_by_lease,
+            blocked_by_cooldown,
+            blocked_by_dep,
+        ),
         counts: NoWorkCounts {
             blocked_by_lease,
             blocked_by_cooldown,
+            blocked_by_dep,
             candidates,
         },
         retry_after,
@@ -752,7 +783,12 @@ pub fn no_work_reason(
 /// The human-readable no-work one-liner for a set of bucket counts. Shared by
 /// the single-workspace `no_work_reason` and the cross-workspace aggregator so
 /// the CLI and MCP emit identical phrasing for the same situation.
-pub fn no_work_reason_text(candidates: i64, blocked_by_lease: i64, blocked_by_cooldown: i64) -> String {
+pub fn no_work_reason_text(
+    candidates: i64,
+    blocked_by_lease: i64,
+    blocked_by_cooldown: i64,
+    blocked_by_dep: i64,
+) -> String {
     if candidates == 0 {
         "no candidate issues in a claimable stage".to_string()
     } else if blocked_by_lease > 0 && blocked_by_cooldown > 0 {
@@ -761,6 +797,8 @@ pub fn no_work_reason_text(candidates: i64, blocked_by_lease: i64, blocked_by_co
         format!("{blocked_by_lease} candidate(s) held by active leases")
     } else if blocked_by_cooldown > 0 {
         format!("{blocked_by_cooldown} candidate(s) in your requeue cooldown")
+    } else if blocked_by_dep > 0 {
+        format!("{blocked_by_dep} candidate(s) waiting on an open blocker")
     } else {
         "no claimable issues match".to_string()
     }
@@ -929,9 +967,175 @@ pub fn release_issue(
         "event",
         &format!("released; status: {} → {status}", issue.status),
     )?;
+    // If this release closes the issue, anything it was blocking whose last open
+    // blocker just went away should learn it's now free to be claimed.
+    if is_terminal(status) && !is_terminal(&issue.status) {
+        emit_unblock_events(&tx, &issue.id, agent)?;
+    }
     touch(&tx, doc_id)?;
     tx.commit()?;
     load_issue(conn, key, false)
+}
+
+/// `done`/`canceled` — a "closed" issue that no longer blocks its dependents.
+fn is_terminal(status: &str) -> bool {
+    status == "done" || status == "canceled"
+}
+
+/// After `blocker_key` transitions to a terminal status, append an
+/// "unblocked [[blocker_key]]" event to every issue it was blocking that now has
+/// *no* remaining open blocker (so the last blocker closing is announced once,
+/// on exactly the issues that became claimable). Shared by `release_issue` and
+/// `update_issue` so both paths emit the same signal.
+fn emit_unblock_events(conn: &Connection, blocker_key: &str, agent: &str) -> Result<()> {
+    // Issues this key blocks whose remaining blockers are all terminal now.
+    let mut stmt = conn.prepare(
+        "SELECT b.blocked FROM blocks b
+         WHERE b.blocker = ?1
+           AND NOT EXISTS(
+             SELECT 1 FROM blocks b2 JOIN issues bi
+               ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b2.blocker)
+             WHERE b2.blocked = b.blocked AND bi.status NOT IN ('done','canceled'))",
+    )?;
+    let freed: Vec<String> = stmt
+        .query_map([blocker_key], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for key in freed {
+        // Skip if the blocked issue itself no longer exists / isn't an issue.
+        if let Some(doc_id) = conn
+            .query_row(
+                "SELECT doc_id FROM documents WHERE id = ?1 AND type = 'issue'",
+                [&key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            append_activity(
+                conn,
+                doc_id,
+                agent,
+                "event",
+                &format!("unblocked [[{blocker_key}]]"),
+            )?;
+            touch(conn, doc_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add a `blocker` → `blocked` dependency edge. Both must be existing issues.
+/// Rejects self-blocks and any edge that would introduce a cycle. Idempotent.
+pub fn add_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &str) -> Result<()> {
+    if blocker.eq_ignore_ascii_case(blocked) {
+        return Err(msg("an issue cannot block itself"));
+    }
+    let tx = immediate(conn)?;
+    let (bk, blocker_doc) = issue_key_and_doc(&tx, blocker)?;
+    let (bd, blocked_doc) = issue_key_and_doc(&tx, blocked)?;
+    // Adding blocker→blocked closes a cycle iff blocker is already reachable
+    // from blocked along existing edges.
+    if reaches(&tx, &bd, &bk)? {
+        return Err(msg(format!(
+            "'{bk}' blocks '{bd}' would create a dependency cycle"
+        )));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO blocks(blocker, blocked) VALUES (?1, ?2)",
+        params![bk, bd],
+    )?;
+    append_activity(&tx, blocked_doc, agent, "event", &format!("blocked by [[{bk}]]"))?;
+    append_activity(&tx, blocker_doc, agent, "event", &format!("blocks [[{bd}]]"))?;
+    touch(&tx, blocked_doc)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove a `blocker` → `blocked` dependency edge. If removing it leaves the
+/// blocked issue with no open blocker, emit an unblock event for it.
+pub fn remove_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &str) -> Result<()> {
+    let tx = immediate(conn)?;
+    let (bk, _) = issue_key_and_doc(&tx, blocker)?;
+    let (bd, blocked_doc) = issue_key_and_doc(&tx, blocked)?;
+    let n = tx.execute(
+        "DELETE FROM blocks WHERE blocker = ?1 AND blocked = ?2",
+        params![bk, bd],
+    )?;
+    if n == 0 {
+        return Err(msg(format!("'{bk}' does not block '{bd}'")));
+    }
+    append_activity(&tx, blocked_doc, agent, "event", &format!("unblocked [[{bk}]]"))?;
+    touch(&tx, blocked_doc)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Resolve a key to (canonical key, doc_id), erroring if it isn't an issue.
+fn issue_key_and_doc(conn: &Connection, key: &str) -> Result<(String, i64)> {
+    conn.query_row(
+        "SELECT id, doc_id FROM documents WHERE id = ?1 AND type = 'issue'",
+        [key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?
+    .ok_or_else(|| msg(format!("no issue '{key}'")))
+}
+
+/// True if `target` is reachable from `start` by following blocker→blocked
+/// edges (i.e. `start` transitively blocks `target`). Used for cycle detection.
+fn reaches(conn: &Connection, start: &str, target: &str) -> Result<bool> {
+    let mut stack = vec![start.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if cur == target {
+            return Ok(true);
+        }
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        let mut stmt = conn.prepare("SELECT blocked FROM blocks WHERE blocker = ?1")?;
+        let next: Vec<String> = stmt
+            .query_map([&cur], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        stack.extend(next);
+    }
+    Ok(false)
+}
+
+/// The open (non-terminal) issues blocking `key`, as `DocRef`s for display —
+/// exactly the blockers that make `key` unclaimable right now.
+pub fn blockers_of(conn: &Connection, key: &str) -> Result<Vec<DocRef>> {
+    dep_refs(
+        conn,
+        "SELECT d.id, d.type, d.title FROM blocks b
+         JOIN documents d ON d.id = b.blocker
+         JOIN issues bi ON bi.doc_id = d.doc_id
+         WHERE b.blocked = ?1 AND bi.status NOT IN ('done','canceled')
+         ORDER BY d.id",
+        key,
+    )
+}
+
+/// The issues that `key` blocks (its dependents), as `DocRef`s.
+pub fn blocked_by(conn: &Connection, key: &str) -> Result<Vec<DocRef>> {
+    dep_refs(
+        conn,
+        "SELECT d.id, d.type, d.title FROM blocks b
+         JOIN documents d ON d.id = b.blocked
+         WHERE b.blocker = ?1 ORDER BY d.id",
+        key,
+    )
+}
+
+fn dep_refs(conn: &Connection, sql: &str, key: &str) -> Result<Vec<DocRef>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([key], |r| {
+        Ok(DocRef {
+            id: r.get(0)?,
+            doc_type: r.get(1)?,
+            title: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 pub struct NewNote {
@@ -1617,17 +1821,88 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
         })?
         .collect::<std::result::Result<_, _>>()?;
 
+    let dependency_cycles = find_dependency_cycles(conn)?;
+
     let ok = unresolved_links.is_empty()
         && stale_claims.is_empty()
         && missing_parents.is_empty()
         && missing_projects.is_empty()
-        && dangling_decisions.is_empty();
+        && dangling_decisions.is_empty()
+        && dependency_cycles.is_empty();
     Ok(DoctorReport {
         unresolved_links,
         stale_claims,
         missing_parents,
         missing_projects,
         dangling_decisions,
+        dependency_cycles,
         ok,
     })
+}
+
+/// Find every cycle in the `blocks` graph via DFS, reporting each distinct ring
+/// once (canonicalized by its lexicographically smallest rotation). `add_block`
+/// already refuses to introduce cycles, so this is a safety net for edges that
+/// entered via import or a raw DB edit.
+fn find_dependency_cycles(conn: &Connection) -> Result<Vec<DependencyCycle>> {
+    // adjacency: blocker -> [blocked...]
+    let mut stmt = conn.prepare("SELECT blocker, blocked FROM blocks")?;
+    let edges: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut adj: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (b, d) in edges {
+        adj.entry(b).or_default().push(d);
+    }
+
+    let mut found: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    // Iterative DFS tracking the current path so a back-edge reveals the ring.
+    let nodes: Vec<String> = adj.keys().cloned().collect();
+    for start in nodes {
+        let mut path: Vec<String> = Vec::new();
+        let mut stack: Vec<(String, usize)> = vec![(start.clone(), 0)];
+        while let Some((node, idx)) = stack.last().cloned() {
+            if idx == 0 {
+                if let Some(pos) = path.iter().position(|n| n == &node) {
+                    // Back-edge: the ring is path[pos..].
+                    let ring = path[pos..].to_vec();
+                    if let Some(canon) = canonical_cycle(&ring) {
+                        if found.insert(canon.clone()) {
+                            out.push(DependencyCycle { cycle: canon });
+                        }
+                    }
+                    stack.pop();
+                    continue;
+                }
+                path.push(node.clone());
+            }
+            let neighbors = adj.get(&node).cloned().unwrap_or_default();
+            if idx < neighbors.len() {
+                stack.last_mut().unwrap().1 += 1;
+                stack.push((neighbors[idx].clone(), 0));
+            } else {
+                path.pop();
+                stack.pop();
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Canonicalize a cycle to its lexicographically-smallest rotation so the same
+/// ring discovered from different start nodes dedupes to one entry.
+fn canonical_cycle(ring: &[String]) -> Option<Vec<String>> {
+    if ring.is_empty() {
+        return None;
+    }
+    let n = ring.len();
+    let start = (0..n)
+        .min_by(|&a, &b| ring[a].cmp(&ring[b]))
+        .unwrap_or(0);
+    let mut rot = Vec::with_capacity(n);
+    for k in 0..n {
+        rot.push(ring[(start + k) % n].clone());
+    }
+    Some(rot)
 }

@@ -749,7 +749,253 @@ fn no_work_with_no_candidates_has_null_retry() {
     assert_eq!(nw.counts.candidates, 0);
     assert_eq!(nw.counts.blocked_by_lease, 0);
     assert_eq!(nw.counts.blocked_by_cooldown, 0);
+    assert_eq!(nw.counts.blocked_by_dep, 0);
     assert!(nw.retry_after.is_none(), "nothing is ever coming");
+}
+
+// ---------- issue dependencies (blocks / blocked-by), R3 ----------
+
+#[test]
+fn blocked_issue_is_not_claimed_while_blocker_open() {
+    let (_d, mut conn) = workspace();
+    // AMT-1 blocks AMT-2. AMT-2 is higher priority but must wait.
+    store::create_issue(&mut conn, new_issue("Blocker", "", "low")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocked", "", "urgent")).unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+
+    // Even though AMT-2 is urgent, the only claimable issue is the blocker.
+    let first = store::claim_next(&mut conn, "agent-a", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, "AMT-1", "the open blocker must be served first");
+
+    // With the blocker leased (in_progress), the blocked issue is STILL not
+    // claimable — a blocker only stops blocking when it's done/canceled.
+    assert!(
+        store::claim_next(&mut conn, "agent-b", 900, 0, &any())
+            .unwrap()
+            .is_none(),
+        "blocked issue must not be served while its blocker is open"
+    );
+    // peek agrees with claim (shared predicate).
+    assert!(store::peek_next(&conn, "agent-b", 0, &any()).unwrap().is_none());
+}
+
+#[test]
+fn closing_blocker_frees_blocked_and_emits_unblock_event() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocked", "", "high")).unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+
+    store::claim_next(&mut conn, "agent-a", 900, 0, &any())
+        .unwrap()
+        .unwrap(); // takes AMT-1
+    // Release the blocker as done → AMT-2 becomes claimable + gets an event.
+    store::release_issue(&mut conn, "AMT-1", "agent-a", "done", None).unwrap();
+
+    let freed = store::get_issue(&conn, "AMT-2").unwrap();
+    assert!(
+        freed
+            .activity
+            .iter()
+            .any(|a| a.kind == "event" && a.body == "unblocked [[AMT-1]]"),
+        "closing the last blocker must log an unblock event: {:?}",
+        freed.activity
+    );
+
+    let got = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "AMT-2", "blocked issue is claimable once blocker closes");
+}
+
+#[test]
+fn unblock_event_only_after_last_blocker_closes() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker A", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocker B", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocked", "", "high")).unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-3", "test").unwrap();
+    store::add_block(&mut conn, "AMT-2", "AMT-3", "test").unwrap();
+
+    // Close only the first blocker: still blocked, no unblock event yet.
+    store::update_issue(
+        &mut conn,
+        "AMT-1",
+        store::IssuePatch { status: Some("done".into()), ..Default::default() },
+        "test",
+    )
+    .unwrap();
+    let mid = store::get_issue(&conn, "AMT-3").unwrap();
+    assert!(
+        !mid.activity.iter().any(|a| a.body.starts_with("unblocked")),
+        "must not announce unblock while another blocker is still open"
+    );
+    assert!(
+        store::peek_next(&conn, "agent-a", 0, &any()).unwrap().unwrap().id != "AMT-3"
+            || store::blockers_of(&conn, "AMT-3").unwrap().len() == 1
+    );
+    assert_eq!(store::blockers_of(&conn, "AMT-3").unwrap().len(), 1);
+
+    // Close the second (last) blocker → now exactly one unblock event fires.
+    store::update_issue(
+        &mut conn,
+        "AMT-2",
+        store::IssuePatch { status: Some("done".into()), ..Default::default() },
+        "test",
+    )
+    .unwrap();
+    let done = store::get_issue(&conn, "AMT-3").unwrap();
+    let unblocks: Vec<&str> = done
+        .activity
+        .iter()
+        .filter(|a| a.body.starts_with("unblocked"))
+        .map(|a| a.body.as_str())
+        .collect();
+    assert_eq!(unblocks, vec!["unblocked [[AMT-2]]"], "one event, from the last blocker");
+    assert!(store::blockers_of(&conn, "AMT-3").unwrap().is_empty());
+}
+
+#[test]
+fn three_issue_chain_drains_in_dependency_order_with_no_wasted_claims() {
+    // A → B → C: A blocks B, B blocks C. Two agents polling concurrently must
+    // drain them in exactly A, B, C with every successful poll (no issue served
+    // out of order, no claim of a blocked issue).
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "chain", "AMT").unwrap();
+    {
+        let mut conn = db::open(&path).unwrap();
+        // Give later links HIGHER priority to prove ordering follows deps, not prio.
+        store::create_issue(&mut conn, new_issue("A", "", "low")).unwrap();
+        store::create_issue(&mut conn, new_issue("B", "", "high")).unwrap();
+        store::create_issue(&mut conn, new_issue("C", "", "urgent")).unwrap();
+        store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+        store::add_block(&mut conn, "AMT-2", "AMT-3", "test").unwrap();
+    }
+
+    let mut order = Vec::new();
+    // Two agents alternate. Each iteration: whoever gets work claims exactly the
+    // next chain link, completes it (done), which unblocks the next link.
+    let agents = ["agent-a", "agent-b"];
+    let mut i = 0;
+    loop {
+        let mut conn = db::open(&path).unwrap();
+        let agent = agents[i % 2];
+        match store::claim_next(&mut conn, agent, 900, 0, &any()).unwrap() {
+            Some(issue) => {
+                order.push(issue.id.clone());
+                // The claim must never be a blocked issue (that's the invariant).
+                assert!(
+                    store::blockers_of(&conn, &issue.id).unwrap().is_empty(),
+                    "claimed {} while it still had an open blocker",
+                    issue.id
+                );
+                store::release_issue(&mut conn, &issue.id, agent, "done", None).unwrap();
+            }
+            None => break,
+        }
+        i += 1;
+        if i > 10 {
+            break; // safety valve
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["AMT-1", "AMT-2", "AMT-3"],
+        "chain must drain in dependency order regardless of priority"
+    );
+}
+
+#[test]
+fn no_work_reason_counts_blocked_by_dep() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocked", "", "high")).unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+
+    // Move the blocker to in_review: it's still OPEN (so it keeps blocking) but
+    // is neither a claimable-stage candidate nor leased — leaving AMT-2 as the
+    // sole no-work reason, held back *only* by its open dependency.
+    store::update_issue(
+        &mut conn,
+        "AMT-1",
+        store::IssuePatch { status: Some("in_review".into()), ..Default::default() },
+        "test",
+    )
+    .unwrap();
+
+    // Nothing is claimable: AMT-2's blocker is still open.
+    assert!(store::claim_next(&mut conn, "agent-b", 900, 0, &any())
+        .unwrap()
+        .is_none());
+
+    let nw = store::no_work_reason(&conn, "agent-b", 0, &any()).unwrap();
+    assert_eq!(nw.counts.candidates, 1, "AMT-2 is the lone candidate");
+    assert_eq!(nw.counts.blocked_by_lease, 0);
+    assert_eq!(nw.counts.blocked_by_cooldown, 0);
+    assert_eq!(nw.counts.blocked_by_dep, 1, "the blocked issue is counted");
+    assert!(nw.reason.contains("open blocker"), "reason: {}", nw.reason);
+}
+
+#[test]
+fn add_block_rejects_self_and_cycles_and_doctor_detects_cycles() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("One", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Two", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Three", "", "high")).unwrap();
+
+    // Self-block is refused.
+    assert!(store::add_block(&mut conn, "AMT-1", "AMT-1", "test").is_err());
+
+    // Build a chain, then the edge that would close a cycle is refused.
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+    store::add_block(&mut conn, "AMT-2", "AMT-3", "test").unwrap();
+    assert!(
+        store::add_block(&mut conn, "AMT-3", "AMT-1", "test").is_err(),
+        "closing a cycle must be refused"
+    );
+
+    // Clean graph → doctor sees no cycles.
+    let report = store::doctor(&conn).unwrap();
+    assert!(report.dependency_cycles.is_empty(), "{report:?}");
+
+    // Force a cycle in past the guard (raw insert) and confirm doctor flags it.
+    conn.execute(
+        "INSERT INTO blocks(blocker, blocked) VALUES ('AMT-3','AMT-1')",
+        [],
+    )
+    .unwrap();
+    let report = store::doctor(&conn).unwrap();
+    assert_eq!(report.dependency_cycles.len(), 1, "{report:?}");
+    assert!(!report.ok);
+    let ring = &report.dependency_cycles[0].cycle;
+    assert_eq!(ring.len(), 3);
+    // The ring contains all three keys.
+    for k in ["AMT-1", "AMT-2", "AMT-3"] {
+        assert!(ring.contains(&k.to_string()), "cycle missing {k}: {ring:?}");
+    }
+}
+
+#[test]
+fn remove_block_frees_the_dependent() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("Blocked", "", "urgent")).unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+
+    // Blocked while the edge exists.
+    assert!(store::peek_next(&conn, "a", 0, &any()).unwrap().unwrap().id == "AMT-1");
+
+    store::remove_block(&mut conn, "AMT-1", "AMT-2", "test").unwrap();
+    // Now the urgent (formerly blocked) issue is the best candidate.
+    let peeked = store::peek_next(&conn, "a", 0, &any()).unwrap().unwrap();
+    assert_eq!(peeked.id, "AMT-2");
+    let freed = store::get_issue(&conn, "AMT-2").unwrap();
+    assert!(freed
+        .activity
+        .iter()
+        .any(|a| a.body == "unblocked [[AMT-1]]"));
 }
 
 /// Build a workspace whose AMT-1 has a backlinked note, a decision resolving

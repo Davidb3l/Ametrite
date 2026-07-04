@@ -442,6 +442,33 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             id.clone(),
             &run!(store::backlinks(conn, &try_arg!(req("id")))),
         ),
+        "add_dependency" => {
+            run!(store::add_block(
+                conn,
+                &try_arg!(req("blocker")),
+                &try_arg!(req("blocked")),
+                &agent_of(&args)
+            ));
+            text_result(id, &json!({ "ok": true }))
+        }
+        "remove_dependency" => {
+            run!(store::remove_block(
+                conn,
+                &try_arg!(req("blocker")),
+                &try_arg!(req("blocked")),
+                &agent_of(&args)
+            ));
+            text_result(id, &json!({ "ok": true }))
+        }
+        "list_dependencies" => {
+            let key = try_arg!(req("id"));
+            let blocked_by = run!(store::blockers_of(conn, &key));
+            let blocks = run!(store::blocked_by(conn, &key));
+            text_result(
+                id,
+                &json!({ "id": key, "blocked_by": blocked_by, "blocks": blocks }),
+            )
+        }
         _ => rpc_err(id, -32602, &format!("unknown tool '{name}'")),
     }
 }
@@ -538,5 +565,14 @@ fn tool_defs() -> Vec<Value> {
             &["id"]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
+        tool("add_dependency", "Declare that 'blocker' must reach a terminal status (done/canceled) before 'blocked' can be claimed. Claim/peek skip an issue with any open blocker. Rejects self-blocks and edges that would form a cycle.",
+            json!({ "blocker": s("Issue key that must close first"), "blocked": s("Issue key that waits on the blocker"),
+                    "agent": s("Acting agent name") }),
+            &["blocker", "blocked"]),
+        tool("remove_dependency", "Remove a blocker → blocked dependency edge. If this clears the blocked issue's last open blocker, an unblock event is logged.",
+            json!({ "blocker": s("Blocking issue key"), "blocked": s("Blocked issue key"), "agent": s("Acting agent name") }),
+            &["blocker", "blocked"]),
+        tool("list_dependencies", "List an issue's open blockers (issues it waits on) and the issues it blocks.",
+            json!({ "id": s("Issue key") }), &["id"]),
     ]
 }

@@ -191,6 +191,7 @@ pub fn no_work_any_workspace(
     let mut counts = store::NoWorkCounts {
         blocked_by_lease: 0,
         blocked_by_cooldown: 0,
+        blocked_by_dep: 0,
         candidates: 0,
     };
     let mut retry_after: Option<i64> = None;
@@ -202,6 +203,7 @@ pub fn no_work_any_workspace(
         counts.candidates += nw.counts.candidates;
         counts.blocked_by_lease += nw.counts.blocked_by_lease;
         counts.blocked_by_cooldown += nw.counts.blocked_by_cooldown;
+        counts.blocked_by_dep += nw.counts.blocked_by_dep;
         if let Some(r) = nw.retry_after {
             retry_after = Some(retry_after.map_or(r, |cur| cur.min(r)));
         }
@@ -211,6 +213,7 @@ pub fn no_work_any_workspace(
             counts.candidates,
             counts.blocked_by_lease,
             counts.blocked_by_cooldown,
+            counts.blocked_by_dep,
         ),
         counts,
         retry_after,

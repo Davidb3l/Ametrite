@@ -116,10 +116,18 @@ async function amt(ws: Workspace, args: string[]): Promise<Response> {
 // ---------- read path: direct SQL ----------
 const PRIORITY_RANK =
   "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
+// `blocked`: 1 when this issue has at least one OPEN blocker (a `blocks` edge
+// whose blocker isn't done/canceled) — the chain-icon signal (R3), matching the
+// engine's claimable predicate.
 const ISSUE_SELECT = `
   SELECT d.doc_id, d.id, d.title, i.status, i.priority, i.project, i.assignee,
          i.parent_id AS parent, i.due, i.claimed_by, i.claim_expires_at,
-         d.created_at, d.updated_at
+         d.created_at, d.updated_at,
+         EXISTS(
+           SELECT 1 FROM blocks b JOIN issues bi
+             ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
+           WHERE b.blocked = d.id AND bi.status NOT IN ('done','canceled')
+         ) AS blocked
   FROM documents d JOIN issues i ON i.doc_id = d.doc_id`;
 
 function withLabels(db: Database, rows: any[]): any[] {

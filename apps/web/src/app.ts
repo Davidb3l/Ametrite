@@ -5,6 +5,8 @@ type Issue = {
   project?: string; assignee?: string; parent?: string; due?: string;
   labels: string[]; claimed_by?: string; claim_expires_at?: string;
   created_at: string; updated_at: string; body?: string;
+  blocked?: number | boolean;
+  blockers?: DocRef[]; blocks?: DocRef[];
   activity?: Activity[]; backlinks?: DocRef[]; decisions?: Decision[];
 };
 type Decision = {
@@ -82,6 +84,14 @@ function prioSvg(p: string): string {
 
 function isStale(i: Issue): boolean {
   return !!i.claimed_by && !!i.claim_expires_at && Date.parse(i.claim_expires_at) < Date.now();
+}
+
+// Small chain-link glyph shown on cards with an open blocker (R3): this issue
+// can't be claimed until the blocker closes.
+function chainIcon(): string {
+  return `<svg class="chain" viewBox="0 0 16 16" aria-label="blocked by an open issue"><title>blocked — waiting on an open blocker</title>
+    <path d="M6.5 9.5 9.5 6.5M5.8 10.9l-1 1a2.4 2.4 0 0 1-3.4-3.4l2-2a2.4 2.4 0 0 1 3.4 0M10.2 5.1l1-1a2.4 2.4 0 0 1 3.4 3.4l-2 2a2.4 2.4 0 0 1-3.4 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </svg>`;
 }
 
 // ---------- tiny markdown renderer (escape first, then transform) ----------
@@ -277,7 +287,7 @@ function card(i: Issue): HTMLElement {
     ? `<span class="claim ${isStale(i) ? "stale" : ""}" title="${isStale(i) ? "stale lease — claimable" : `lease until ${i.claim_expires_at}`}">🔒 ${esc(i.claimed_by)}</span>`
     : "";
   el.innerHTML = `
-    <span class="key">${i.id}</span>
+    <span class="key">${i.id}${i.blocked ? chainIcon() : ""}</span>
     <a class="title" href="#/issue/${i.id}">${esc(i.title)}</a>
     <div class="meta">
       ${prioSvg(i.priority)}

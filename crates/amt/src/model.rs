@@ -46,6 +46,12 @@ pub struct Issue {
     pub activity: Vec<ActivityEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub backlinks: Vec<DocRef>,
+    /// Open (non-terminal) issues blocking this one. Populated on full load.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blockers: Vec<DocRef>,
+    /// Issues this one blocks (its dependents). Populated on full load.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blocks: Vec<DocRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,7 +157,18 @@ pub struct DoctorReport {
     pub missing_parents: Vec<MissingRef>,
     pub missing_projects: Vec<MissingRef>,
     pub dangling_decisions: Vec<MissingRef>,
+    /// Cycles in the `blocks` dependency graph (each is an issue-key ring that
+    /// can never drain, since every member waits on another). R3.
+    pub dependency_cycles: Vec<DependencyCycle>,
     pub ok: bool,
+}
+
+/// One cycle in the dependency graph: the issue keys forming the ring, in
+/// blocker→blocked order (the first key blocks the second, … the last blocks
+/// the first).
+#[derive(Debug, Serialize)]
+pub struct DependencyCycle {
+    pub cycle: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
