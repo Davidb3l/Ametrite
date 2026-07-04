@@ -118,17 +118,35 @@ const PRIORITY_RANK =
   "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
 // `blocked`: 1 when this issue has at least one OPEN blocker (a `blocks` edge
 // whose blocker isn't done/canceled) — the chain-icon signal (R3), matching the
-// engine's claimable predicate.
-const ISSUE_SELECT = `
-  SELECT d.doc_id, d.id, d.title, i.status, i.priority, i.project, i.assignee,
-         i.parent_id AS parent, i.due, i.claimed_by, i.claim_expires_at,
-         d.created_at, d.updated_at,
-         EXISTS(
+// engine's claimable predicate. The `blocks` table only exists at schema v4+;
+// the web layer never migrates (only the `amt` engine does), so a workspace
+// still on v3 has no `blocks` table. Detect it per-DB and fall back to
+// `blocked = 0` there, so the board serves un-migrated workspaces without
+// erroring. Once any `amt` command migrates that workspace, the icon appears.
+const hasBlocksCache = new WeakMap<Database, boolean>();
+function hasBlocks(db: Database): boolean {
+  let v = hasBlocksCache.get(db);
+  if (v === undefined) {
+    v = !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks'").get();
+    hasBlocksCache.set(db, v);
+  }
+  return v;
+}
+function issueSelect(db: Database): string {
+  const blocked = hasBlocks(db)
+    ? `EXISTS(
            SELECT 1 FROM blocks b JOIN issues bi
              ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
            WHERE b.blocked = d.id AND bi.status NOT IN ('done','canceled')
-         ) AS blocked
+         )`
+    : "0";
+  return `
+  SELECT d.doc_id, d.id, d.title, i.status, i.priority, i.project, i.assignee,
+         i.parent_id AS parent, i.due, i.claimed_by, i.claim_expires_at,
+         d.created_at, d.updated_at,
+         ${blocked} AS blocked
   FROM documents d JOIN issues i ON i.doc_id = d.doc_id`;
+}
 
 function withLabels(db: Database, rows: any[]): any[] {
   const stmt = db.query("SELECT DISTINCT tag FROM tags WHERE doc_id = ? ORDER BY tag");
@@ -140,7 +158,7 @@ function withLabels(db: Database, rows: any[]): any[] {
 }
 
 function listIssues(db: Database, params: URLSearchParams): any[] {
-  let sql = `${ISSUE_SELECT} WHERE 1=1`;
+  let sql = `${issueSelect(db)} WHERE 1=1`;
   const args: any[] = [];
   if (params.get("status")) {
     sql += " AND i.status = ?";
@@ -163,7 +181,7 @@ function listIssues(db: Database, params: URLSearchParams): any[] {
 }
 
 function getIssue(db: Database, id: string): any | null {
-  const row: any = db.query(`${ISSUE_SELECT} WHERE d.id = ?`).get(id);
+  const row: any = db.query(`${issueSelect(db)} WHERE d.id = ?`).get(id);
   if (!row) return null;
   const docId = row.doc_id;
   withLabels(db, [row]);
