@@ -1353,3 +1353,28 @@ fn events_stream_cursor_and_since_catchup() {
     assert_eq!(fresh[0].author, "bob");
     assert!(fresh[0].cursor > tip);
 }
+
+#[test]
+fn events_drain_covers_everything_past_the_batch_limit() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    for i in 0..30 {
+        store::add_comment(&mut conn, "AMT-1", "a", &format!("c{i}")).unwrap();
+    }
+    // The CLI/web drain loop: fetch batches of `limit` until a short batch,
+    // advancing the cursor — must yield ALL events (1 created + 30 comments),
+    // never silently truncating at the limit.
+    let (mut cursor, mut total) = (0i64, 0usize);
+    loop {
+        let batch = store::events(&conn, cursor, 5).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        total += batch.len();
+        cursor = batch.last().unwrap().cursor;
+        if (batch.len() as i64) < 5 {
+            break;
+        }
+    }
+    assert_eq!(total, 31, "drain must cover every event past the batch limit");
+}

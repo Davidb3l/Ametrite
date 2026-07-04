@@ -165,7 +165,8 @@ enum Cmd {
         /// Keep the stream open and emit new events as they arrive
         #[arg(long)]
         follow: bool,
-        /// Max events per batch
+        /// Rows fetched per query (the stream is drained fully; this only
+        /// bounds memory per batch)
         #[arg(long, default_value_t = 500)]
         limit: i64,
     },
@@ -1351,12 +1352,22 @@ fn run(cli: Cli) -> Result<()> {
                 None => 0,
             };
             let mut out = std::io::stdout();
+            // Drain fully: `limit` bounds each fetch (memory), but we loop until
+            // caught up so nothing past the first batch is ever silently dropped
+            // — a one-shot dump emits the whole log, and a follow poll flushes
+            // an entire burst even if it exceeds `limit`.
             let mut emit = |cursor: &mut i64| -> Result<()> {
-                for e in store::events(&conn, *cursor, limit)? {
-                    // NDJSON: one compact JSON object per line.
-                    writeln!(out, "{}", serde_json::to_string(&e).expect("serialize"))
-                        .map_err(|e| amt::error::msg(e.to_string()))?;
-                    *cursor = e.cursor;
+                loop {
+                    let batch = store::events(&conn, *cursor, limit)?;
+                    for e in &batch {
+                        // NDJSON: one compact JSON object per line.
+                        writeln!(out, "{}", serde_json::to_string(e).expect("serialize"))
+                            .map_err(|e| amt::error::msg(e.to_string()))?;
+                        *cursor = e.cursor;
+                    }
+                    if (batch.len() as i64) < limit {
+                        break;
+                    }
                 }
                 out.flush().ok();
                 Ok(())

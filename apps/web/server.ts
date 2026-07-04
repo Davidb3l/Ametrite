@@ -319,11 +319,16 @@ setInterval(() => {
     if (versions.has(ws.alias) && versions.get(ws.alias) !== v) {
       broadcast("change", `{"ws":"${ws.alias}"}`);
       // Push the actual new activity rows so live consumers (R4 event stream)
-      // react without re-fetching the whole board.
+      // react without re-fetching the whole board. Drain fully — a burst larger
+      // than one batch must not be stranded until the next unrelated commit.
       try {
-        for (const e of eventsSince(ws.db, cursors.get(ws.alias)!, 200)) {
-          broadcast("activity", JSON.stringify({ ws: ws.alias, ...e }));
-          cursors.set(ws.alias, e.cursor);
+        for (;;) {
+          const batch = eventsSince(ws.db, cursors.get(ws.alias)!, 500);
+          for (const e of batch) {
+            broadcast("activity", JSON.stringify({ ws: ws.alias, ...e }));
+            cursors.set(ws.alias, e.cursor);
+          }
+          if (batch.length < 500) break;
         }
       } catch {}
     }
