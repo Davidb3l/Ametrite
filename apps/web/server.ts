@@ -114,8 +114,18 @@ async function amt(ws: Workspace, args: string[]): Promise<Response> {
 }
 
 // ---------- read path: direct SQL ----------
+// Single source for priority ordering on the web side (mirrors Rust
+// `model::PRIORITIES`). Both the SQL rank below and the cross-workspace inbox
+// sort derive from this array, so reordering priorities means editing one line.
+const PRIORITIES = ["urgent", "high", "medium", "low", "none"] as const;
+const priorityRank = (p: string): number => {
+  const i = (PRIORITIES as readonly string[]).indexOf(p);
+  return i < 0 ? PRIORITIES.length : i;
+};
 const PRIORITY_RANK =
-  "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
+  "CASE i.priority " +
+  PRIORITIES.map((p, i) => `WHEN '${p}' THEN ${i}`).join(" ") +
+  ` ELSE ${PRIORITIES.length} END`;
 // `blocked`: 1 when this issue has at least one OPEN blocker (a `blocks` edge
 // whose blocker isn't done/canceled) — the chain-icon signal (R3), matching the
 // engine's claimable predicate. The `blocks` table only exists at schema v4+;
@@ -362,7 +372,6 @@ Bun.serve({
     // Inbox: every workspace's open issues in one globally priority-sorted
     // list, each row tagged with its workspace (R1 cross-workspace view).
     "/api/inbox": () => {
-        const rank: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
         const out: any[] = [];
         for (const ws of workspaces.values()) {
             const db = dbOf(ws);
@@ -373,7 +382,7 @@ Bun.serve({
                 out.push(r);
             }
         }
-        out.sort((a, b) => (rank[a.priority] ?? 9) - (rank[b.priority] ?? 9) || a.created_at.localeCompare(b.created_at));
+        out.sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at));
         return json(out);
     },
     "/api/workspace": (req) => {

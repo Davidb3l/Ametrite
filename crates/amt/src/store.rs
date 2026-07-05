@@ -5,9 +5,6 @@ use crate::wikilink;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior};
 use serde::Serialize;
 
-const PRIORITY_RANK: &str =
-    "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
-
 pub struct NewIssue {
     pub title: String,
     pub body: String,
@@ -344,7 +341,10 @@ pub fn list_issues(conn: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
             sql.push_str(" AND i.claimed_by IS NULL");
         }
     }
-    sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT ?"));
+    sql.push_str(&format!(
+        " ORDER BY {}, d.created_at LIMIT ?",
+        priority_rank_sql("i.priority")
+    ));
     args.push(Box::new(if f.limit > 0 { f.limit } else { 200 }));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -582,7 +582,10 @@ fn best_claimable_key(
     let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     claimable_predicate(&mut sql, &mut args, now, agent, cooldown_secs, f);
-    sql.push_str(&format!(" ORDER BY {PRIORITY_RANK}, d.created_at LIMIT 1"));
+    sql.push_str(&format!(
+        " ORDER BY {}, d.created_at LIMIT 1",
+        priority_rank_sql("i.priority")
+    ));
     Ok(conn
         .query_row(
             &sql,
@@ -1313,13 +1316,17 @@ pub fn backlinks(conn: &Connection, id: &str) -> Result<Vec<DocRef>> {
     backlinks_of(conn, doc_id)
 }
 
+/// Quote a single whitespace-token so user input is never parsed as FTS5
+/// syntax (a bare `"` is doubled to escape it).
+fn quote_term(t: &str) -> String {
+    format!("\"{}\"", t.replace('"', "\"\""))
+}
+
 /// Quote each whitespace-separated term so user input is never parsed as
-/// FTS5 syntax; the final term gets prefix matching.
+/// FTS5 syntax; ANDs them (FTS5's implicit conjunction) and gives the final
+/// term prefix matching. This is the precision-oriented explicit-search query.
 fn fts_query(q: &str) -> String {
-    let terms: Vec<String> = q
-        .split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect();
+    let terms: Vec<String> = q.split_whitespace().map(quote_term).collect();
     match terms.split_last() {
         Some((last, rest)) if !rest.is_empty() => {
             format!("{} {last}*", rest.join(" "))
@@ -1329,11 +1336,37 @@ fn fts_query(q: &str) -> String {
     }
 }
 
+/// Quote each term and OR-join them, so a doc matches if it shares *any* term.
+/// Recall-oriented — the opposite trade-off from [`fts_query`]'s AND — for
+/// surfacing partially-overlapping related docs (context packs), where a doc
+/// need not contain every word of the source title to be relevant.
+fn fts_query_any(q: &str) -> String {
+    q.split_whitespace()
+        .map(quote_term)
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Explicit full-text search: ANDs the query terms (a hit must contain them
+/// all), prefix-matching the last term for incremental typing.
 pub fn search(conn: &Connection, query: &str, f: &SearchFilter) -> Result<Vec<SearchHit>> {
-    let match_expr = fts_query(query);
+    search_with_expr(conn, &fts_query(query), f)
+}
+
+/// Recall-oriented related-doc search: ORs the query terms so a doc sharing
+/// *some* words surfaces. Used by [`context_pack`]; keeps [`search`]'s AND
+/// semantics untouched for explicit user search.
+pub fn search_related(conn: &Connection, query: &str, f: &SearchFilter) -> Result<Vec<SearchHit>> {
+    search_with_expr(conn, &fts_query_any(query), f)
+}
+
+/// Run a prepared FTS5 match expression (already quoted/joined by a `fts_query*`
+/// builder) through the shared ranked-hit query. Empty expr → no hits.
+fn search_with_expr(conn: &Connection, match_expr: &str, f: &SearchFilter) -> Result<Vec<SearchHit>> {
     if match_expr.is_empty() {
         return Ok(Vec::new());
     }
+    let match_expr = match_expr.to_string();
     let mut sql = String::from(
         "SELECT d.id, d.type, d.title,
                 snippet(documents_fts, 1, '**', '**', '…', 18),
@@ -1702,9 +1735,12 @@ pub fn context_pack(conn: &Connection, key: &str, budget: Option<i64>) -> Result
         });
     }
 
-    // Top-k FTS hits by the issue title, excluding docs already in the pack.
+    // Top-k related hits by the issue title. Uses the OR-joined recall query
+    // (search_related, not search) so a doc that shares only *some* of the
+    // title's terms still surfaces — explicit search keeps its stricter AND
+    // semantics. Excludes docs already in the pack.
     let query = issue.title.clone();
-    let raw_hits = search(
+    let raw_hits = search_related(
         conn,
         &query,
         &SearchFilter {

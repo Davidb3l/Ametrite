@@ -1,5 +1,5 @@
 use crate::error::{msg, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 4;
@@ -210,6 +210,51 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     }
     if version < SCHEMA_VERSION {
         migrate(&conn, version)?;
+    }
+    Ok(conn)
+}
+
+/// Open a workspace database **read-only, without running migrations**.
+///
+/// The cross-workspace READ fan-outs (`list`/`search --all-workspaces`, the web
+/// inbox, and the peek/survey phase of a cross-workspace claim) open every
+/// registered workspace. Routing those through the migrating [`open`] means a
+/// mere *read* silently migrates — writes to — every DB on the machine, and
+/// hard-fails on a newer-schema workspace. `open_ro` avoids both: it opens with
+/// `SQLITE_OPEN_READ_ONLY` and never migrates.
+///
+/// Because it does not migrate, it requires the workspace to already be at
+/// exactly `SCHEMA_VERSION` — a read-only connection can't be brought up to the
+/// schema the queries assume, and running current-schema SQL against an older DB
+/// would error on missing tables/columns. A version mismatch (older *or* newer)
+/// is therefore returned as an error, which the fan-out loops treat as "skip
+/// this workspace". A workspace needing migration is upgraded the next time a
+/// write verb (`claim`/`create`/`update`) opens it via [`open`].
+pub fn open_ro(db_path: &Path) -> Result<Connection> {
+    if !db_path.is_file() {
+        return Err(msg(format!(
+            "no workspace database at {}",
+            db_path.display()
+        )));
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.pragma_update(None, "busy_timeout", 10_000)?;
+    let version: i64 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|_| msg("not an ametrite database (missing meta.schema_version)"))?
+        .parse()
+        .map_err(|_| msg("corrupt meta.schema_version"))?;
+    if version != SCHEMA_VERSION {
+        return Err(msg(format!(
+            "workspace schema v{version} != v{SCHEMA_VERSION}; read-only fan-out skips it (a write verb will migrate it)"
+        )));
     }
     Ok(conn)
 }

@@ -19,6 +19,29 @@ pub fn valid_priority(p: &str) -> bool {
     PRIORITIES.contains(&p)
 }
 
+/// Rank of a priority (0 = highest), derived from `PRIORITIES` position so the
+/// Rust and SQL orderings can never drift. Unknown priorities sort last.
+pub fn priority_rank(priority: &str) -> usize {
+    PRIORITIES
+        .iter()
+        .position(|p| *p == priority)
+        .unwrap_or(PRIORITIES.len())
+}
+
+/// SQL `CASE` expression mapping `col` (an `i.priority`-style column reference)
+/// to its rank, generated from `PRIORITIES` so it stays in lockstep with
+/// [`priority_rank`]. Callers embed the result in an `ORDER BY`. Single source
+/// for the priority ordering that was previously copied across store.rs,
+/// registry.rs, and the web server.
+pub fn priority_rank_sql(col: &str) -> String {
+    let mut sql = format!("CASE {col}");
+    for (i, p) in PRIORITIES.iter().enumerate() {
+        sql.push_str(&format!(" WHEN '{p}' THEN {i}"));
+    }
+    sql.push_str(&format!(" ELSE {} END", PRIORITIES.len()));
+    sql
+}
+
 #[derive(Debug, Serialize)]
 pub struct Issue {
     pub id: String,

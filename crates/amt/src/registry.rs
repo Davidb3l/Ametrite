@@ -6,7 +6,7 @@
 
 use crate::db;
 use crate::error::{msg, Result};
-use crate::model::Issue;
+use crate::model::{priority_rank, Issue};
 use crate::store;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -89,15 +89,6 @@ fn db_path(root: &str) -> PathBuf {
     Path::new(root).join(db::DB_DIR).join(db::DB_FILE)
 }
 
-/// Global priority rank (0 = highest) matching the SQL `PRIORITY_RANK`, so
-/// cross-workspace sorting agrees with each workspace's own ordering.
-fn priority_rank(priority: &str) -> usize {
-    crate::model::PRIORITIES
-        .iter()
-        .position(|p| *p == priority)
-        .unwrap_or(usize::MAX)
-}
-
 /// Open every registered workspace and run `f` against its connection,
 /// returning `(alias, T)` pairs. Unreachable/stale workspaces are silently
 /// skipped (that's `amt ws doctor`'s job to surface), so a fan-out over a
@@ -110,7 +101,8 @@ pub fn for_each_workspace<T>(
         // A single unreachable-or-erroring workspace must not sink the whole
         // fan-out: skip both open failures AND per-workspace query errors
         // (corrupt FTS, schema drift) so the healthy workspaces still return.
-        if let Ok(conn) = db::open(&db_path(&root)) {
+        // Read-only + no-migrate: a read verb must never migrate every DB.
+        if let Ok(conn) = db::open_ro(&db_path(&root)) {
             if let Ok(value) = f(&conn) {
                 out.push((alias, value));
             }
@@ -130,7 +122,8 @@ pub fn peek_any_workspace(
 ) -> Result<Option<(String, Issue)>> {
     let mut best: Option<(String, Issue)> = None;
     for (alias, root) in load()? {
-        let Ok(conn) = db::open(&db_path(&root)) else {
+        // Peek is read-only: open_ro so surveying every workspace never migrates.
+        let Ok(conn) = db::open_ro(&db_path(&root)) else {
             continue;
         };
         if let Some(issue) = store::peek_next(&conn, agent, cooldown_secs, f)? {
@@ -155,7 +148,9 @@ pub fn claim_any_workspace(
     // (alias, root, best-claimable candidate issue) for every workspace with work.
     let mut candidates: Vec<(String, String, Issue)> = Vec::new();
     for (alias, root) in load()? {
-        let Ok(conn) = db::open(&db_path(&root)) else {
+        // Survey phase is a read-only peek — open_ro so it never migrates. The
+        // winning workspace is re-opened with the migrating `open` below to claim.
+        let Ok(conn) = db::open_ro(&db_path(&root)) else {
             continue;
         };
         if let Some(issue) = store::peek_next(&conn, agent, cooldown_secs, f)? {
@@ -196,7 +191,8 @@ pub fn no_work_any_workspace(
     };
     let mut retry_after: Option<i64> = None;
     for (_alias, root) in load()? {
-        let Ok(conn) = db::open(&db_path(&root)) else {
+        // Read-only no-work report: open_ro so aggregating never migrates.
+        let Ok(conn) = db::open_ro(&db_path(&root)) else {
             continue;
         };
         let nw = store::no_work_reason(&conn, agent, cooldown_secs, f)?;

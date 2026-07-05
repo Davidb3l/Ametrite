@@ -1495,3 +1495,214 @@ fn init_rejects_unsafe_prefix() {
     let d3 = TempDir::new().unwrap();
     assert!(db::init(d3.path(), "n", "AMT").is_ok());
 }
+
+// ---------- AMT-11: read-only DB open (no migration on the read fan-out) ----------
+
+/// Turn a current-schema workspace into a valid *older* (v3) one: the v3→v4
+/// migration adds the `blocks` table, so dropping it and recording version 3
+/// mirrors a workspace last touched by an older `amt` that hasn't migrated.
+fn downgrade_to_v3(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE blocks;
+         UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+}
+
+fn schema_version_on_disk(path: &std::path::Path) -> String {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn open_ro_reads_current_schema_but_cannot_write() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "ro", "AMT").unwrap();
+    {
+        let mut conn = db::open(&path).unwrap();
+        store::create_issue(&mut conn, new_issue("readable", "", "high")).unwrap();
+    }
+    // open_ro opens the current-schema DB and can read it...
+    let ro = db::open_ro(&path).unwrap();
+    let n: i64 = ro
+        .query_row("SELECT COUNT(*) FROM issues", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    // ...but the connection is genuinely read-only: SQLite rejects any write.
+    assert!(
+        ro.execute("UPDATE meta SET value = 'x' WHERE key = 'workspace_name'", [])
+            .is_err(),
+        "open_ro must yield a read-only connection"
+    );
+}
+
+#[test]
+fn open_ro_refuses_schema_mismatch_and_never_migrates() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "stale", "AMT").unwrap();
+    downgrade_to_v3(&path);
+
+    // A read-only open refuses the stale (older-schema) workspace instead of
+    // migrating it, and leaves the on-disk schema untouched (the bug this fixes:
+    // a mere read migrating — writing to — a registered DB).
+    assert!(db::open_ro(&path).is_err(), "older schema is refused");
+    assert_eq!(
+        schema_version_on_disk(&path),
+        "3",
+        "open_ro must not migrate a stale workspace"
+    );
+
+    // A newer schema is refused too (a read-only conn can't be downgraded).
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [(db::SCHEMA_VERSION + 1).to_string()],
+        )
+        .unwrap();
+    assert!(db::open_ro(&path).is_err(), "newer schema is refused");
+
+    // Restore a valid v3 and prove the migrating write path still upgrades it —
+    // so the skip is open_ro-specific, not a broken database.
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'", [])
+        .unwrap();
+    let _ = db::open(&path).unwrap();
+    assert_eq!(schema_version_on_disk(&path), db::SCHEMA_VERSION.to_string());
+}
+
+#[test]
+fn read_fanout_skips_stale_workspace_without_migrating_it() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    // A healthy current-schema workspace with one issue...
+    let good = TempDir::new().unwrap();
+    {
+        let mut c = db::open(&db::init(good.path(), "good", "GD").unwrap()).unwrap();
+        store::create_issue(&mut c, new_issue("live", "", "high")).unwrap();
+    }
+    // ...and a stale (older-schema) one that a read must NOT migrate.
+    let stale = TempDir::new().unwrap();
+    let stale_path = db::init(stale.path(), "stale", "ST").unwrap();
+    downgrade_to_v3(&stale_path);
+
+    registry::add("good", good.path()).unwrap();
+    registry::add("stale", stale.path()).unwrap();
+
+    // The read fan-out behind `list/search --all-workspaces`: returns the
+    // healthy workspace and silently skips the stale one.
+    let counts = registry::for_each_workspace(|c| {
+        Ok(c.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get::<_, i64>(0))?)
+    })
+    .unwrap();
+    let aliases: Vec<&str> = counts.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(
+        aliases,
+        vec!["good"],
+        "read fan-out returns healthy workspaces and skips the stale one"
+    );
+    // The stale workspace is left un-migrated — a read never writes.
+    assert_eq!(
+        schema_version_on_disk(&stale_path),
+        "3",
+        "read fan-out must not migrate a registered workspace"
+    );
+
+    std::env::remove_var("AMT_REGISTRY");
+}
+
+// ---------- AMT-12: single-sourced priority rank ----------
+
+#[test]
+fn priority_rank_sql_agrees_with_rust_rank_from_one_source() {
+    let (_d, conn) = workspace();
+    // Every known priority: the generated SQL CASE and the Rust rank agree, and
+    // both equal the PRIORITIES index — a single source of truth.
+    for (i, p) in amt::model::PRIORITIES.iter().enumerate() {
+        let sql_rank: i64 = conn
+            .query_row(
+                &format!("SELECT {}", amt::model::priority_rank_sql(&format!("'{p}'"))),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql_rank as usize, i);
+        assert_eq!(amt::model::priority_rank(p), i);
+    }
+    // An unknown priority sorts last (== len) in both the SQL and Rust ranks.
+    let unknown: i64 = conn
+        .query_row(
+            &format!("SELECT {}", amt::model::priority_rank_sql("'bogus'")),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown as usize, amt::model::PRIORITIES.len());
+    assert_eq!(
+        amt::model::priority_rank("bogus"),
+        amt::model::PRIORITIES.len()
+    );
+}
+
+#[test]
+fn list_orders_by_generated_priority_rank() {
+    let (_d, mut conn) = workspace();
+    // Insert in shuffled priority order; list must come back in PRIORITIES order,
+    // driven entirely by the generated SQL rank.
+    for p in ["low", "urgent", "none", "high", "medium"] {
+        store::create_issue(&mut conn, new_issue(p, "", p)).unwrap();
+    }
+    let listed: Vec<String> = store::list_issues(&conn, &store::IssueFilter::default())
+        .unwrap()
+        .into_iter()
+        .map(|i| i.priority)
+        .collect();
+    let expected: Vec<String> = amt::model::PRIORITIES.iter().map(|s| s.to_string()).collect();
+    assert_eq!(listed, expected);
+}
+
+// ---------- AMT-15: context-pack FTS recall (OR-join title terms) ----------
+
+#[test]
+fn context_pack_surfaces_partially_overlapping_docs() {
+    let (_d, mut conn) = workspace();
+    // AMT-1: a multi-term title.
+    store::create_issue(&mut conn, new_issue("Session token rotation", "Body.", "high")).unwrap();
+    // A related note sharing only ONE term ("rotation") — under store::search's
+    // AND semantics it would not match the full title.
+    store::create_doc(
+        &mut conn,
+        new_note("Certificate rotation policy", "How we rotate TLS certificates."),
+    )
+    .unwrap();
+
+    // Explicit search keeps AND semantics: the partial-overlap note is excluded.
+    let strict = store::search(
+        &conn,
+        "Session token rotation",
+        &store::SearchFilter::default(),
+    )
+    .unwrap();
+    assert!(
+        strict.iter().all(|h| h.id != "certificate-rotation-policy"),
+        "explicit search must keep AND semantics (partial-overlap doc excluded)"
+    );
+
+    // The context pack OR-joins the title terms, so the partial-overlap doc
+    // surfaces as related context.
+    let pack = store::context_pack(&conn, "AMT-1", None).unwrap();
+    assert!(
+        pack.fts_hits.iter().any(|h| h.id == "certificate-rotation-policy"),
+        "context_pack OR-recall must surface partially-overlapping docs"
+    );
+}
