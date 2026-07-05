@@ -135,4 +135,4 @@ belongs to (one); labels = what kind of thing it is (many).*
 - Live Obsidian vault mirroring (two-way file sync)
 - Configurable workflows and statuses
 
-MIT licensed. See [PRD.md](PRD.md) for the v1 build tracker and [ROADMAP.md](ROADMAP.md) for v1.5 (multi-workspace agents, context packs, dependencies, graph view).
+MIT licensed.

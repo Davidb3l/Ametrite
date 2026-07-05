@@ -6,3 +6,8 @@ node_modules/
 *.db-shm
 dist/
 .DS_Store
+
+# Internal strategy docs — kept outside the public repo
+PRD.md
+ROADMAP.md
+SUITE_CONTRACTS.md
