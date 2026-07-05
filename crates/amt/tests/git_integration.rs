@@ -191,3 +191,22 @@ fn commits_since_base_scopes_to_branch() {
     assert_eq!(scoped.len(), 2, "got: {scoped:?}");
     assert!(scoped.iter().all(|c| !c.subject.contains("on main")));
 }
+
+#[test]
+fn hook_appends_refs_on_first_commit_of_unborn_branch() {
+    // A fresh repo with NO commits: the branch is "unborn", where
+    // `git rev-parse --abbrev-ref HEAD` returns "HEAD" (no key). The hook uses
+    // symbolic-ref, which still resolves the branch name.
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git(repo, &["config", "user.email", "t@example.com"]);
+    git(repo, &["config", "user.name", "Test"]);
+    git::install_hook(repo).unwrap();
+    git::create_branch(repo, "amt-9-first").unwrap();
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "first commit"]);
+    let body = git(repo, &["log", "-1", "--pretty=%B"]);
+    assert!(body.contains("Refs: AMT-9"), "unborn-branch first commit: {body:?}");
+}

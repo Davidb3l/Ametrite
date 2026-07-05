@@ -44,7 +44,9 @@ pub fn hook_script() -> String {
         r#"{HOOK_MARKER}
 # Auto-appends `Refs: <ISSUE-KEY>` when the branch name carries an issue key.
 # Managed by `amt hook`; edit inside these markers at your own risk.
-branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+# symbolic-ref resolves the branch name even on an unborn branch (the first
+# commit in a fresh repo), where `rev-parse --abbrev-ref HEAD` yields "HEAD".
+branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
 key="$(printf '%s' "$branch" | grep -oE '[A-Za-z][A-Za-z0-9]*-[0-9]+' | head -n1 | tr '[:lower:]' '[:upper:]')"
 if [ -n "$key" ] && ! grep -qiE "^Refs:[[:space:]]*$key\b" "$1"; then
   printf '\nRefs: %s\n' "$key" >> "$1"
