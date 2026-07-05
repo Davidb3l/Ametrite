@@ -4,6 +4,7 @@
 //! `tools/list`, and `tools/call` — the subset a tools-only MCP server needs.
 
 use crate::error::Result;
+use crate::git as store_git;
 use crate::store;
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -494,8 +495,26 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 &json!({ "id": key, "blocked_by": blocked_by, "blocks": blocks }),
             )
         }
+        "get_commits" => {
+            // R5: commits referencing an issue key. Degrades to an empty list
+            // when the workspace isn't inside a git repo.
+            let key = try_arg!(req("id"));
+            let commits = repo_root_of(conn)
+                .and_then(|repo| store_git::commits_for_key(&repo, &key).ok())
+                .unwrap_or_default();
+            text_result(id, &json!({ "id": key, "commits": commits }))
+        }
         _ => rpc_err(id, -32602, &format!("unknown tool '{name}'")),
     }
+}
+
+/// The git repo root for this MCP session's workspace, derived from the SQLite
+/// database path (`<root>/.ametrite/ametrite.db` → git repo containing
+/// `<root>`). `None` when the path is unknown or `<root>` isn't in a repo.
+fn repo_root_of(conn: &Connection) -> Option<std::path::PathBuf> {
+    let db_path = conn.path()?;
+    let root = std::path::Path::new(db_path).parent()?.parent()?;
+    store_git::repo_root(root).ok().flatten()
 }
 
 fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
@@ -605,5 +624,7 @@ fn tool_defs() -> Vec<Value> {
             &["blocker", "blocked"]),
         tool("list_dependencies", "List an issue's open blockers (issues it waits on) and the issues it blocks.",
             json!({ "id": s("Issue key") }), &["id"]),
+        tool("get_commits", "List git commits that reference an issue key (via `git log --grep`). Returns {id, commits:[{hash, subject}]}. Empty when the workspace isn't inside a git repo.",
+            json!({ "id": s("Issue key, e.g. AMT-7") }), &["id"]),
     ]
 }

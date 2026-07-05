@@ -1,6 +1,7 @@
 pub mod db;
 pub mod error;
 pub mod export;
+pub mod git;
 pub mod mcp;
 pub mod model;
 pub mod registry;

@@ -1,6 +1,6 @@
 use amt::error::Result;
 use amt::model::*;
-use amt::{db, export, mcp, registry, store};
+use amt::{db, export, git, mcp, registry, store};
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -181,6 +181,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WsCmd,
     },
+    /// Manage the git commit-msg hook that appends `Refs: <KEY>` from the branch
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+    /// Create and check out a git branch for an issue (`<key>-<slug>`)
+    Branch {
+        /// Issue key, e.g. AMT-7
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Install the commit-msg hook (idempotent; appends to a pre-existing hook)
+    Install,
+    /// Remove the commit-msg hook (only our marked block; keeps foreign hooks)
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +380,60 @@ fn identity(explicit: Option<String>) -> String {
         .or_else(|| std::env::var("AMT_AGENT").ok())
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "user".into())
+}
+
+/// The workspace root directory (the parent of `.ametrite`), used to locate the
+/// git repo for R5 git integration. Mirrors `open_workspace`'s resolution:
+/// explicit `--workspace` wins, otherwise walk up from cwd to the `.ametrite`
+/// marker.
+fn workspace_root(cli_workspace: &Option<PathBuf>) -> Result<PathBuf> {
+    match cli_workspace {
+        Some(dir) => Ok(dir.clone()),
+        None => {
+            let cwd = std::env::current_dir()?;
+            let db_path = db::find_workspace(&cwd).ok_or_else(|| {
+                amt::error::msg("no .ametrite workspace found (run `amt init` first)")
+            })?;
+            // db_path = <root>/.ametrite/ametrite.db → up two → <root>
+            Ok(db_path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or(cwd))
+        }
+    }
+}
+
+/// Commits referencing `key` reachable from HEAD, or an empty list when not in
+/// a git repo (or git errors). Never fails the caller — `issue show` degrades
+/// silently outside a repo.
+fn git_commits_for(cli_workspace: &Option<PathBuf>, key: &str) -> Vec<git::Commit> {
+    let root = match workspace_root(cli_workspace) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    match git::repo_root(&root) {
+        Ok(Some(repo)) => git::commits_for_key(&repo, key).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Commits on the current branch (since the default-branch merge-base) that
+/// reference `key`, for `release`'s auto-comment. Empty outside a git repo.
+fn git_commits_since_base(cli_workspace: &Option<PathBuf>, key: &str) -> Vec<git::Commit> {
+    let root = match workspace_root(cli_workspace) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    match git::repo_root(&root) {
+        Ok(Some(repo)) => git::commits_since_base(&repo, key).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Thin wrapper around `git::build_release_comment` (kept pure/testable there).
+fn build_release_comment(user: Option<&str>, commits: &[git::Commit]) -> Option<String> {
+    git::build_release_comment(user, commits)
 }
 
 fn open_workspace(cli_workspace: &Option<PathBuf>) -> Result<Connection> {
@@ -716,10 +788,23 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 IssueCmd::Show { id } => {
                     let issue = store::get_issue(&conn, id)?;
+                    // R5: list commits referencing this key when inside a git
+                    // repo; degrade silently (empty) otherwise.
+                    let commits = git_commits_for(&cli.workspace, &issue.id);
                     if cli.json {
-                        print_json(&issue);
+                        let mut v = serde_json::to_value(&issue)?;
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("commits".into(), serde_json::to_value(&commits)?);
+                        }
+                        print_json(&v);
                     } else {
                         print_issue_full(&issue);
+                        if !commits.is_empty() {
+                            println!("\ncommits:");
+                            for c in &commits {
+                                println!("  {} {}", c.hash, c.subject);
+                            }
+                        }
                     }
                 }
                 IssueCmd::Update {
@@ -947,12 +1032,19 @@ fn run(cli: Cli) -> Result<()> {
             comment,
         } => {
             let mut conn = open_workspace(&cli.workspace)?;
+            // Resolve the canonical key first so the git grep matches how commits
+            // reference it (get_issue validates existence and normalizes case).
+            let issue_key = store::get_issue(&conn, &id)?.id;
+            // R5: append the commits on this branch that reference the issue to
+            // the closing comment. Graceful no-op outside a git repo.
+            let commits = git_commits_since_base(&cli.workspace, &issue_key);
+            let final_comment = build_release_comment(comment.as_deref(), &commits);
             let issue = store::release_issue(
                 &mut conn,
                 &id,
                 &identity(agent),
                 &status,
-                comment.as_deref(),
+                final_comment.as_deref(),
             )?;
             if cli.json {
                 print_json(&issue);
@@ -1487,6 +1579,75 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Hook { ref cmd } => {
+            let root = workspace_root(&cli.workspace)?;
+            let repo = git::repo_root(&root)?.ok_or_else(|| {
+                amt::error::msg(format!(
+                    "not a git repository at {} — `amt hook` needs one",
+                    root.display()
+                ))
+            })?;
+            match cmd {
+                HookCmd::Install => {
+                    let action = git::install_hook(&repo)?;
+                    let msg = match action {
+                        git::HookAction::Installed => "installed commit-msg hook",
+                        git::HookAction::AlreadyInstalled => "commit-msg hook already installed",
+                        git::HookAction::Appended => {
+                            "appended amt block to existing commit-msg hook"
+                        }
+                        _ => "installed commit-msg hook",
+                    };
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "ok": true, "action": format!("{action:?}").to_lowercase(),
+                            "repo": repo,
+                        }));
+                    } else {
+                        println!("{msg} in {}", repo.display());
+                    }
+                }
+                HookCmd::Uninstall => {
+                    let action = git::uninstall_hook(&repo)?;
+                    let msg = match action {
+                        git::HookAction::Removed => "removed commit-msg hook",
+                        _ => "no amt commit-msg hook to remove",
+                    };
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "ok": true, "action": format!("{action:?}").to_lowercase(),
+                            "repo": repo,
+                        }));
+                    } else {
+                        println!("{msg} in {}", repo.display());
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Branch { key } => {
+            let conn = open_workspace(&cli.workspace)?;
+            // Validate the key and derive a slug from the real title.
+            let issue = store::get_issue(&conn, &key)?;
+            let root = workspace_root(&cli.workspace)?;
+            let repo = git::repo_root(&root)?.ok_or_else(|| {
+                amt::error::msg(format!(
+                    "not a git repository at {} — `amt branch` needs one",
+                    root.display()
+                ))
+            })?;
+            let slug = amt::wikilink::slugify(&issue.title);
+            let branch = format!("{}-{}", issue.id.to_lowercase(), slug);
+            git::create_branch(&repo, &branch)?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": true, "branch": branch, "issue": issue.id,
+                }));
+            } else {
+                println!("created and checked out branch {branch} (for {})", issue.id);
+            }
+            Ok(())
+        }
     }
 }
 
