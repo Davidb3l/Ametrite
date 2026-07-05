@@ -148,9 +148,16 @@ pub fn claim_any_workspace(
     // (alias, root, best-claimable candidate issue) for every workspace with work.
     let mut candidates: Vec<(String, String, Issue)> = Vec::new();
     for (alias, root) in load()? {
-        // Survey phase is a read-only peek — open_ro so it never migrates. The
-        // winning workspace is re-opened with the migrating `open` below to claim.
-        let Ok(conn) = db::open_ro(&db_path(&root)) else {
+        // Survey healthy workspaces read-only (open_ro) so claim doesn't migrate
+        // the whole fleet just to look. But claim is a WRITE verb: a stale
+        // (older-schema) workspace must still be migrated here so its ready work
+        // stays reachable — open_ro refuses a mismatched schema, so fall back to
+        // the migrating `open` for exactly those. Without this, --all-workspaces
+        // claim would permanently starve a stale workspace: the actual-claim
+        // re-open below only visits workspaces that reached `candidates`, so one
+        // skipped in the survey is never migrated and never seen again.
+        let path = db_path(&root);
+        let Ok(conn) = db::open_ro(&path).or_else(|_| db::open(&path)) else {
             continue;
         };
         if let Some(issue) = store::peek_next(&conn, agent, cooldown_secs, f)? {

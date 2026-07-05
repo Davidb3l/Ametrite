@@ -216,20 +216,25 @@ pub fn open(db_path: &Path) -> Result<Connection> {
 
 /// Open a workspace database **read-only, without running migrations**.
 ///
-/// The cross-workspace READ fan-outs (`list`/`search --all-workspaces`, the web
-/// inbox, and the peek/survey phase of a cross-workspace claim) open every
-/// registered workspace. Routing those through the migrating [`open`] means a
-/// mere *read* silently migrates — writes to — every DB on the machine, and
-/// hard-fails on a newer-schema workspace. `open_ro` avoids both: it opens with
+/// The cross-workspace READ fan-outs (`list`/`search`/`peek --all-workspaces`,
+/// the web inbox, and the no-work aggregation) open every registered workspace.
+/// Routing those through the migrating [`open`] means a mere *read* silently
+/// migrates — writes to — every DB on the machine, and hard-fails on a
+/// newer-schema workspace. `open_ro` avoids both: it opens with
 /// `SQLITE_OPEN_READ_ONLY` and never migrates.
 ///
 /// Because it does not migrate, it requires the workspace to already be at
 /// exactly `SCHEMA_VERSION` — a read-only connection can't be brought up to the
 /// schema the queries assume, and running current-schema SQL against an older DB
 /// would error on missing tables/columns. A version mismatch (older *or* newer)
-/// is therefore returned as an error, which the fan-out loops treat as "skip
-/// this workspace". A workspace needing migration is upgraded the next time a
-/// write verb (`claim`/`create`/`update`) opens it via [`open`].
+/// is therefore returned as an error, which the read fan-outs treat as "skip
+/// this workspace".
+///
+/// A workspace needing migration is upgraded the next time a write verb opens it
+/// via [`open`]. Note the cross-workspace *claim* survey deliberately does NOT
+/// simply skip an `open_ro` refusal: claim is a write verb, so it falls back to
+/// the migrating [`open`] for a stale workspace (see `registry::claim_any_workspace`),
+/// otherwise `claim --all-workspaces` would permanently starve its ready work.
 pub fn open_ro(db_path: &Path) -> Result<Connection> {
     if !db_path.is_file() {
         return Err(msg(format!(

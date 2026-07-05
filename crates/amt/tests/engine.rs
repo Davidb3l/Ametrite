@@ -1621,6 +1621,35 @@ fn read_fanout_skips_stale_workspace_without_migrating_it() {
     std::env::remove_var("AMT_REGISTRY");
 }
 
+#[test]
+fn cross_workspace_claim_migrates_and_claims_from_a_stale_workspace() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    // A stale (older-schema) workspace that holds ready, claimable work.
+    let stale = TempDir::new().unwrap();
+    let stale_path = db::init(stale.path(), "stale", "ST").unwrap();
+    {
+        let mut c = db::open(&stale_path).unwrap();
+        store::create_issue(&mut c, new_issue("urgent work", "", "urgent")).unwrap();
+    }
+    downgrade_to_v3(&stale_path);
+    registry::add("stale", stale.path()).unwrap();
+
+    // claim --all-workspaces is a WRITE verb: unlike a pure read fan-out (which
+    // skips a stale workspace), it must migrate the stale workspace and claim its
+    // ready issue rather than starve it — the fleet self-heals on claim.
+    let claimed = registry::claim_any_workspace("solo", 900, 0, &any()).unwrap();
+    let (ws, issue) = claimed.expect("a stale workspace's ready work must be claimable");
+    assert_eq!(ws, "stale");
+    assert_eq!(issue.id, "ST-1");
+    // The claim path migrated the workspace up to the current schema.
+    assert_eq!(schema_version_on_disk(&stale_path), db::SCHEMA_VERSION.to_string());
+
+    std::env::remove_var("AMT_REGISTRY");
+}
+
 // ---------- AMT-12: single-sourced priority rank ----------
 
 #[test]
