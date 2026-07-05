@@ -731,3 +731,82 @@ dialog .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin
 .agent-row .last { text-align: right; color: var(--text-3); font-size: 12px; }
 .agent-row .muted { color: var(--text-3); }
 .activity-entry .xn { color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+/* ---------- ⌘K command palette (R6) ---------- */
+.cmdk-hint {
+  margin: 14px 6px 0; width: calc(100% - 12px); display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+  color: var(--text-3); font: inherit; font-size: 12px; cursor: pointer; transition: border-color .12s, color .12s; }
+.cmdk-hint:hover { border-color: var(--line-strong); color: var(--text-2); }
+.cmdk-hint kbd { margin-left: auto; }
+.cmdk-overlay {
+  position: fixed; inset: 0; z-index: 90; display: flex; justify-content: center; align-items: flex-start;
+  padding-top: 14vh; background: rgba(8, 6, 12, 0.55); backdrop-filter: blur(4px);
+  opacity: 0; transition: opacity .13s var(--ease-out); }
+.cmdk-overlay.show { opacity: 1; }
+.cmdk {
+  width: min(560px, 92vw); background: var(--overlay); border: 1px solid var(--line-strong);
+  border-radius: 14px; overflow: hidden; box-shadow: 0 24px 70px -20px rgba(0,0,0,.7), 0 0 0 1px rgba(139,116,255,.08);
+  transform: translateY(-6px) scale(.99); transition: transform .16s var(--ease-out); }
+.cmdk-overlay.show .cmdk { transform: none; }
+.cmdk-top { display: flex; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.cmdk-mag { width: 16px; height: 16px; color: var(--text-3); flex: none; }
+.cmdk-input { flex: 1; background: none; border: none; outline: none; color: var(--text); font: inherit; font-size: 15px; }
+.cmdk-input::placeholder { color: var(--text-3); }
+.cmdk-list { max-height: 48vh; overflow-y: auto; padding: 6px; }
+.cmdk-item { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
+.cmdk-item.on { background: var(--violet-soft); }
+.cmdk-k {
+  flex: none; width: 46px; text-align: center; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-3); font-family: var(--mono); }
+.cmdk-item.on .cmdk-k { color: var(--violet-bright); }
+.cmdk-k.nav, .cmdk-k.action { color: var(--amber); font-size: 13px; }
+.cmdk-label { color: var(--text); font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmdk-empty { padding: 22px; text-align: center; color: var(--text-3); font-size: 13px; }
+.cmdk-foot { display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 11px; }
+.cmdk-foot kbd { margin-right: 3px; }
+
+/* ---------- force-directed graph (R6) ---------- */
+.graph-content { padding: 0; position: relative; }
+#graph-svg { width: 100%; height: calc(100vh - 130px); display: block; cursor: grab; }
+#graph-svg:active { cursor: grabbing; }
+.g-edge { stroke: var(--line-strong); stroke-width: 1; transition: stroke .12s, opacity .12s; }
+.g-edge.hot { stroke: var(--violet); stroke-width: 1.6; }
+.g-edge.dim { opacity: .12; }
+.g-node { cursor: pointer; transition: opacity .12s; }
+.g-node.dim { opacity: .22; }
+.g-node circle { stroke: var(--bg); stroke-width: 1.5; transition: r .1s; }
+.g-node:hover circle { stroke: var(--text); }
+.g-node .g-label {
+  fill: var(--text-2); font-family: var(--mono); font-size: 9px; text-anchor: middle;
+  paint-order: stroke; stroke: var(--bg); stroke-width: 3px; pointer-events: none; opacity: 0; transition: opacity .12s; }
+.g-node:hover .g-label { opacity: 1; }
+.t-issue circle { fill: var(--violet); }
+.t-note circle { fill: var(--st-todo); }
+.t-decision circle { fill: var(--amber); }
+.t-project circle { fill: var(--green); }
+.graph-legend { display: flex; gap: 12px; }
+.graph-legend .lg { font-size: 11px; color: var(--text-2); display: flex; align-items: center; gap: 5px; }
+.graph-legend .lg::before { content: ""; width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.graph-legend .t-issue::before { background: var(--violet); }
+.graph-legend .t-note::before { background: var(--st-todo); }
+.graph-legend .t-decision::before { background: var(--amber); }
+.graph-legend .t-project::before { background: var(--green); }
+
+/* ---------- decisions timeline (R6) ---------- */
+.decisions-page { max-width: 820px; display: flex; flex-direction: column; gap: 22px; }
+.d-group { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: var(--panel); }
+.d-issue {
+  font-family: var(--mono); font-size: 12px; color: var(--violet-bright); background: var(--violet-soft);
+  padding: 2px 9px; border-radius: 6px; text-decoration: none; }
+.d-chain { margin-top: 12px; display: flex; flex-direction: column; }
+.d-node { display: flex; gap: 12px; text-decoration: none; align-items: flex-start; }
+.d-dot { flex: none; width: 11px; height: 11px; border-radius: 50%; margin-top: 3px; border: 2px solid var(--amber); background: var(--overlay); }
+.d-node.accepted .d-dot { background: var(--amber); }
+.d-node.superseded .d-dot { border-color: var(--text-3); }
+.d-node.proposed .d-dot { border-color: var(--st-todo); }
+.d-link { width: 2px; height: 16px; background: var(--line-strong); margin-left: 6.5px; }
+.d-key { font-family: var(--mono); font-size: 11px; color: var(--text-3); }
+.d-title { color: var(--text); font-size: 14px; }
+.d-node.superseded .d-title { color: var(--text-2); text-decoration: line-through; text-decoration-color: var(--text-3); }
+.d-meta { display: block; font-size: 11.5px; color: var(--text-3); margin-top: 2px; }

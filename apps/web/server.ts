@@ -456,6 +456,22 @@ Bun.serve({
     },
     "/api/projects": (req) =>
       json(dbOf(wsOf(req)).query("SELECT id, title FROM documents WHERE type = 'project' ORDER BY title").all()),
+    // The wikilink graph (R6): every document as a node, every resolved link as
+    // an edge. Powers the force-directed graph view.
+    "/api/graph": (req) => {
+      const db = dbOf(wsOf(req));
+      const nodes = db.query("SELECT id, type, title FROM documents ORDER BY id").all();
+      const edges = db
+        .query(
+          `SELECT DISTINCT s.id AS source, t.id AS target
+           FROM links l
+           JOIN documents s ON s.doc_id = l.source_doc_id
+           JOIN documents t ON t.doc_id = l.target_doc_id
+           WHERE l.target_doc_id IS NOT NULL AND s.doc_id != t.doc_id`
+        )
+        .all();
+      return json({ nodes, edges });
+    },
     "/api/docs/:id": (req) => {
       const doc = getDoc(dbOf(wsOf(req)), decodeURIComponent(req.params.id));
       return doc ? json(doc) : json({ error: "not found" }, 404);

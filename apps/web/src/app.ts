@@ -161,6 +161,8 @@ async function render() {
     else if (r.view === "notes") await renderNotes(r.arg);
     else if (r.view === "search") renderSearch();
     else if (r.view === "agents") await renderAgents();
+    else if (r.view === "graph") await renderGraph();
+    else if (r.view === "decisions") await renderDecisions();
     else if (r.view === "doc" && r.arg) await renderDocRedirect(r.arg);
     else if (r.view === "x" && r.arg) await crossWorkspace(r.arg);
     else location.hash = "#/board";
@@ -214,6 +216,7 @@ async function renderBoard() {
   main.querySelector("#new-issue")!.addEventListener("click", () => issueDialog());
 
   const board = main.querySelector("#board")!;
+  const CHUNK = 60; // render in windows so a 1k-issue column stays snappy
   for (const status of STATUSES) {
     const col = document.createElement("div");
     col.className = "column";
@@ -227,19 +230,52 @@ async function renderBoard() {
       <div class="col-body" data-status="${status}"></div>`;
     col.querySelector(".add")!.addEventListener("click", () => issueDialog(status));
     const body = col.querySelector(".col-body")! as HTMLElement;
-    for (const issue of byStatus[status]) body.appendChild(card(issue));
+    const issues = byStatus[status];
+    // Progressive windowing: render the first CHUNK, append more as the column
+    // scrolls — keeps initial DOM small for very large boards.
+    let rendered = 0;
+    const renderMore = () => {
+      const slice = issues.slice(rendered, rendered + CHUNK);
+      for (const issue of slice) body.appendChild(card(issue));
+      rendered += slice.length;
+    };
+    renderMore();
+    if (issues.length > CHUNK) {
+      body.addEventListener("scroll", () => {
+        if (rendered < issues.length && body.scrollTop + body.clientHeight > body.scrollHeight - 400) renderMore();
+      });
+    }
     body.addEventListener("dragover", (e) => { e.preventDefault(); body.classList.add("drop-target"); });
     body.addEventListener("dragleave", () => body.classList.remove("drop-target"));
-    body.addEventListener("drop", async (e) => {
+    body.addEventListener("drop", (e) => {
       e.preventDefault();
       body.classList.remove("drop-target");
       const id = e.dataTransfer!.getData("text/amt-issue");
-      if (!id) return;
-      await patch(`/api/issues/${encodeURIComponent(id)}`, { status });
-      render();
+      const el = draggedCard;
+      if (!id || !el) return;
+      const from = el.dataset.status!;
+      if (from === status) return;
+      // Optimistic: move the card + fix the counts immediately, then confirm.
+      const prevCol = el.parentElement as HTMLElement;
+      body.appendChild(el);
+      el.dataset.status = status;
+      bumpCount(board, from, -1);
+      bumpCount(board, status, +1);
+      patch(`/api/issues/${encodeURIComponent(id)}`, { status }).catch(() => {
+        // rollback on failure
+        prevCol.appendChild(el);
+        el.dataset.status = from;
+        bumpCount(board, from, +1);
+        bumpCount(board, status, -1);
+      });
     });
     board.appendChild(col);
   }
+}
+function bumpCount(board: Element, status: string, delta: number) {
+  const head = board.querySelector(`.col-body[data-status="${status}"]`)?.previousElementSibling;
+  const c = head?.querySelector(".count");
+  if (c) c.textContent = String(Math.max(0, Number(c.textContent) + delta));
 }
 
 // ---------- inbox (cross-workspace) ----------
@@ -361,13 +397,17 @@ function card(i: Issue): HTMLElement {
       ${i.labels.slice(0, 3).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}
       ${claim}
     </div>`;
+  el.dataset.id = i.id;
+  el.dataset.status = i.status;
   el.addEventListener("dragstart", (e) => {
     e.dataTransfer!.setData("text/amt-issue", i.id);
+    draggedCard = el;
     el.classList.add("dragging");
   });
-  el.addEventListener("dragend", () => el.classList.remove("dragging"));
+  el.addEventListener("dragend", () => { el.classList.remove("dragging"); draggedCard = null; });
   return el;
 }
+let draggedCard: HTMLElement | null = null;
 
 function issueDialog(status?: string) {
   const dlg = document.createElement("dialog");
@@ -732,10 +772,256 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "b") location.hash = "#/board";
   else if (e.key === "i") location.hash = "#/inbox";
   else if (e.key === "a") location.hash = "#/agents";
+  else if (e.key === "g") location.hash = "#/graph";
+  else if (e.key === "d") location.hash = "#/decisions";
   else if (e.key === "n") location.hash = "#/notes";
   else if (e.key === "/") { location.hash = "#/search"; e.preventDefault(); }
   else if (e.key === "c" && route().view === "board") { issueDialog(); e.preventDefault(); }
 });
+
+// ---------- ⌘K command palette ----------
+type Cmd = { label: string; kind: string; run: () => void };
+function navCommands(): Cmd[] {
+  const go = (hash: string) => () => (location.hash = hash);
+  return [
+    { label: "Go to Board", kind: "nav", run: go("#/board") },
+    { label: "Go to Inbox", kind: "nav", run: go("#/inbox") },
+    { label: "Go to Agents", kind: "nav", run: go("#/agents") },
+    { label: "Go to Graph", kind: "nav", run: go("#/graph") },
+    { label: "Go to Decisions", kind: "nav", run: go("#/decisions") },
+    { label: "Go to Notes", kind: "nav", run: go("#/notes") },
+    { label: "New issue", kind: "action", run: () => { location.hash = "#/board"; setTimeout(issueDialog, 30); } },
+  ];
+}
+
+let paletteOpen = false;
+function openPalette() {
+  if (paletteOpen) return;
+  paletteOpen = true;
+  const ov = document.createElement("div");
+  ov.className = "cmdk-overlay";
+  ov.innerHTML = `
+    <div class="cmdk">
+      <div class="cmdk-top"><svg viewBox="0 0 16 16" class="cmdk-mag"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.6"/></svg>
+        <input class="cmdk-input" placeholder="Search issues, notes, decisions — or jump…" /></div>
+      <div class="cmdk-list"></div>
+      <div class="cmdk-foot"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>↵</kbd> open</span><span><kbd>esc</kbd> close</span></div>
+    </div>`;
+  document.body.appendChild(ov);
+  requestAnimationFrame(() => ov.classList.add("show"));
+  const input = ov.querySelector(".cmdk-input") as HTMLInputElement;
+  const list = ov.querySelector(".cmdk-list")!;
+  let items: Cmd[] = [];
+  let sel = 0;
+  let timer: any;
+  const close = () => { paletteOpen = false; ov.remove(); };
+  const paint = () => {
+    list.innerHTML = items.length
+      ? items.map((c, i) => `<div class="cmdk-item ${i === sel ? "on" : ""}" data-i="${i}">
+          <span class="cmdk-k ${c.kind}">${c.kind === "nav" ? "→" : c.kind === "action" ? "＋" : esc(c.kind)}</span>
+          <span class="cmdk-label">${esc(c.label)}</span></div>`).join("")
+      : '<div class="cmdk-empty">No matches</div>';
+    list.querySelector(".cmdk-item.on")?.scrollIntoView({ block: "nearest" });
+  };
+  const build = async () => {
+    const query = input.value.trim();
+    const cmds = navCommands().filter((c) => !query || c.label.toLowerCase().includes(query.toLowerCase()));
+    let docs: Cmd[] = [];
+    if (query) {
+      const hits: any[] = await api(`/api/search?q=${encodeURIComponent(query)}`).catch(() => []);
+      docs = hits.slice(0, 8).map((hit) => ({
+        label: `${hit.id}  ${hit.title}`, kind: hit.type,
+        run: () => (location.hash = `#/doc/${encodeURIComponent(hit.id)}`),
+      }));
+    }
+    items = [...docs, ...cmds];
+    sel = 0; paint();
+  };
+  input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(build, 130); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { sel = Math.min(sel + 1, items.length - 1); paint(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { sel = Math.max(sel - 1, 0); paint(); e.preventDefault(); }
+    else if (e.key === "Enter") { const c = items[sel]; close(); c?.run(); e.preventDefault(); }
+    else if (e.key === "Escape") { close(); e.preventDefault(); }
+  });
+  list.addEventListener("click", (e) => {
+    const el = (e.target as HTMLElement).closest(".cmdk-item") as HTMLElement | null;
+    if (!el) return; const c = items[Number(el.dataset.i)]; close(); c?.run();
+  });
+  ov.addEventListener("mousedown", (e) => { if (e.target === ov) close(); });
+  build();
+  setTimeout(() => input.focus(), 20);
+}
+
+// ---------- force-directed link graph (R6) ----------
+async function renderGraph() {
+  const g = await api("/api/graph").catch(() => ({ nodes: [], edges: [] }));
+  main.innerHTML = "";
+  main.append(h(`
+    <div class="topbar"><h1>Graph</h1>
+      <span class="crumb">${g.nodes.length} nodes · ${g.edges.length} links</span>
+      <div class="spacer"></div>
+      <div class="graph-legend">
+        <span class="lg t-issue">issue</span><span class="lg t-note">note</span>
+        <span class="lg t-decision">decision</span><span class="lg t-project">project</span>
+      </div>
+    </div>
+    <div class="content graph-content"><svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg></div>`));
+  if (!g.nodes.length) {
+    main.querySelector(".graph-content")!.innerHTML =
+      '<div class="empty big"><span class="facet"></span>Nothing linked yet — connect work with [[wikilinks]].</div>';
+    return;
+  }
+  forceGraph(main.querySelector("#graph-svg") as unknown as SVGSVGElement, g.nodes, g.edges);
+}
+
+type GNode = { id: string; type: string; x: number; y: number; vx: number; vy: number; deg: number; fixed?: boolean };
+function forceGraph(svg: SVGSVGElement, rawNodes: any[], rawEdges: any[]) {
+  const NS = "http://www.w3.org/2000/svg";
+  const box = (svg.parentElement as HTMLElement).getBoundingClientRect();
+  const W = Math.max(box.width, 400), H = Math.max(box.height - 8, 400);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const nodes: GNode[] = rawNodes.map((n, i) => ({
+    id: n.id, type: n.type, deg: 0, vx: 0, vy: 0,
+    x: W / 2 + Math.cos(i * 2.4) * (40 + i * 3),
+    y: H / 2 + Math.sin(i * 2.4) * (40 + i * 3),
+  }));
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const edges = rawEdges.map((e: any) => ({ s: byId.get(e.source)!, t: byId.get(e.target)! })).filter((e) => e.s && e.t);
+  edges.forEach((e) => { e.s.deg++; e.t.deg++; });
+  const adj = new Map<string, Set<string>>();
+  nodes.forEach((n) => adj.set(n.id, new Set()));
+  edges.forEach((e) => { adj.get(e.s.id)!.add(e.t.id); adj.get(e.t.id)!.add(e.s.id); });
+
+  svg.innerHTML = "";
+  const gE = document.createElementNS(NS, "g");
+  const gN = document.createElementNS(NS, "g");
+  svg.append(gE, gN);
+  const edgeEls = edges.map(() => { const l = document.createElementNS(NS, "line"); l.setAttribute("class", "g-edge"); gE.append(l); return l; });
+  const rOf = (n: GNode) => 4 + Math.min(n.deg, 10);
+  let drag: GNode | null = null;
+  let hover: GNode | null = null;
+  const nodeEls = nodes.map((n) => {
+    const grp = document.createElementNS(NS, "g");
+    grp.setAttribute("class", `g-node t-${n.type}`);
+    const c = document.createElementNS(NS, "circle"); c.setAttribute("r", String(rOf(n)));
+    const tx = document.createElementNS(NS, "text"); tx.setAttribute("class", "g-label");
+    tx.setAttribute("y", String(-rOf(n) - 4)); tx.textContent = n.id;
+    grp.append(c, tx);
+    grp.addEventListener("mousedown", (ev) => { drag = n; n.fixed = true; ev.preventDefault(); });
+    grp.addEventListener("mouseenter", () => { hover = n; paintHover(); });
+    grp.addEventListener("mouseleave", () => { hover = null; paintHover(); });
+    grp.addEventListener("click", () => { if (!moved) location.hash = `#/doc/${encodeURIComponent(n.id)}`; });
+    gN.append(grp); return grp;
+  });
+  const paintHover = () => {
+    nodeEls.forEach((el, i) => {
+      const n = nodes[i];
+      const near = !hover || n.id === hover.id || adj.get(hover.id)!.has(n.id);
+      el.classList.toggle("dim", !near);
+    });
+    edgeEls.forEach((el, i) => {
+      const e = edges[i];
+      const near = !hover || e.s.id === hover.id || e.t.id === hover.id;
+      el.classList.toggle("hot", !!hover && near);
+      el.classList.toggle("dim", !!hover && !near);
+    });
+  };
+  let moved = false;
+  svg.addEventListener("mousemove", (ev) => {
+    if (!drag) return;
+    moved = true;
+    const pt = svgPoint(svg, ev);
+    drag.x = pt.x; drag.y = pt.y; drag.vx = drag.vy = 0;
+  });
+  const drop = () => { if (drag) drag.fixed = false; drag = null; setTimeout(() => (moved = false), 0); };
+  window.addEventListener("mouseup", drop);
+
+  let alpha = 1;
+  const tick = () => {
+    if (route().view !== "graph") { window.removeEventListener("mouseup", drop); return; }
+    // repulsion (O(n^2), fine for a few hundred nodes)
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y; let d2 = dx * dx + dy * dy || 0.01;
+        const f = (1400 * alpha) / d2; const d = Math.sqrt(d2);
+        const fx = (dx / d) * f, fy = (dy / d) * f;
+        a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+      }
+    }
+    // springs
+    for (const e of edges) {
+      let dx = e.t.x - e.s.x, dy = e.t.y - e.s.y; const d = Math.hypot(dx, dy) || 0.01;
+      const f = (d - 70) * 0.04 * alpha; const fx = (dx / d) * f, fy = (dy / d) * f;
+      e.s.vx += fx; e.s.vy += fy; e.t.vx -= fx; e.t.vy -= fy;
+    }
+    // gravity to centre + integrate
+    for (const n of nodes) {
+      n.vx += (W / 2 - n.x) * 0.002 * alpha; n.vy += (H / 2 - n.y) * 0.002 * alpha;
+      if (n.fixed) { n.vx = n.vy = 0; continue; }
+      n.vx *= 0.86; n.vy *= 0.86;
+      n.x = Math.max(14, Math.min(W - 14, n.x + n.vx));
+      n.y = Math.max(14, Math.min(H - 14, n.y + n.vy));
+    }
+    nodeEls.forEach((el, i) => el.setAttribute("transform", `translate(${nodes[i].x.toFixed(1)},${nodes[i].y.toFixed(1)})`));
+    edgeEls.forEach((el, i) => {
+      const e = edges[i];
+      el.setAttribute("x1", e.s.x.toFixed(1)); el.setAttribute("y1", e.s.y.toFixed(1));
+      el.setAttribute("x2", e.t.x.toFixed(1)); el.setAttribute("y2", e.t.y.toFixed(1));
+    });
+    alpha = Math.max(alpha * 0.994, drag ? 0.35 : 0.02);
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+function svgPoint(svg: SVGSVGElement, ev: MouseEvent) {
+  const r = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  return { x: ((ev.clientX - r.left) / r.width) * vb.width, y: ((ev.clientY - r.top) / r.height) * vb.height };
+}
+
+// ---------- decisions page with supersede timelines (R6) ----------
+async function renderDecisions() {
+  const decs: any[] = await api("/api/decisions").catch(() => []);
+  main.innerHTML = "";
+  main.append(h(`
+    <div class="topbar"><h1>Decisions</h1><span class="crumb">${decs.length} recorded</span><div class="spacer"></div></div>
+    <div class="content"><div class="decisions-page" id="dpage"></div></div>`));
+  const page = main.querySelector("#dpage")!;
+  if (!decs.length) {
+    page.innerHTML = '<div class="empty big"><span class="facet"></span>No decisions yet — record the “why” with <code>amt decide</code>.</div>';
+    return;
+  }
+  // Group by the issue each decision resolves; order chains oldest→newest.
+  const byIssue = new Map<string, any[]>();
+  for (const d of decs) (byIssue.get(d.resolves) ?? byIssue.set(d.resolves, []).get(d.resolves)!).push(d);
+  const groups = [...byIssue.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  page.innerHTML = groups.map(([issue, ds]) => {
+    ds.sort((a: any, b: any) => (a.created_at || "").localeCompare(b.created_at || ""));
+    const items = ds.map((d: any) => {
+      const superseded = d.status === "superseded";
+      return `<a class="d-node ${superseded ? "superseded" : d.status}" href="#/doc/${encodeURIComponent(d.id)}">
+        <span class="d-dot"></span>
+        <span class="d-body"><span class="d-key">${esc(d.id)}</span> <span class="d-title">${esc(d.title)}</span>
+          <span class="d-meta">${superseded ? `superseded by ${esc(d.superseded_by || "")}` : d.status}${d.created_at ? ` · ${ago(d.created_at)} ago` : ""}</span>
+        </span></a>`;
+    }).join('<span class="d-link"></span>');
+    return `<div class="d-group">
+      <a class="d-issue" href="#/doc/${encodeURIComponent(issue)}">${esc(issue)}</a>
+      <div class="d-chain">${items}</div></div>`;
+  }).join("");
+}
+
+// ⌘K / Ctrl+K — works from anywhere (including inputs).
+window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    if (!paletteOpen) openPalette();
+  }
+});
+document.getElementById("cmdk-hint")?.addEventListener("click", openPalette);
 
 window.addEventListener("hashchange", render);
 loadSidebar().then(render);
