@@ -236,6 +236,17 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
 
 /// Create a new workspace under `dir/.ametrite/ametrite.db`.
 pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
+    // The prefix becomes part of every issue id (`PREFIX-1`), which flows into
+    // URLs and the web UI — restrict it to a safe, id-shaped token so an id can
+    // never carry markup/path characters (prevents stored-XSS / route breakage).
+    if prefix.is_empty()
+        || prefix.len() > 16
+        || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Err(msg(format!(
+            "invalid prefix '{prefix}': use 1-16 ASCII letters/digits (e.g. AMT)"
+        )));
+    }
     let db_dir = dir.join(DB_DIR);
     let db_path = db_dir.join(DB_FILE);
     if db_path.exists() {

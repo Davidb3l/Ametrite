@@ -377,8 +377,13 @@ fn decisions_export_import_round_trip() {
     )
     .unwrap();
 
+    let src_act: i64 = conn.query_row("SELECT COUNT(*) FROM activity", [], |r| r.get(0)).unwrap();
     let out = TempDir::new().unwrap();
     export::export(&conn, out.path()).unwrap();
+    let mut fpath = String::new();
+    for e in std::fs::read_dir(out.path().join("issues")).unwrap() { fpath = e.unwrap().path().to_string_lossy().into(); }
+    eprintln!("SRC_ACT={src_act} FILE={fpath}");
+    eprintln!("--CONTENT--\n{}\n--END--", std::fs::read_to_string(&fpath).unwrap());
     assert!(out.path().join("decisions/D-1-use-sqlite.md").is_file());
 
     let dir2 = TempDir::new().unwrap();
@@ -1377,4 +1382,116 @@ fn events_drain_covers_everything_past_the_batch_limit() {
         }
     }
     assert_eq!(total, 31, "drain must cover every event past the batch limit");
+}
+
+// ---------- review-sweep regressions ----------
+
+#[test]
+fn from_stage_does_not_reclaim_out_of_stage_expired_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("R", "", "high")).unwrap();
+    // Claim (→ in_progress) with an already-expired lease, then move to in_review
+    // while still holding the claim.
+    store::claim_issue(&mut conn, "AMT-1", "alice", -10).unwrap();
+    store::update_issue(
+        &mut conn,
+        "AMT-1",
+        store::IssuePatch { status: Some("in_review".into()), ..Default::default() },
+        "alice",
+    )
+    .unwrap();
+    let todo = ["todo".to_string()];
+    let f = store::ClaimFilter { stages: Some(&todo), ..Default::default() };
+    // A --from todo builder must NOT reclaim the out-of-stage in_review issue,
+    // and neither should the default filter (reclaim is scoped to in_progress).
+    assert!(store::claim_next(&mut conn, "bob", 900, 0, &f).unwrap().is_none());
+    assert!(store::claim_next(&mut conn, "bob", 900, 0, &any()).unwrap().is_none());
+}
+
+#[test]
+fn remove_block_unblocks_only_on_last_open_blocker() {
+    let (_d, mut conn) = workspace();
+    for _ in 0..3 {
+        store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    }
+    store::add_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
+    store::add_block(&mut conn, "AMT-2", "AMT-3", "t").unwrap();
+    // Removing one blocker while the other stays open → NO unblock event.
+    store::remove_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
+    let a = store::get_issue(&conn, "AMT-3").unwrap();
+    assert!(!a.activity.iter().any(|e| e.body.starts_with("unblocked")));
+    // Removing the last open blocker → unblock event fires once.
+    store::remove_block(&mut conn, "AMT-2", "AMT-3", "t").unwrap();
+    let a = store::get_issue(&conn, "AMT-3").unwrap();
+    assert_eq!(
+        a.activity.iter().filter(|e| e.body == "unblocked [[AMT-2]]").count(),
+        1
+    );
+}
+
+#[test]
+fn remove_label_keeps_body_derived_tag() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(
+        &mut conn,
+        store::NewIssue {
+            labels: vec!["mytag".into()],
+            ..new_issue("x", "body with #mytag inside", "high")
+        },
+    )
+    .unwrap();
+    store::update_issue(
+        &mut conn,
+        "AMT-1",
+        store::IssuePatch { remove_labels: vec!["mytag".into()], ..Default::default() },
+        "t",
+    )
+    .unwrap();
+    // The body still contains #mytag, so the label filter must still match.
+    let hits = store::list_issues(
+        &conn,
+        &store::IssueFilter { label: Some("mytag".into()), limit: 10, ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn stats_ignores_comment_ending_in_done() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap(); // stays backlog
+    store::add_comment(&mut conn, "AMT-1", "t", "moved from todo → done").unwrap();
+    let s = store::stats(&conn, None).unwrap();
+    assert_eq!(s.throughput, 0, "a comment ending in → done is not a completion");
+}
+
+#[test]
+fn export_import_preserves_comment_with_activity_markers() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
+    let tricky = "Line one\n### @mallory · 2020-01-01T00:00:00.000Z\ntricky second header";
+    store::add_comment(&mut conn, "AMT-1", "alice", tricky).unwrap();
+
+    let out = TempDir::new().unwrap();
+    export::export(&conn, out.path()).unwrap();
+    let dir2 = TempDir::new().unwrap();
+    let mut conn2 = db::open(&db::init(dir2.path(), "copy", "AMT").unwrap()).unwrap();
+    export::import(&mut conn2, out.path()).unwrap();
+
+    let issue = store::get_issue(&conn2, "AMT-1").unwrap();
+    let comments: Vec<_> = issue.activity.iter().filter(|a| a.kind == "comment").collect();
+    assert_eq!(comments.len(), 1, "no injection split");
+    assert_eq!(comments[0].author, "alice", "author not spoofed");
+    assert!(comments[0].body.contains("### @mallory"));
+    assert!(comments[0].body.contains("tricky second header"));
+}
+
+#[test]
+fn init_rejects_unsafe_prefix() {
+    let d1 = TempDir::new().unwrap();
+    assert!(db::init(d1.path(), "n", "<img src=x>").is_err());
+    let d2 = TempDir::new().unwrap();
+    assert!(db::init(d2.path(), "n", "").is_err());
+    let d3 = TempDir::new().unwrap();
+    assert!(db::init(d3.path(), "n", "AMT").is_ok());
 }

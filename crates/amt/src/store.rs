@@ -473,8 +473,10 @@ pub fn update_issue(
         )?;
     }
     for label in &patch.remove_labels {
+        // Only remove the explicit label, not an identically-named body-derived
+        // #tag (which the body still contains and refresh_body_derived owns).
         tx.execute(
-            "DELETE FROM tags WHERE doc_id = ?1 AND tag = lower(?2)",
+            "DELETE FROM tags WHERE doc_id = ?1 AND tag = lower(?2) AND src = 'label'",
             params![doc_id, label],
         )?;
     }
@@ -528,10 +530,14 @@ fn claimable_predicate(
         _ => CLAIMABLE_STATUSES.to_vec(),
     };
     let ph = vec!["?"; stages.len()].join(",");
+    // Arm A: fresh, unclaimed work in a requested stage. Arm B: reclaim a
+    // stalled lease — scoped to `in_progress` (the status a claim produces), so
+    // a `--from todo` builder recovers dead in-progress work but does NOT get
+    // an expired-lease issue that was moved to in_review/backlog out of band.
     sql.push_str(&format!(
         " WHERE ((i.status IN ({ph}) AND i.claimed_by IS NULL)
                 OR (i.claimed_by IS NOT NULL AND i.claim_expires_at < ?
-                    AND i.status NOT IN ('done','canceled')))
+                    AND i.status = 'in_progress'))
           AND NOT EXISTS(
                 SELECT 1 FROM blocks b JOIN issues bi
                   ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
@@ -698,12 +704,12 @@ pub fn no_work_reason(
 
     // Base scope: candidates for claiming ignoring lease and cooldown,
     // mirroring the two arms of `claimable_predicate` — (a) in a claimable
-    // stage, or (b) currently leased in a non-terminal stage (claimable once
-    // the lease expires) — plus any project/label restriction.
+    // stage, or (b) a stalled in-progress lease (claimable once it expires) —
+    // plus any project/label restriction.
     let mut scope = format!(
         "FROM documents d JOIN issues i ON i.doc_id = d.doc_id
          WHERE ((i.status IN ({ph}))
-                OR (i.claimed_by IS NOT NULL AND i.status NOT IN ('done','canceled')))"
+                OR (i.claimed_by IS NOT NULL AND i.status = 'in_progress'))"
     );
     let mut scope_args: Vec<Box<dyn ToSql>> = stages
         .iter()
@@ -1067,7 +1073,7 @@ pub fn add_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &st
 /// blocked issue with no open blocker, emit an unblock event for it.
 pub fn remove_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &str) -> Result<()> {
     let tx = immediate(conn)?;
-    let (bk, _) = issue_key_and_doc(&tx, blocker)?;
+    let (bk, blocker_doc) = issue_key_and_doc(&tx, blocker)?;
     let (bd, blocked_doc) = issue_key_and_doc(&tx, blocked)?;
     let n = tx.execute(
         "DELETE FROM blocks WHERE blocker = ?1 AND blocked = ?2",
@@ -1076,7 +1082,26 @@ pub fn remove_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: 
     if n == 0 {
         return Err(msg(format!("'{bk}' does not block '{bd}'")));
     }
-    append_activity(&tx, blocked_doc, agent, "event", &format!("unblocked [[{bk}]]"))?;
+    // Announce an unblock only if THIS removal actually freed the issue: the
+    // removed blocker was itself open, and no other open blocker remains. This
+    // avoids a false "claimable" signal when other blockers persist and a
+    // duplicate event when the removed blocker was already done/canceled (the
+    // close path already emitted for it).
+    let bk_was_open: bool = tx.query_row(
+        "SELECT status NOT IN ('done','canceled') FROM issues WHERE doc_id = ?1",
+        [blocker_doc],
+        |r| r.get(0),
+    )?;
+    let still_blocked: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM blocks b JOIN issues bi
+            ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
+            WHERE b.blocked = ?1 AND bi.status NOT IN ('done','canceled'))",
+        [&bd],
+        |r| r.get(0),
+    )?;
+    if bk_was_open && !still_blocked {
+        append_activity(&tx, blocked_doc, agent, "event", &format!("unblocked [[{bk}]]"))?;
+    }
     touch(&tx, blocked_doc)?;
     tx.commit()?;
     Ok(())
@@ -1981,12 +2006,14 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
 /// `--since` window (ISO-8601 lower bound on the completion time).
 pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
     // Per issue: its done-time (latest '→ done' event) and first-claim time.
+    // The '→ done' match must require kind='event' — a comment whose body ends
+    // in '→ done' is not a real completion (agents() guards this the same way).
     let mut sql = "SELECT cycle FROM (
-        SELECT (julianday(MAX(CASE WHEN a.body LIKE '%→ done' THEN a.at END))
+        SELECT (julianday(MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END))
                 - julianday(MIN(CASE WHEN a.kind='event'
                        AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
                      THEN a.at END))) * 86400.0 AS cycle,
-               MAX(CASE WHEN a.body LIKE '%→ done' THEN a.at END) AS done_at
+               MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END) AS done_at
         FROM documents d JOIN activity a ON a.doc_id = d.doc_id
         WHERE d.type = 'issue'
         GROUP BY d.doc_id)

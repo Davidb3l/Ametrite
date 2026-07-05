@@ -235,7 +235,7 @@ async function renderBoard() {
       body.classList.remove("drop-target");
       const id = e.dataTransfer!.getData("text/amt-issue");
       if (!id) return;
-      await patch(`/api/issues/${id}`, { status });
+      await patch(`/api/issues/${encodeURIComponent(id)}`, { status });
       render();
     });
     board.appendChild(col);
@@ -354,8 +354,8 @@ function card(i: Issue): HTMLElement {
     ? `<span class="claim ${isStale(i) ? "stale" : ""}" title="${isStale(i) ? "stale lease — claimable" : `lease until ${i.claim_expires_at}`}">🔒 ${esc(i.claimed_by)}</span>`
     : "";
   el.innerHTML = `
-    <span class="key">${i.id}${i.blocked ? chainIcon() : ""}</span>
-    <a class="title" href="#/issue/${i.id}">${esc(i.title)}</a>
+    <span class="key">${esc(i.id)}${i.blocked ? chainIcon() : ""}</span>
+    <a class="title" href="#/issue/${encodeURIComponent(i.id)}">${esc(i.title)}</a>
     <div class="meta">
       ${prioSvg(i.priority)}
       ${i.labels.slice(0, 3).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}
@@ -403,7 +403,7 @@ function issueDialog(status?: string) {
       body: f.get("body") || undefined,
       labels: String(f.get("labels") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
     });
-    if (status && status !== "backlog") await patch(`/api/issues/${created.id}`, { status });
+    if (status && status !== "backlog") await patch(`/api/issues/${encodeURIComponent(created.id)}`, { status });
     render();
   });
   dlg.showModal();
@@ -416,13 +416,13 @@ async function renderIssue(id: string) {
   main.append(h(`
     <div class="topbar">
       <a class="crumb" href="#/board">← Board</a>
-      <h1>${i.id}</h1>
+      <h1>${esc(i.id)}</h1>
       <div class="spacer"></div>
     </div>
     <div class="content">
       <div class="issue-page">
         <div class="issue-main">
-          <div class="issue-key">${i.id}${i.parent ? ` · sub-issue of <a class="wikilink" href="#/issue/${esc(i.parent)}">${esc(i.parent)}</a>` : ""}</div>
+          <div class="issue-key">${esc(i.id)}${i.parent ? ` · sub-issue of <a class="wikilink" href="#/issue/${encodeURIComponent(i.parent)}">${esc(i.parent)}</a>` : ""}</div>
           <h2 class="issue-title">${esc(i.title)}</h2>
           <div class="prose">${i.body?.trim() ? md(i.body) : '<p style="color:var(--text-3)">No description.</p>'}</div>
           <div class="activity">
@@ -466,11 +466,11 @@ async function renderIssue(id: string) {
       ? fieldRow("Claim", `<span class="claim ${isStale(i) ? "stale" : ""}">🔒 ${esc(i.claimed_by)}</span>`)
       : "");
   fields.querySelector("#f-status")!.addEventListener("change", async (e) => {
-    await patch(`/api/issues/${i.id}`, { status: (e.target as HTMLSelectElement).value });
+    await patch(`/api/issues/${encodeURIComponent(i.id)}`, { status: (e.target as HTMLSelectElement).value });
     render();
   });
   fields.querySelector("#f-priority")!.addEventListener("change", async (e) => {
-    await patch(`/api/issues/${i.id}`, { priority: (e.target as HTMLSelectElement).value });
+    await patch(`/api/issues/${encodeURIComponent(i.id)}`, { priority: (e.target as HTMLSelectElement).value });
     render();
   });
 
@@ -502,7 +502,7 @@ async function renderIssue(id: string) {
   main.querySelector("#send-comment")!.addEventListener("click", async () => {
     const ta = main.querySelector("#comment") as HTMLTextAreaElement;
     if (!ta.value.trim()) return;
-    await post(`/api/issues/${i.id}/comments`, { body: ta.value });
+    await post(`/api/issues/${encodeURIComponent(i.id)}/comments`, { body: ta.value });
     render();
   });
 }

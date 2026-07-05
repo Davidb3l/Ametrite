@@ -300,15 +300,24 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             text_result(id, &issue)
         }
         "update_issue" => {
+            // A clearable field: absent = no change; "" or JSON null = clear;
+            // a non-empty string = set. (Matches the CLI, which clears on "" —
+            // the schema promises "empty/null clears".)
+            let clearable = |key: &str| -> Option<Option<String>> {
+                args.get(key).map(|v| match v.as_str() {
+                    Some("") | None => None,
+                    Some(s) => Some(s.to_string()),
+                })
+            };
             let patch = store::IssuePatch {
                 title: opt_s(&args, "title"),
                 body: opt_s(&args, "description"),
                 status: opt_s(&args, "status"),
                 priority: opt_s(&args, "priority"),
-                project: args.get("project").map(|v| v.as_str().map(String::from)),
-                assignee: args.get("assignee").map(|v| v.as_str().map(String::from)),
-                parent: args.get("parent").map(|v| v.as_str().map(String::from)),
-                due: args.get("due").map(|v| v.as_str().map(String::from)),
+                project: clearable("project"),
+                assignee: clearable("assignee"),
+                parent: clearable("parent"),
+                due: clearable("due"),
                 add_labels: strings(&args, "add_labels"),
                 remove_labels: strings(&args, "remove_labels"),
             };

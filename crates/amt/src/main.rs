@@ -593,6 +593,47 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Issue { ref cmd } => {
+            // `list --all-workspaces` fans out over the registry and needs no
+            // local workspace, matching `search`/`claim --all-workspaces`.
+            if let IssueCmd::List {
+                status,
+                assignee,
+                project,
+                label,
+                all,
+                all_workspaces: true,
+                limit,
+            } = cmd
+            {
+                let filter = store::IssueFilter {
+                    status: status.clone(),
+                    assignee: assignee.clone(),
+                    project: project.clone(),
+                    label: label.clone(),
+                    claimed: None,
+                    include_closed: *all,
+                    limit: *limit,
+                };
+                let per = registry::for_each_workspace(|c| store::list_issues(c, &filter))?;
+                if cli.json {
+                    let mut rows: Vec<serde_json::Value> = Vec::new();
+                    for (ws, issues) in &per {
+                        for i in issues {
+                            rows.push(issue_with_workspace(i, ws)?);
+                        }
+                    }
+                    print_json(&rows);
+                } else if per.iter().all(|(_, v)| v.is_empty()) {
+                    println!("no issues in any workspace");
+                } else {
+                    for (ws, issues) in &per {
+                        for i in issues {
+                            println!("[{ws}] {}", issue_line(i));
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let mut conn = open_workspace(&cli.workspace)?;
             match cmd {
                 IssueCmd::Create {
@@ -607,6 +648,16 @@ fn run(cli: Cli) -> Result<()> {
                     blocked_by,
                     blocks,
                 } => {
+                    // Validate dependency targets up front: create_issue and
+                    // add_block are separate transactions, so a bad --blocks /
+                    // --blocked-by key would otherwise leave an orphan issue
+                    // behind after the command exits non-zero. A brand-new issue
+                    // can't cycle or self-block, so existence is the only risk.
+                    let me = identity(None);
+                    for b in blocked_by.iter().chain(blocks) {
+                        store::get_issue(&conn, b)
+                            .map_err(|_| amt::error::msg(format!("no issue '{b}' to depend on")))?;
+                    }
                     let issue = store::create_issue(
                         &mut conn,
                         store::NewIssue {
@@ -618,10 +669,9 @@ fn run(cli: Cli) -> Result<()> {
                             assignee: assignee.clone(),
                             parent: parent.clone(),
                             due: due.clone(),
-                            author: identity(None),
+                            author: me.clone(),
                         },
                     )?;
-                    let me = identity(None);
                     for b in blocked_by {
                         store::add_block(&mut conn, b, &issue.id, &me)?;
                     }
@@ -641,7 +691,7 @@ fn run(cli: Cli) -> Result<()> {
                     project,
                     label,
                     all,
-                    all_workspaces,
+                    all_workspaces: _, // handled above (needs no local workspace)
                     limit,
                 } => {
                     let filter = store::IssueFilter {
@@ -653,36 +703,14 @@ fn run(cli: Cli) -> Result<()> {
                         include_closed: *all,
                         limit: *limit,
                     };
-                    if *all_workspaces {
-                        let per =
-                            registry::for_each_workspace(|c| store::list_issues(c, &filter))?;
-                        if cli.json {
-                            let mut rows: Vec<serde_json::Value> = Vec::new();
-                            for (ws, issues) in &per {
-                                for i in issues {
-                                    rows.push(issue_with_workspace(i, ws)?);
-                                }
-                            }
-                            print_json(&rows);
-                        } else if per.iter().all(|(_, v)| v.is_empty()) {
-                            println!("no issues in any workspace");
-                        } else {
-                            for (ws, issues) in &per {
-                                for i in issues {
-                                    println!("[{ws}] {}", issue_line(i));
-                                }
-                            }
-                        }
+                    let issues = store::list_issues(&conn, &filter)?;
+                    if cli.json {
+                        print_json(&issues);
+                    } else if issues.is_empty() {
+                        println!("no issues");
                     } else {
-                        let issues = store::list_issues(&conn, &filter)?;
-                        if cli.json {
-                            print_json(&issues);
-                        } else if issues.is_empty() {
-                            println!("no issues");
-                        } else {
-                            for i in &issues {
-                                println!("{}", issue_line(i));
-                            }
+                        for i in &issues {
+                            println!("{}", issue_line(i));
                         }
                     }
                 }
@@ -713,7 +741,17 @@ fn run(cli: Cli) -> Result<()> {
                         v.as_ref()
                             .map(|s| if s.is_empty() { None } else { Some(s.clone()) })
                     };
-                    let issue = store::update_issue(
+                    let me = identity(None);
+                    // Apply dependency edges first: add_block validates target
+                    // existence, self-blocks, and cycles, so a bad --blocks /
+                    // --blocked-by aborts before any field change is committed.
+                    for b in blocked_by {
+                        store::add_block(&mut conn, b, id, &me)?;
+                    }
+                    for b in blocks {
+                        store::add_block(&mut conn, id, b, &me)?;
+                    }
+                    store::update_issue(
                         &mut conn,
                         id,
                         store::IssuePatch {
@@ -728,16 +766,9 @@ fn run(cli: Cli) -> Result<()> {
                             add_labels: add_labels.clone(),
                             remove_labels: remove_labels.clone(),
                         },
-                        &identity(None),
+                        &me,
                     )?;
-                    let me = identity(None);
-                    for b in blocked_by {
-                        store::add_block(&mut conn, b, &issue.id, &me)?;
-                    }
-                    for b in blocks {
-                        store::add_block(&mut conn, &issue.id, b, &me)?;
-                    }
-                    let issue = store::get_issue(&conn, &issue.id)?;
+                    let issue = store::get_issue(&conn, id)?;
                     if cli.json {
                         print_json(&issue);
                     } else {
@@ -1343,6 +1374,9 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             use std::io::Write;
             let conn = open_workspace(&cli.workspace)?;
+            // Guard the drain loop: LIMIT 0 returns 0 rows forever (0 < 0 never
+            // breaks), and a negative LIMIT means "no cap" in SQLite — pin to >= 1.
+            let limit = limit.max(1);
             // Start cursor: explicit --since wins; otherwise a follower tails
             // from the current tip (new events only), while a one-shot dump
             // replays the whole log.

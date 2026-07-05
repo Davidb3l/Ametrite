@@ -141,12 +141,18 @@ pub fn export(conn: &Connection, dir: &Path) -> Result<usize> {
                 if a.kind == "event" {
                     content.push_str(&format!("- {} @{} {}\n", a.at, a.author, a.body));
                 } else {
-                    content.push_str(&format!(
-                        "\n### @{} · {}\n{}\n",
-                        a.author,
-                        a.at,
-                        a.body.trim_end()
-                    ));
+                    // Indent every comment-body line by 4 spaces so none can
+                    // start at column 0 with `### @` or `## Activity` and be
+                    // re-parsed as a new comment / section header on import
+                    // (import dedents to restore the exact text).
+                    let indented = a
+                        .body
+                        .trim_end()
+                        .lines()
+                        .map(|l| format!("    {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    content.push_str(&format!("\n### @{} · {}\n{}\n", a.author, a.at, indented));
                 }
             }
         }
@@ -217,10 +223,17 @@ fn parse_frontmatter(text: &str) -> Option<(Frontmatter, String)> {
 
 /// Split the body at a trailing `## Activity` section and parse its entries.
 fn split_activity(body: &str) -> (String, Vec<(String, String, String, String)>) {
-    let Some(pos) = body.find("\n## Activity") else {
+    // The "## Activity" header sits either at the very start of the body (an
+    // empty-body doc — parse_frontmatter trims the leading newline) or after
+    // real content ("\n## Activity"). `act` is normalized to start AT the
+    // header line so the per-line loop below can just skip that one line.
+    let (main, act) = if body.starts_with("## Activity") {
+        ("", body)
+    } else if let Some(pos) = body.find("\n## Activity") {
+        (&body[..pos], &body[pos + 1..])
+    } else {
         return (body.to_string(), Vec::new());
     };
-    let (main, act) = body.split_at(pos);
     let mut entries: Vec<(String, String, String, String)> = Vec::new(); // (at, author, kind, body)
     let mut comment: Option<(String, String, String)> = None; // (at, author, buf)
     let flush = |c: &mut Option<(String, String, String)>,
@@ -229,7 +242,7 @@ fn split_activity(body: &str) -> (String, Vec<(String, String, String, String)>)
             entries.push((at, author, "comment".into(), buf.trim().to_string()));
         }
     };
-    for line in act.lines().skip(2) {
+    for line in act.lines().skip(1) {
         if let Some(rest) = line.strip_prefix("### @") {
             flush(&mut comment, &mut entries);
             if let Some((author, at)) = rest.split_once(" · ") {
@@ -254,7 +267,9 @@ fn split_activity(body: &str) -> (String, Vec<(String, String, String, String)>)
                 }
             }
         } else if let Some((_, _, buf)) = comment.as_mut() {
-            buf.push_str(line);
+            // Reverse the export-side 4-space indent (older un-indented exports
+            // just pass through unchanged).
+            buf.push_str(line.strip_prefix("    ").unwrap_or(line));
             buf.push('\n');
         }
     }
@@ -327,11 +342,29 @@ pub fn import(conn: &mut Connection, dir: &Path) -> Result<usize> {
         };
 
         if doc_type == "issue" {
-            let num: i64 = id
+            let suffix: i64 = id
                 .rsplit('-')
                 .next()
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| msg(format!("issue id '{id}' has no numeric suffix")))?;
+            // issue_num is globally UNIQUE, but the id suffix can collide with an
+            // issue of a *different* prefix (cross-prefix import / Obsidian
+            // authoring). Keep the id as-is and, on collision, assign the next
+            // free number so the whole import batch doesn't roll back.
+            let taken: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM issues WHERE issue_num = ?1 AND doc_id != ?2)",
+                params![suffix, doc_id],
+                |r| r.get(0),
+            )?;
+            let num: i64 = if taken {
+                tx.query_row(
+                    "SELECT COALESCE(MAX(issue_num), 0) + 1 FROM issues",
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                suffix
+            };
             let get = |k: &str| fm.fields.get(k).cloned();
             tx.execute(
                 "INSERT INTO issues(doc_id, issue_num, status, priority, project, assignee, parent_id, due, claimed_by, claim_expires_at)
