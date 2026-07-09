@@ -29,3 +29,14 @@ jobs:
       - run: bun install
       # verify the web app bundles (server + frontend) without errors
       - run: bun build apps/web/server.ts --target bun --outdir /tmp/build
+
+  bench:
+    # Perf-budget gate: seed 10k issues and fail if a hot read path regresses
+    # past its budget (list/search/claim <15ms, context <50ms). Release build,
+    # median of many iterations to smooth CI scheduler noise.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release --example bench
