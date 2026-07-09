@@ -200,6 +200,8 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Compact the workspace database (FTS optimize, VACUUM, WAL checkpoint)
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -1670,6 +1672,41 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Gc => {
+            let conn = open_workspace(&cli.workspace)?;
+            let r = db::gc(&conn)?;
+            let reclaimed = (r.bytes_before - r.bytes_after).max(0);
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "bytes_before": r.bytes_before,
+                    "bytes_after": r.bytes_after,
+                    "bytes_reclaimed": reclaimed,
+                    "wal_frames_checkpointed": r.wal_frames_checkpointed,
+                }));
+            } else {
+                println!(
+                    "gc: {} → {} ({} reclaimed, {} WAL frames checkpointed)",
+                    fmt_bytes(r.bytes_before),
+                    fmt_bytes(r.bytes_after),
+                    fmt_bytes(reclaimed),
+                    r.wal_frames_checkpointed,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Compact human byte size: "512 B", "8.0 KB", "3.2 MB".
+fn fmt_bytes(n: i64) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f < KB {
+        format!("{n} B")
+    } else if f < KB * KB {
+        format!("{:.1} KB", f / KB)
+    } else {
+        format!("{:.1} MB", f / (KB * KB))
     }
 }
 

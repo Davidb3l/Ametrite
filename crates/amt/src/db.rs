@@ -284,6 +284,50 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
     Ok(())
 }
 
+/// On-disk size of the main database file in bytes (`page_count * page_size`),
+/// excluding the WAL — the metric `gc` reports shrinking.
+fn db_bytes(conn: &Connection) -> Result<i64> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok(pages * page_size)
+}
+
+/// Outcome of `gc`: main-db bytes before/after and WAL frames checkpointed.
+pub struct GcReport {
+    pub bytes_before: i64,
+    pub bytes_after: i64,
+    /// WAL frames folded into the main db by the final truncating checkpoint.
+    pub wal_frames_checkpointed: i64,
+}
+
+/// Compact a workspace database (`amt gc`): optimize the FTS index, run
+/// `PRAGMA optimize`, `VACUUM` to reclaim free pages, then a truncating WAL
+/// checkpoint. Requires a read-write connection with no open transaction
+/// (`VACUUM` cannot run inside one). Returns before/after sizes so the caller
+/// can report the space reclaimed.
+pub fn gc(conn: &Connection) -> Result<GcReport> {
+    let bytes_before = db_bytes(conn)?;
+    // Merge the FTS5 b-tree segments so search touches fewer pages.
+    conn.execute("INSERT INTO documents_fts(documents_fts) VALUES('optimize')", [])?;
+    // Let SQLite refresh stale query-planner statistics.
+    conn.execute_batch("PRAGMA optimize;")?;
+    // Rewrite the file without free pages (must be outside any transaction).
+    conn.execute_batch("VACUUM;")?;
+    // Fold the WAL (VACUUM writes a fresh one) back in and truncate it to ~0.
+    let wal_frames_checkpointed: i64 = conn.query_row(
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        [],
+        // columns: (busy, log_frames, checkpointed_frames)
+        |r| r.get(2),
+    )?;
+    let bytes_after = db_bytes(conn)?;
+    Ok(GcReport {
+        bytes_before,
+        bytes_after,
+        wal_frames_checkpointed,
+    })
+}
+
 /// Create a new workspace under `dir/.ametrite/ametrite.db`.
 pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
     // The prefix becomes part of every issue id (`PREFIX-1`), which flows into

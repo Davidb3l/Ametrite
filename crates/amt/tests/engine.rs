@@ -1579,6 +1579,43 @@ fn seed_zero_is_a_noop() {
     assert!(store::list_docs(&conn, "project").unwrap().is_empty());
 }
 
+// ---------- AMT-17: amt gc ----------
+
+#[test]
+fn gc_reclaims_freed_pages_and_preserves_data() {
+    let (_d, mut conn) = workspace();
+    store::seed(&mut conn, 1000, "seed").unwrap();
+    // Delete ~half the issues (FK cascade drops their issues/tags/activity/fts
+    // rows too), leaving free pages for VACUUM to reclaim.
+    conn.execute("DELETE FROM documents WHERE type = 'issue' AND doc_id % 2 = 0", [])
+        .unwrap();
+    let survivors = store::list_issues(
+        &conn,
+        &store::IssueFilter { include_closed: true, limit: 100000, ..Default::default() },
+    )
+    .unwrap()
+    .len();
+    assert!(survivors > 0);
+
+    let report = db::gc(&conn).unwrap();
+    assert!(report.bytes_after <= report.bytes_before, "gc never grows the db");
+    assert!(
+        report.bytes_before - report.bytes_after > 0,
+        "gc reclaims the freed pages"
+    );
+
+    // Data (and FTS) survive the vacuum: the remaining issues still list and
+    // search.
+    let after = store::list_issues(
+        &conn,
+        &store::IssueFilter { include_closed: true, limit: 100000, ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(after.len(), survivors, "gc preserves surviving issues");
+    let hits = store::search(&conn, "rotation", &store::SearchFilter::default()).unwrap();
+    assert!(!hits.is_empty(), "FTS still returns results after gc");
+}
+
 #[test]
 fn init_rejects_unsafe_prefix() {
     let d1 = TempDir::new().unwrap();
