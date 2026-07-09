@@ -1486,6 +1486,99 @@ fn export_import_preserves_comment_with_activity_markers() {
     assert!(comments[0].body.contains("tricky second header"));
 }
 
+// ---------- AMT-16: amt seed ----------
+
+#[test]
+fn seed_bulk_inserts_varied_claimable_and_linked_issues() {
+    let (_d, mut conn) = workspace();
+    let n = store::seed(&mut conn, 50, "seed-agent").unwrap();
+    assert_eq!(n, 50);
+
+    // All 50 land as issues (include_closed to count done/canceled too).
+    let all = store::list_issues(
+        &conn,
+        &store::IssueFilter {
+            include_closed: true,
+            limit: 1000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(all.len(), 50);
+
+    // Priorities and statuses are varied, not all one value.
+    let distinct_prio: std::collections::HashSet<_> =
+        all.iter().map(|i| i.priority.clone()).collect();
+    let distinct_status: std::collections::HashSet<_> =
+        all.iter().map(|i| i.status.clone()).collect();
+    assert!(distinct_prio.len() >= 3, "seed spreads priorities");
+    assert!(distinct_status.len() >= 3, "seed spreads statuses");
+
+    // A meaningful share stays claimable (backlog/todo), so a claim benchmark
+    // has candidates.
+    let claimable = all
+        .iter()
+        .filter(|i| i.status == "backlog" || i.status == "todo")
+        .count();
+    assert!(claimable > 0, "seed leaves claimable work");
+
+    // Deterministic: seeding a fresh workspace with the same count reproduces
+    // the same first title.
+    let (_d2, mut conn2) = workspace();
+    store::seed(&mut conn2, 50, "seed-agent").unwrap();
+    let first = store::get_issue(&conn, "AMT-1").unwrap();
+    let first2 = store::get_issue(&conn2, "AMT-1").unwrap();
+    assert_eq!(first.title, first2.title);
+
+    // Every fifth issue links a prior one, so backlinks exist somewhere.
+    let linked = store::get_issue(&conn, "AMT-1").unwrap();
+    assert!(
+        !linked.backlinks.is_empty(),
+        "AMT-1 should be backlinked by AMT-6 (every-fifth link)"
+    );
+
+    // Seeding again appends (ids continue), never collides.
+    let n2 = store::seed(&mut conn, 10, "seed-agent").unwrap();
+    assert_eq!(n2, 10);
+    assert!(store::get_issue(&conn, "AMT-60").is_ok());
+}
+
+#[test]
+fn seed_produces_real_stats_and_agent_metrics() {
+    let (_d, mut conn) = workspace();
+    store::seed(&mut conn, 60, "operator").unwrap();
+
+    // Done issues carry a backdated claim→done lifecycle, so stats has real
+    // throughput and a positive cycle time (not zeros).
+    let stats = store::stats(&conn, None).unwrap();
+    assert!(stats.throughput > 0, "seeded done issues count toward throughput");
+    assert!(
+        stats.median_cycle_secs.unwrap_or(0) > 0,
+        "claim precedes done, so cycle time is positive"
+    );
+    // The synthetic lifecycle must not trip the claim-integrity audit.
+    assert!(
+        stats.integrity.overlaps.is_empty(),
+        "seed emits one claim per issue — no overlapping leases"
+    );
+
+    // Worker agents show up with real claim/completed counts.
+    let agents = store::agents(&conn).unwrap();
+    let completed: i64 = agents.iter().map(|a| a.completed).sum();
+    let claims: i64 = agents.iter().map(|a| a.claims).sum();
+    assert!(completed > 0 && claims > 0, "agents report seeded work");
+    assert!(agents.len() >= 2, "seed spreads work across a worker pool");
+}
+
+#[test]
+fn seed_zero_is_a_noop() {
+    let (_d, mut conn) = workspace();
+    assert_eq!(store::seed(&mut conn, 0, "seed-agent").unwrap(), 0);
+    // No issues and no stray project docs created.
+    assert!(store::list_issues(&conn, &store::IssueFilter::default()).unwrap().is_empty());
+    assert!(store::list_docs(&conn, "project").unwrap().is_empty());
+}
+
 #[test]
 fn init_rejects_unsafe_prefix() {
     let d1 = TempDir::new().unwrap();

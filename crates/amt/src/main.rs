@@ -191,6 +191,15 @@ enum Cmd {
         /// Issue key, e.g. AMT-7
         key: String,
     },
+    /// Bulk-insert N synthetic issues (perf benchmarking / demos)
+    Seed {
+        /// Number of issues to create
+        #[arg(long, default_value_t = 1000)]
+        count: usize,
+        /// Author for the seeded activity (default: $AMT_AGENT or $USER)
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1645,6 +1654,19 @@ fn run(cli: Cli) -> Result<()> {
                 }));
             } else {
                 println!("created and checked out branch {branch} (for {})", issue.id);
+            }
+            Ok(())
+        }
+        Cmd::Seed { count, agent } => {
+            let me = identity(agent);
+            let mut conn = open_workspace(&cli.workspace)?;
+            let start = std::time::Instant::now();
+            let n = store::seed(&mut conn, count, &me)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            if cli.json {
+                print_json(&serde_json::json!({ "seeded": n, "elapsed_ms": elapsed_ms }));
+            } else {
+                println!("seeded {n} issues in {elapsed_ms}ms");
             }
             Ok(())
         }

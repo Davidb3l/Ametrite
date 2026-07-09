@@ -6,7 +6,7 @@ members = ["crates/amt"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ametrite/ametrite"
+repository = "https://github.com/Davidb3l/Ametrite"
 
 [profile.release]
 lto = true

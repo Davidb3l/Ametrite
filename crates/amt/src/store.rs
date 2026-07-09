@@ -1813,6 +1813,178 @@ fn trim_to_budget(pack: &mut ContextPack, cap: i64) {
     }
 }
 
+/// Bulk-insert `count` synthetic issues in a single transaction, for perf
+/// benchmarking and demos (`amt seed`). Structure is deterministic: ids, titles,
+/// priorities, statuses, projects, labels, and links are pure functions of the
+/// row index (no RNG dependency), so a given `count` always produces the same
+/// shape. Only timestamps float (they are anchored to "now").
+///
+/// Issues span all priorities, a spread of statuses (~40% left claimable), a
+/// handful of projects and labels, and every fifth issue wikilinks a prior one
+/// so backlink/graph reads have realistic fan-in. Non-open issues carry a
+/// backdated lifecycle (`created` → `claimed` → `released`/`done`) by a small
+/// pool of worker agents, so `stats` and `agents` report real throughput,
+/// cycle times, and per-agent counts rather than zeros. Creation times are
+/// staggered so age-tiebroken ordering (`claim`/`list`) behaves realistically.
+///
+/// Returns the number of issues created.
+///
+/// Note: assumes the workspace has no pre-existing non-project document whose id
+/// collides with a seed project slug (`core`/`web`/`cli`/`ops`); such a clash is
+/// left to `doctor` to surface, as with any hand-authored data.
+pub fn seed(conn: &mut Connection, count: usize, author: &str) -> Result<usize> {
+    if count == 0 {
+        return Ok(0);
+    }
+    const TOPICS: &[&str] = &[
+        "auth", "token", "rotation", "cache", "index", "search", "migration",
+        "registry", "claim", "lease", "webhook", "export", "import", "graph",
+        "budget", "vacuum", "checkpoint", "schema", "cursor", "backlink",
+    ];
+    const PROJECTS: &[&str] = &["core", "web", "cli", "ops"];
+    const LABELS: &[&str] = &["engine", "ops", "ux", "perf", "docs"];
+    // Non-terminal-heavy status spread; backlog+todo (2 of 5) stay claimable.
+    const STATUS_CYCLE: &[&str] = &["backlog", "todo", "in_review", "done", "canceled"];
+    const WORKERS: &[&str] = &["agent-a", "agent-b", "agent-c"];
+    // Seconds between successive issues' creation, so ages spread out.
+    const STEP: i64 = 600;
+
+    let tx = immediate(conn)?;
+    let prefix = db::id_prefix(&tx)?;
+    let start: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(issue_num), 0) + 1 FROM issues",
+        [],
+        |r| r.get(0),
+    )?;
+    let n = count as i64;
+
+    // Insert one activity row with an explicit backdated timestamp (`age`
+    // seconds before now — larger = older), so lifecycle events land in
+    // chronological order and `stats`/`agents` can reconstruct cycle times.
+    let activity = |tx: &Transaction<'_>,
+                    doc_id: i64,
+                    seq: i64,
+                    age: i64,
+                    author: &str,
+                    kind: &str,
+                    body: &str|
+     -> Result<()> {
+        tx.execute(
+            "INSERT INTO activity(doc_id, seq, at, author, kind, body)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','-'||?3||' seconds'), ?4, ?5, ?6)",
+            params![doc_id, seq, age, author, kind, body],
+        )?;
+        Ok(())
+    };
+
+    // Referenced projects exist as documents so `doctor` stays quiet on seeds.
+    for p in PROJECTS {
+        tx.execute(
+            "INSERT OR IGNORE INTO documents(id, type, title, body, created_at, updated_at)
+             VALUES (?1, 'project', ?1, '',
+               strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![p],
+        )?;
+    }
+
+    for k in 0..count {
+        let ki = k as i64;
+        let num = start + ki;
+        let key = format!("{prefix}-{num}");
+        let topic_a = TOPICS[k % TOPICS.len()];
+        let topic_b = TOPICS[(k / TOPICS.len() + 1) % TOPICS.len()];
+        let title = format!("Seed {num}: {topic_a} {topic_b}");
+        // Every fifth issue (past the first window) links a prior seeded issue.
+        let links_back = k >= 5 && k % 5 == 0;
+        let body = if links_back {
+            format!("Work on {topic_a} and {topic_b}. Relates to [[{prefix}-{}]].", num - 5)
+        } else {
+            format!("Work on {topic_a} and {topic_b}.")
+        };
+        let status = STATUS_CYCLE[k % STATUS_CYCLE.len()];
+        let worker = WORKERS[k % WORKERS.len()];
+        // Oldest issue first: index 0 created `n*STEP`s ago, the last ~STEPs ago.
+        let created_age = (n - ki) * STEP;
+
+        tx.execute(
+            "INSERT INTO documents(id, type, title, body, created_at, updated_at)
+             VALUES (?1, 'issue', ?2, ?3,
+               strftime('%Y-%m-%dT%H:%M:%fZ','now','-'||?4||' seconds'),
+               strftime('%Y-%m-%dT%H:%M:%fZ','now','-'||?4||' seconds'))",
+            params![key, title, body, created_age],
+        )?;
+        let doc_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO issues(doc_id, issue_num, status, priority, project)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                doc_id,
+                num,
+                status,
+                PRIORITIES[k % PRIORITIES.len()],
+                PROJECTS[k % PROJECTS.len()],
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tags(doc_id, tag, src) VALUES (?1, lower(?2), 'label')",
+            params![doc_id, LABELS[k % LABELS.len()]],
+        )?;
+        // Only the linking issues need the (comparatively costly) body-derived
+        // link/tag refresh; the rest carry no wikilinks, so skip it for them.
+        if links_back {
+            refresh_body_derived(&tx, doc_id, &body)?;
+        }
+
+        // Backdated lifecycle so `stats`/`agents` see real events. Events use
+        // the exact bodies those readers match (`claimed (…)`, `…→ done`).
+        activity(&tx, doc_id, 1, created_age, author, "event", "created")?;
+        match status {
+            // Claimed then released to review/done: one claim, one release, no
+            // overlap — clean under `stats`'s claim-integrity replay.
+            "in_review" | "done" => {
+                activity(&tx, doc_id, 2, (created_age - 60).max(0), worker, "event", "claimed (+900s)")?;
+                activity(
+                    &tx,
+                    doc_id,
+                    3,
+                    (created_age - 420).max(0),
+                    worker,
+                    "event",
+                    &format!("released; status: in_progress → {status}"),
+                )?;
+            }
+            // Abandoned work: a status change, no claim (so it doesn't inflate
+            // claim/throughput counts).
+            "canceled" => {
+                activity(&tx, doc_id, 2, (created_age - 300).max(0), worker, "event", "status: backlog → canceled")?;
+            }
+            // backlog / todo: created only — still open and claimable.
+            _ => {}
+        }
+    }
+
+    // Heal any pre-existing dangling links that point at ids/titles this seed
+    // just created, mirroring create_issue's per-insert resolve_dangling
+    // (batched into one statement here). Links between seeded issues already
+    // resolved inline via refresh_body_derived.
+    tx.execute(
+        "UPDATE links SET target_doc_id = (
+            SELECT d.doc_id FROM documents d
+            WHERE lower(d.id) = lower(links.target_raw)
+               OR lower(d.title) = lower(links.target_raw)
+            LIMIT 1)
+         WHERE target_doc_id IS NULL
+           AND EXISTS(
+             SELECT 1 FROM documents d
+             WHERE lower(d.id) = lower(links.target_raw)
+                OR lower(d.title) = lower(links.target_raw))",
+        [],
+    )?;
+
+    tx.commit()?;
+    Ok(count)
+}
+
 pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
     let now = db::now(conn)?;
     let mut stmt = conn.prepare(
