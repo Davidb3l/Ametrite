@@ -22,14 +22,33 @@ Ametrite gives every repo a shared workspace both humans and agents can read and
 - **Everything is scriptable.** Every command takes `--json`; `amt events --follow` streams
   activity as NDJSON.
 
-## Quickstart
+## Install
 
-Requires a Rust toolchain (CI builds on stable, Linux/macOS/Windows).
+Prebuilt binaries for macOS (Intel + Apple Silicon), Linux (x86_64), and Windows
+are attached to each [release](https://github.com/Davidb3l/Ametrite/releases).
 
 ```sh
-git clone https://github.com/Davidb3l/Ametrite && cd Ametrite
-cargo install --path crates/amt        # installs `amt`
+# Homebrew
+brew install Davidb3l/tap/amt
 
+# Shell installer (macOS / Linux)
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Davidb3l/Ametrite/releases/latest/download/amt-installer.sh | sh
+
+# From source (needs a Rust toolchain)
+cargo install --git https://github.com/Davidb3l/Ametrite amt --locked
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://github.com/Davidb3l/Ametrite/releases/latest/download/amt-installer.ps1 | iex
+```
+
+`amt upgrade` updates in place, delegating to whichever of those installed it.
+
+## Quickstart
+
+```sh
 cd ~/code/your-project
 amt init --name my-project --prefix AMT   # creates .ametrite/ (git-ignores itself)
 
@@ -119,6 +138,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt doctor` | Workspace health: unresolved links, stale claims, missing refs |
 | `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
 | `amt gc` | Compact the database: FTS optimize, `VACUUM`, WAL checkpoint |
+| `amt upgrade` | Update `amt` in place via brew / installer / cargo (`--dry-run`) |
 | `amt mcp` | MCP stdio server |
 
 Statuses: `backlog → todo → in_progress → in_review → done` (or `canceled`).

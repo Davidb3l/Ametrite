@@ -202,6 +202,15 @@ enum Cmd {
     },
     /// Compact the workspace database (FTS optimize, VACUUM, WAL checkpoint)
     Gc,
+    /// Upgrade amt in place, delegating to whatever installed it
+    Upgrade {
+        /// Print the upgrade command instead of running it
+        #[arg(long)]
+        dry_run: bool,
+        /// Force an install method: brew, cargo, or installer (default: detect)
+        #[arg(long)]
+        method: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1691,6 +1700,33 @@ fn run(cli: Cli) -> Result<()> {
                     fmt_bytes(reclaimed),
                     r.wal_frames_checkpointed,
                 );
+            }
+            Ok(())
+        }
+        Cmd::Upgrade { dry_run, method } => {
+            // `upgrade` touches no workspace — it manages the binary itself.
+            let (install, program, args) = amt::upgrade::plan(method.as_deref())?;
+            let rendered = format!("{program} {}", args.join(" "));
+            let version = amt::upgrade::VERSION;
+            if cli.json {
+                if !dry_run {
+                    amt::upgrade::execute(&program, &args, true)?;
+                }
+                print_json(&serde_json::json!({
+                    "version": version,
+                    "install": install.as_str(),
+                    "command": rendered,
+                    "dry_run": dry_run,
+                    "upgraded": !dry_run,
+                }));
+            } else {
+                println!("amt {version} installed via {}", install.as_str());
+                if dry_run {
+                    println!("would run: {rendered}");
+                } else {
+                    println!("running: {rendered}");
+                    amt::upgrade::execute(&program, &args, false)?;
+                }
             }
             Ok(())
         }

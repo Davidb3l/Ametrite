@@ -6,4 +6,5 @@ pub mod mcp;
 pub mod model;
 pub mod registry;
 pub mod store;
+pub mod upgrade;
 pub mod wikilink;
