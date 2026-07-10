@@ -28,7 +28,8 @@ Prebuilt binaries for macOS (Intel + Apple Silicon), Linux (x86_64), and Windows
 are attached to each [release](https://github.com/Davidb3l/Ametrite/releases).
 
 ```sh
-# Homebrew
+# Homebrew. Recent versions refuse third-party taps until you trust them;
+# if brew asks, run `brew trust Davidb3l/tap` and re-run the install.
 brew install Davidb3l/tap/amt
 
 # Shell installer (macOS / Linux)
