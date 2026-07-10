@@ -1388,7 +1388,28 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open_workspace(&cli.workspace)?;
             let report = store::doctor(&conn)?;
             if cli.json {
-                print_json(&report);
+                // Suite doctor handshake (SUITE_CONTRACTS §3): every suite tool
+                // answers `<tool> doctor --json` with this stable envelope so
+                // peers (the 6969 hub, sirius) can discover each other without
+                // tool-specific knowledge. Tool detail lives under `checks`;
+                // `capabilities.ui` is where this tool's web UI is served
+                // (honoring AMT_PORT, like the web server itself).
+                let ui_port = std::env::var("AMT_PORT")
+                    .ok()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(1776);
+                print_json(&serde_json::json!({
+                    "tool": "ametrite",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "schemaVersion": db::SCHEMA_VERSION,
+                    "ok": report.ok,
+                    "capabilities": {
+                        "ui": format!("http://localhost:{ui_port}"),
+                        "mcp": true,
+                        "events": true,
+                    },
+                    "checks": report,
+                }));
             } else if report.ok {
                 println!("workspace healthy ✓");
             } else {
