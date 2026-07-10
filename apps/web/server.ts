@@ -7,7 +7,15 @@ import { homedir } from "node:os";
 import index from "./index.html";
 
 // 1776 — a local-first declaration of independence from cloud SaaS.
-const PORT = Number(process.env.AMT_PORT ?? 1776);
+// This parse must agree with `ui_port()` in crates/amt/src/main.rs, which
+// advertises the board's address in the doctor envelope (SUITE_CONTRACTS §3.2):
+// anything unparseable, empty, out of u16 range, or 0 falls back to the default,
+// so doctor can never point peers at a port the board never bound.
+const PORT = ((raw: string | undefined): number => {
+  if (raw === undefined) return 1776;
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n > 0 && n <= 65535 ? n : 1776;
+})(process.env.AMT_PORT);
 
 type Workspace = { alias: string; root: string; db: Database | null };
 const workspaces = new Map<string, Workspace>();

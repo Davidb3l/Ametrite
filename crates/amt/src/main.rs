@@ -478,6 +478,58 @@ fn print_json(value: &impl serde::Serialize) {
     );
 }
 
+/// The port the board is served on, honoring `AMT_PORT` (SUITE_CONTRACTS §3.2:
+/// a tool reports the address its UI is *currently* served on). `apps/web/
+/// server.ts` must agree with this parse, or doctor advertises a UI at an
+/// address the board never bound: anything unparseable, empty, out of u16
+/// range, or port 0 falls back to the default.
+fn ui_port() -> u16 {
+    std::env::var("AMT_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(1776)
+}
+
+/// The suite doctor handshake envelope (SUITE_CONTRACTS §3, schemaVersion 1).
+///
+/// Every suite tool answers `<tool> doctor --json` with this stable shape so
+/// peers (the Suite Hub, sirius) discover each other without tool-specific
+/// knowledge. Ametrite is the reference implementation, so the shape is pinned
+/// by tests: `capabilities` is the spec's string array, the optional top-level
+/// `ui` says where the board is served (§3.2), `checks` carries the spec's
+/// `{name, ok, detail}` rows, and the full workspace report stays available
+/// under `report` (additive).
+///
+/// NB: health lives in `ok`, never in the exit code — §3.1 distinguishes
+/// *present-but-unhealthy* (exit 0, `ok: false`) from *absent* (non-zero exit).
+fn doctor_envelope(report: &DoctorReport, ui_port: u16) -> serde_json::Value {
+    let check = |name: &str, n: usize| {
+        serde_json::json!({
+            "name": name,
+            "ok": n == 0,
+            "detail": format!("{n} found"),
+        })
+    };
+    serde_json::json!({
+        "tool": "amt",
+        "version": env!("CARGO_PKG_VERSION"),
+        "schemaVersion": 1,
+        "ok": report.ok,
+        "capabilities": ["ui", "mcp"],
+        "ui": format!("http://localhost:{ui_port}"),
+        "checks": [
+            check("unresolved_links", report.unresolved_links.len()),
+            check("stale_claims", report.stale_claims.len()),
+            check("missing_parents", report.missing_parents.len()),
+            check("missing_projects", report.missing_projects.len()),
+            check("dangling_decisions", report.dangling_decisions.len()),
+            check("dependency_cycles", report.dependency_cycles.len()),
+        ],
+        "report": report,
+    })
+}
+
 /// Serialize an issue with a top-level `"workspace"` field so cross-workspace
 /// JSON stays a flat issue object — agents keep reading `.id` while gaining
 /// `.workspace` to know which board it came from.
@@ -1388,44 +1440,7 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open_workspace(&cli.workspace)?;
             let report = store::doctor(&conn)?;
             if cli.json {
-                // Suite doctor handshake (SUITE_CONTRACTS §3, schemaVersion 1):
-                // every suite tool answers `<tool> doctor --json` with this
-                // stable envelope so peers (the 6969 hub, sirius) can discover
-                // each other without tool-specific knowledge. `capabilities`
-                // is the spec's string array; the optional top-level `ui` says
-                // where this tool's web UI is served (honoring AMT_PORT, like
-                // the web server itself) — an additive v1 extension. `checks`
-                // carries the spec's {name, ok, detail} rows; the full
-                // workspace report stays available under `report` (additive).
-                let ui_port = std::env::var("AMT_PORT")
-                    .ok()
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(1776);
-                let check = |name: &str, n: usize| {
-                    serde_json::json!({
-                        "name": name,
-                        "ok": n == 0,
-                        "detail": format!("{n} found"),
-                    })
-                };
-                let checks = vec![
-                    check("unresolved_links", report.unresolved_links.len()),
-                    check("stale_claims", report.stale_claims.len()),
-                    check("missing_parents", report.missing_parents.len()),
-                    check("missing_projects", report.missing_projects.len()),
-                    check("dangling_decisions", report.dangling_decisions.len()),
-                    check("dependency_cycles", report.dependency_cycles.len()),
-                ];
-                print_json(&serde_json::json!({
-                    "tool": "amt",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "schemaVersion": 1,
-                    "ok": report.ok,
-                    "capabilities": ["ui", "mcp"],
-                    "ui": format!("http://localhost:{ui_port}"),
-                    "checks": checks,
-                    "report": report,
-                }));
+                print_json(&doctor_envelope(&report, ui_port()));
             } else if report.ok {
                 println!("workspace healthy ✓");
             } else {
@@ -1826,5 +1841,80 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy_report() -> DoctorReport {
+        DoctorReport {
+            unresolved_links: vec![],
+            stale_claims: vec![],
+            missing_parents: vec![],
+            missing_projects: vec![],
+            dangling_decisions: vec![],
+            dependency_cycles: vec![],
+            ok: true,
+        }
+    }
+
+    /// Ametrite is the REFERENCE implementation of the SUITE_CONTRACTS §3
+    /// handshake — peers are coded against this exact shape, so pin it.
+    #[test]
+    fn doctor_envelope_matches_suite_contracts_3() {
+        let v = doctor_envelope(&healthy_report(), 1776);
+        assert_eq!(v["tool"], "amt");
+        assert_eq!(v["schemaVersion"], 1);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["capabilities"], serde_json::json!(["ui", "mcp"]));
+        // §3.2: a tool serving a web UI advertises both the capability and the
+        // live URL.
+        assert_eq!(v["ui"], "http://localhost:1776");
+        // §3: checks are {name, ok, detail} rows with stable snake_case names.
+        let checks = v["checks"].as_array().expect("checks array");
+        assert_eq!(checks.len(), 6);
+        for c in checks {
+            assert!(c["name"].is_string());
+            assert!(c["ok"].is_boolean());
+            assert!(c["detail"].is_string());
+        }
+        assert_eq!(checks[0]["name"], "unresolved_links");
+        // Additive: the full report stays available under `report`.
+        assert!(v["report"].is_object());
+    }
+
+    /// §3.1: an unhealthy tool still speaks — `ok:false` in the envelope, and
+    /// the failing check is visible (never hidden behind an exit code).
+    #[test]
+    fn doctor_envelope_reports_unhealthy_in_the_ok_field() {
+        let mut report = healthy_report();
+        report.dependency_cycles = vec![DependencyCycle {
+            cycle: vec!["AMT-1".into(), "AMT-2".into()],
+        }];
+        report.ok = false;
+        let v = doctor_envelope(&report, 1776);
+        assert_eq!(v["ok"], false);
+        let cycles = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "dependency_cycles")
+            .expect("dependency_cycles check");
+        assert_eq!(cycles["ok"], false);
+        assert_eq!(cycles["detail"], "1 found");
+    }
+
+    /// §3.2: the `ui` field must follow AMT_PORT, and the parse must agree with
+    /// `apps/web/server.ts` — an unusable value falls back to the default
+    /// rather than advertising a port the board never bound.
+    #[test]
+    fn ui_url_follows_the_port_override() {
+        assert_eq!(
+            doctor_envelope(&healthy_report(), 9999)["ui"],
+            "http://localhost:9999"
+        );
     }
 }

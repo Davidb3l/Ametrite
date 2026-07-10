@@ -5,7 +5,7 @@ members = ["crates/amt"]
 [workspace.package]
 # cargo-dist requires the git tag to match this version exactly (a `v0.1.0` tag
 # needs version `0.1.0`). Verify with `dist plan --tag=<tag>` before tagging.
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Davidb3l/Ametrite"
