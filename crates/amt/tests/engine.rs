@@ -1745,9 +1745,29 @@ fn init_rejects_unsafe_prefix() {
 /// mirrors a workspace last touched by an older `amt` that hasn't migrated.
 fn downgrade_to_v3(path: &std::path::Path) {
     let conn = Connection::open(path).unwrap();
+    // A v3 workspace predates both the v4 `blocks` table and the v5 rollup
+    // tables — drop them all so the 3→4→5 migration path can recreate them.
     conn.execute_batch(
         "DROP TABLE blocks;
+         DROP TABLE issue_metrics;
+         DROP TABLE agent_rollup;
+         DROP TABLE agent_completions;
+         DROP TABLE archived_overlaps;
          UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+}
+
+/// Turn a current-schema workspace into a valid v4 one (pre-AMT-20 rollup
+/// tables), for exercising the 4→5 migration alone.
+fn downgrade_to_v4(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE issue_metrics;
+         DROP TABLE agent_rollup;
+         DROP TABLE agent_completions;
+         DROP TABLE archived_overlaps;
+         UPDATE meta SET value = '4' WHERE key = 'schema_version';",
     )
     .unwrap();
 }
@@ -2003,4 +2023,235 @@ fn context_pack_surfaces_partially_overlapping_docs() {
             .any(|h| h.id == "certificate-rotation-policy"),
         "context_pack OR-recall must surface partially-overlapping docs"
     );
+}
+
+// ---------- AMT-20: activity archival (gc --archive-older-than) ----------
+
+fn archive_path(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join(".ametrite").join("archive.db")
+}
+
+/// Comparable snapshot of everything archival must not change:
+/// (throughput, avg cycle, median cycle, integrity ok, per-agent (name, claims, completed)).
+type MetricsSnapshot = (i64, Option<i64>, Option<i64>, bool, Vec<(String, i64, i64)>);
+
+fn metrics_snapshot(conn: &Connection) -> MetricsSnapshot {
+    let s = store::stats(conn, None).unwrap();
+    let mut agents: Vec<(String, i64, i64)> = store::agents(conn)
+        .unwrap()
+        .into_iter()
+        .map(|a| (a.name, a.claims, a.completed))
+        .collect();
+    agents.sort();
+    (
+        s.throughput,
+        s.avg_cycle_secs,
+        s.median_cycle_secs,
+        s.integrity.ok,
+        agents,
+    )
+}
+
+#[test]
+fn archive_preserves_stats_agents_and_integrity_exactly() {
+    let (dir, mut conn) = workspace();
+    store::seed(&mut conn, 60, "operator").unwrap();
+    let before = metrics_snapshot(&conn);
+    assert!(before.0 > 0, "fixture has completions to protect");
+
+    // Everything seeded is done/canceled-and-quiet relative to a 0-day cutoff.
+    let report = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert!(report.issues_archived > 0, "terminal issues were archived");
+    assert!(
+        report.rows_archived > report.issues_archived,
+        "moved multi-row histories"
+    );
+
+    // The metrics contract: stats/agents/integrity are IDENTICAL after archival.
+    // (agents() may add the gc author itself; compare against `before`'s names.)
+    let after = metrics_snapshot(&conn);
+    assert_eq!(before.0, after.0, "throughput unchanged");
+    assert_eq!(before.1, after.1, "avg cycle unchanged");
+    assert_eq!(before.2, after.2, "median cycle unchanged");
+    assert_eq!(before.3, after.3, "integrity verdict unchanged");
+    let after_agents: Vec<(String, i64, i64)> = after
+        .4
+        .into_iter()
+        .filter(|(n, _, _)| before.4.iter().any(|(bn, _, _)| bn == n))
+        .collect();
+    assert_eq!(
+        before.4, after_agents,
+        "per-agent claims/completed unchanged"
+    );
+
+    // A done issue's live activity is now just the marker; the raw history is
+    // in the archive file, keyed by issue key.
+    let done_key = {
+        let all = store::list_issues(
+            &conn,
+            &store::IssueFilter {
+                status: vec!["done".into()],
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        all[0].id.clone()
+    };
+    let issue = store::get_issue(&conn, &done_key).unwrap();
+    assert_eq!(issue.activity.len(), 1);
+    assert!(issue.activity[0].body.starts_with("activity archived ("));
+    let arch = Connection::open(archive_path(&dir)).unwrap();
+    let n: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM activity WHERE issue_key = ?1",
+            [&done_key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        n >= 3,
+        "done issue's created/claimed/released rows are in the archive"
+    );
+
+    // Open (backlog/todo) issues keep their activity untouched.
+    let open = store::list_issues(
+        &conn,
+        &store::IssueFilter {
+            status: vec!["backlog".into()],
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let open_issue = store::get_issue(&conn, &open[0].id).unwrap();
+    assert!(open_issue
+        .activity
+        .iter()
+        .all(|a| !a.body.starts_with("activity archived")));
+}
+
+#[test]
+fn archive_skips_recent_issues_and_is_idempotent() {
+    let (dir, mut conn) = workspace();
+    store::seed(&mut conn, 30, "operator").unwrap();
+
+    // A 9999-day cutoff: nothing seeded is that old — nothing moves.
+    let report = store::archive_activity(&mut conn, &archive_path(&dir), 9999, "gc-bot").unwrap();
+    assert_eq!(report.issues_archived, 0);
+    assert_eq!(report.rows_archived, 0);
+    assert!(
+        !archive_path(&dir).exists() || {
+            let arch = Connection::open(archive_path(&dir)).unwrap();
+            let n: i64 = arch
+                .query_row("SELECT COUNT(*) FROM activity", [], |r| r.get(0))
+                .unwrap();
+            n == 0
+        }
+    );
+
+    // Archive for real, then again: the second run finds only markers and
+    // must not re-archive (or marker counts would grow forever).
+    let first = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert!(first.issues_archived > 0);
+    let snapshot = metrics_snapshot(&conn);
+    let second = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert_eq!(second.issues_archived, 0, "markers are not re-archived");
+    assert_eq!(
+        metrics_snapshot(&conn),
+        snapshot,
+        "second run changes nothing"
+    );
+}
+
+#[test]
+fn archived_issue_can_reopen_and_complete_again() {
+    let (dir, mut conn) = workspace();
+    store::seed(&mut conn, 20, "operator").unwrap();
+    let done_key = store::list_issues(
+        &conn,
+        &store::IssueFilter {
+            status: vec!["done".into()],
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap()[0]
+        .id
+        .clone();
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    let throughput_before = store::stats(&conn, None).unwrap().throughput;
+
+    // Reopen, reclaim, complete again. Live history and the archived metrics
+    // row are merged PER ISSUE KEY, so this is still ONE completed issue —
+    // exactly what a never-archived workspace would report (its GROUP BY
+    // doc_id also counts a done → reopened → done issue once).
+    store::update_issue(
+        &mut conn,
+        &done_key,
+        store::IssuePatch {
+            status: Some("todo".into()),
+            ..Default::default()
+        },
+        "operator",
+    )
+    .unwrap();
+    store::claim_issue(&mut conn, &done_key, "agent-x", 900).unwrap();
+    store::release_issue(&mut conn, &done_key, "agent-x", "done", None).unwrap();
+
+    let s = store::stats(&conn, None).unwrap();
+    assert_eq!(
+        s.throughput, throughput_before,
+        "recompletion of an archived issue must not double-count"
+    );
+    assert!(
+        s.integrity.ok,
+        "no phantom overlaps from the archive boundary"
+    );
+    let issue = store::get_issue(&conn, &done_key).unwrap();
+    assert!(
+        issue.activity.len() > 1,
+        "new lifecycle appended after the marker"
+    );
+
+    // A later archive run must be a no-op for metrics: gc never changes stats.
+    // (The recompleted issue re-archives once its new activity ages out; with
+    // cutoff 0 that is immediately.)
+    let stats_before_gc = store::stats(&conn, None).unwrap();
+    let agents_before_gc = metrics_snapshot(&conn).4;
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    let stats_after_gc = store::stats(&conn, None).unwrap();
+    assert_eq!(
+        stats_before_gc.throughput, stats_after_gc.throughput,
+        "re-archiving must not change throughput"
+    );
+    assert_eq!(
+        stats_before_gc.avg_cycle_secs, stats_after_gc.avg_cycle_secs,
+        "re-archiving must not change cycle time (first claim anchors the span)"
+    );
+    // agent-x completed this issue once; a re-archive must not make it 2.
+    let agents_after_gc = metrics_snapshot(&conn).4;
+    let x_before = agents_before_gc.iter().find(|(n, _, _)| n == "agent-x");
+    let x_after = agents_after_gc.iter().find(|(n, _, _)| n == "agent-x");
+    assert_eq!(
+        x_before, x_after,
+        "per-agent claims/completed survive a re-archive unchanged"
+    );
+}
+
+#[test]
+fn v4_workspace_migrates_to_v5_and_archives() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "mig", "MG").unwrap();
+    {
+        let mut c = db::open(&path).unwrap();
+        store::seed(&mut c, 10, "operator").unwrap();
+    }
+    downgrade_to_v4(&path);
+    // Re-opening migrates 4→5 (creates the rollup tables)…
+    let mut conn = db::open(&path).unwrap();
+    // …and archival works on the migrated workspace.
+    let report = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert!(report.issues_archived > 0);
+    assert!(store::stats(&conn, None).unwrap().throughput > 0);
 }

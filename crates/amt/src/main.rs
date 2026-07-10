@@ -201,7 +201,12 @@ enum Cmd {
         agent: Option<String>,
     },
     /// Compact the workspace database (FTS optimize, VACUUM, WAL checkpoint)
-    Gc,
+    Gc {
+        /// Also archive the activity of done/canceled issues untouched for this
+        /// many days into .ametrite/archive.db (stats/agents stay exact)
+        #[arg(long, value_name = "DAYS")]
+        archive_older_than: Option<i64>,
+    },
     /// Upgrade amt in place, delegating to whatever installed it
     Upgrade {
         /// Print the upgrade command instead of running it
@@ -1681,18 +1686,48 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Gc => {
-            let conn = open_workspace(&cli.workspace)?;
+        Cmd::Gc { archive_older_than } => {
+            let mut conn = open_workspace(&cli.workspace)?;
+            // Archive BEFORE compacting, so the vacuum reclaims the moved rows.
+            let archived = match archive_older_than {
+                Some(days) => {
+                    let root = workspace_root(&cli.workspace)?;
+                    let archive_path = root.join(db::DB_DIR).join(db::ARCHIVE_FILE);
+                    Some(store::archive_activity(
+                        &mut conn,
+                        &archive_path,
+                        days,
+                        &identity(None),
+                    )?)
+                }
+                None => None,
+            };
             let r = db::gc(&conn)?;
             let reclaimed = (r.bytes_before - r.bytes_after).max(0);
             if cli.json {
-                print_json(&serde_json::json!({
+                let mut v = serde_json::json!({
                     "bytes_before": r.bytes_before,
                     "bytes_after": r.bytes_after,
                     "bytes_reclaimed": reclaimed,
                     "wal_frames_checkpointed": r.wal_frames_checkpointed,
-                }));
+                });
+                if let (Some(a), Some(obj)) = (&archived, v.as_object_mut()) {
+                    obj.insert(
+                        "issues_archived".into(),
+                        serde_json::json!(a.issues_archived),
+                    );
+                    obj.insert("rows_archived".into(), serde_json::json!(a.rows_archived));
+                }
+                print_json(&v);
             } else {
+                if let Some(a) = &archived {
+                    println!(
+                        "archived {} activity row(s) from {} issue(s) to .ametrite/{}",
+                        a.rows_archived,
+                        a.issues_archived,
+                        db::ARCHIVE_FILE
+                    );
+                }
                 println!(
                     "gc: {} → {} ({} reclaimed, {} WAL frames checkpointed)",
                     fmt_bytes(r.bytes_before),

@@ -2239,6 +2239,11 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
         for r in s.query_map([], |r| r.get::<_, String>(0))? {
             names.insert(r?);
         }
+        // Agents whose entire history was archived still belong on the roster.
+        let mut s = conn.prepare("SELECT agent FROM agent_rollup")?;
+        for r in s.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(r?);
+        }
     }
     let mut out = Vec::new();
     for name in names {
@@ -2268,20 +2273,43 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
             [&name],
             |r| r.get(0),
         )?;
-        // COUNT DISTINCT doc_id so an issue done → reopened → done counts once.
+        // Distinct issues so a done → reopened → done issue counts once — and
+        // distinct ACROSS the archive boundary: live completions (by issue
+        // key) union the (agent, issue_key) rows frozen at archive time, so an
+        // issue completed, archived, reopened, and completed again by the same
+        // agent still counts once, exactly as if nothing had been archived.
         let completed: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT doc_id) FROM activity
-             WHERE author = ?1 AND kind = 'event' AND body LIKE '%→ done'",
+            "SELECT COUNT(*) FROM (
+               SELECT d.id FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+                WHERE a.author = ?1 AND a.kind = 'event' AND a.body LIKE '%→ done'
+               UNION
+               SELECT issue_key FROM agent_completions WHERE agent = ?1
+             )",
             [&name],
             |r| r.get(0),
         )?;
+        // Fold in counters rolled up when this agent's history was archived, so
+        // `gc --archive-older-than` never zeroes anyone's lifetime numbers.
+        // (claims is a plain event count, so addition is exact.)
+        let rollup: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT claims, last_activity FROM agent_rollup WHERE agent = ?1",
+                [&name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (arch_claims, arch_last) = rollup.unwrap_or((0, None));
+        let last_activity = match (last_activity, arch_last) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
         out.push(AgentRow {
             name,
             active_leases,
             next_expiry,
             has_stale_lease,
             last_activity,
-            claims,
+            claims: claims + arch_claims,
             completed,
         });
     }
@@ -2294,15 +2322,29 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
     // Per issue: its done-time (latest '→ done' event) and first-claim time.
     // The '→ done' match must require kind='event' — a comment whose body ends
     // in '→ done' is not a real completion (agents() guards this the same way).
-    let mut sql = "SELECT cycle FROM (
-        SELECT (julianday(MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END))
-                - julianday(MIN(CASE WHEN a.kind='event'
-                       AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
-                     THEN a.at END))) * 86400.0 AS cycle,
-               MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END) AS done_at
-        FROM documents d JOIN activity a ON a.doc_id = d.doc_id
-        WHERE d.type = 'issue'
-        GROUP BY d.doc_id)
+    //
+    // Live history and archived history (issue_metrics, written by
+    // `gc --archive-older-than`) are merged PER ISSUE KEY before the cycle is
+    // computed — done_at takes the MAX and first_claim the MIN across both
+    // sides — so an issue that was archived, reopened, and completed again
+    // still reports exactly one completion whose cycle spans its full history,
+    // identical to a workspace where nothing was ever archived.
+    let mut sql = "SELECT (julianday(done_at) - julianday(first_claim)) * 86400.0 AS cycle
+        FROM (
+          SELECT key, MAX(done_at) AS done_at, MIN(claim_at) AS first_claim FROM (
+            SELECT d.id AS key,
+                   MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END) AS done_at,
+                   MIN(CASE WHEN a.kind='event'
+                        AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
+                        THEN a.at END) AS claim_at
+            FROM documents d JOIN activity a ON a.doc_id = d.doc_id
+            WHERE d.type = 'issue'
+            GROUP BY d.doc_id
+            UNION ALL
+            SELECT issue_key, done_at, first_claim_at FROM issue_metrics
+          )
+          GROUP BY key
+        )
         WHERE done_at IS NOT NULL"
         .to_string();
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
@@ -2366,6 +2408,42 @@ fn claim_integrity(conn: &Connection, since: Option<&str>) -> Result<Integrity> 
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<std::result::Result<_, _>>()?;
 
+    let (mut overlaps, _trailing_lease) = replay_overlaps(conn, events)?;
+    // Frozen overlaps from archived history count too — an audit finding does
+    // not stop being real because its events moved to the archive.
+    let mut stmt =
+        conn.prepare("SELECT issue, holder, claimant, at FROM archived_overlaps ORDER BY at")?;
+    let frozen: Vec<ClaimOverlap> = stmt
+        .query_map([], |r| {
+            Ok(ClaimOverlap {
+                issue: r.get(0)?,
+                holder: r.get(1)?,
+                claimant: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    overlaps.extend(frozen);
+    // Scope the *report* to the window (the replay above stayed full-history).
+    if let Some(s) = since {
+        overlaps.retain(|o| o.at.as_str() >= s);
+    }
+    Ok(Integrity {
+        ok: overlaps.is_empty(),
+        overlaps,
+    })
+}
+
+/// Replay claim/release events (already ordered by issue then seq) and return
+/// every overlapping claim, plus the expiry of a lease still open when the
+/// history ends (meaningful only for single-issue input). Shared by the live
+/// audit (which ignores the trailing lease) and the archiver, which freezes an
+/// issue's overlaps into `archived_overlaps` before its events move out of the
+/// live table — and skips issues whose trailing lease is still relevant.
+fn replay_overlaps(
+    conn: &Connection,
+    events: Vec<(String, String, String, String)>,
+) -> Result<(Vec<ClaimOverlap>, Option<String>)> {
     let mut overlaps = Vec::new();
     let mut cur_issue = String::new();
     let mut holder: Option<String> = None;
@@ -2405,13 +2483,254 @@ fn claim_integrity(conn: &Connection, since: Option<&str>) -> Result<Integrity> 
             holder = Some(author);
         }
     }
-    // Scope the *report* to the window (the replay above stayed full-history).
-    if let Some(s) = since {
-        overlaps.retain(|o| o.at.as_str() >= s);
+    Ok((overlaps, expiry))
+}
+
+/// What `archive_activity` did, for the gc report.
+#[derive(Debug, Serialize)]
+pub struct ArchiveReport {
+    pub issues_archived: i64,
+    pub rows_archived: i64,
+}
+
+/// Archive the activity of long-closed issues into the `archive.db` side file
+/// (AMT-20), so `gc`'s VACUUM can actually shrink the main DB.
+///
+/// Scope: issues in a terminal status (`done`/`canceled`) whose *entire*
+/// activity is older than `older_than_days`. The issue itself (body, labels,
+/// links) stays in the main DB — only its activity chatter moves. A single
+/// marker event replaces the moved rows so `show`/`context` say what happened.
+///
+/// Metrics are preserved exactly, not approximately: before an issue's rows
+/// move, its completion time + cycle time are rolled into `issue_metrics`, its
+/// per-agent claim/completion counts into `agent_rollup`, and any claim
+/// overlaps into `archived_overlaps`. `stats`, `agents`, and the integrity
+/// audit read live + rollup, so their numbers do not change when history moves.
+///
+/// Crash safety: the copy into archive.db and the delete from the live table
+/// are separate commits (WAL mode cannot commit across two databases
+/// atomically). The copy goes first and is idempotent — archive rows are keyed
+/// by (issue_key, seq) and re-copied with INSERT OR REPLACE — so a crash
+/// between the two phases leaves duplicates that the next run resolves, never
+/// lost history. Concurrent writers are fenced per issue: only rows up to the
+/// seq captured at candidate time are copied, and the delete is skipped for
+/// any issue whose max seq moved in the meantime (a comment landed mid-run),
+/// so a row can never be deleted without having been copied.
+pub fn archive_activity(
+    conn: &mut Connection,
+    archive_path: &std::path::Path,
+    older_than_days: i64,
+    agent: &str,
+) -> Result<ArchiveReport> {
+    if older_than_days < 0 {
+        return Err(msg("--archive-older-than must be >= 0 days"));
     }
-    Ok(Integrity {
-        ok: overlaps.is_empty(),
-        overlaps,
+    let now = db::now(conn)?;
+    let cutoff: String = conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '-'||?2||' days')",
+        params![now, older_than_days],
+        |r| r.get(0),
+    )?;
+
+    // Candidates: terminal issues whose newest activity predates the cutoff.
+    // "Newest activity" (not created_at) so an old issue that someone commented
+    // on recently is left alone. An issue already reduced to nothing but its
+    // archive marker (kind checked, so a user comment that merely looks like
+    // one doesn't block archiving) is skipped, or every later run would
+    // re-archive markers. MAX(a.seq) is the fence for the concurrency check in
+    // phase 2: only rows up to it are copied, and an issue is skipped if
+    // anything newer appears before its delete.
+    let mut stmt = conn.prepare(
+        "SELECT d.doc_id, d.id, MAX(a.seq)
+         FROM documents d
+         JOIN issues i ON i.doc_id = d.doc_id
+         JOIN activity a ON a.doc_id = d.doc_id
+         WHERE i.status IN ('done','canceled')
+         GROUP BY d.doc_id
+         HAVING MAX(a.at) < ?1
+            AND NOT (COUNT(*) = 1 AND MIN(a.kind) = 'event'
+                     AND MIN(a.body) LIKE 'activity archived (%')
+         ORDER BY d.id",
+    )?;
+    let candidates: Vec<(i64, String, i64)> = stmt
+        .query_map([&cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    if candidates.is_empty() {
+        return Ok(ArchiveReport {
+            issues_archived: 0,
+            rows_archived: 0,
+        });
+    }
+
+    // Phase 1: copy each candidate's rows — bounded to the seq fence — into
+    // the archive (its own commit; idempotent on re-run, see the doc comment).
+    let archive = db::open_archive(archive_path)?;
+    archive.execute_batch("BEGIN")?;
+    {
+        let mut read = conn.prepare(
+            "SELECT seq, at, author, kind, body FROM activity
+             WHERE doc_id = ?1 AND seq <= ?2 ORDER BY seq",
+        )?;
+        let mut write = archive.prepare(
+            "INSERT OR REPLACE INTO activity(issue_key, seq, at, author, kind, body, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (doc_id, key, max_seq) in &candidates {
+            let rows: Vec<(i64, String, String, String, String)> = read
+                .query_map(params![doc_id, max_seq], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            for (seq, at, author, kind, body) in rows {
+                write.execute(params![key, seq, at, author, kind, body, now])?;
+            }
+        }
+    }
+    archive.execute_batch("COMMIT")?;
+
+    // Phase 2: one main-DB transaction — roll up metrics, then delete and mark.
+    let tx = immediate(conn)?;
+    let mut issues_archived = 0i64;
+    let mut rows_archived = 0i64;
+    for (doc_id, key, max_seq) in &candidates {
+        // Concurrency fence: another agent may have appended to this issue
+        // between the candidate scan / phase-1 copy and this transaction.
+        // Anything beyond the fence was never copied, so deleting it would
+        // destroy history — skip the issue; the stray phase-1 copy in the
+        // archive is harmless (nothing reads it until a later run re-copies
+        // and supersedes it).
+        let live_max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM activity WHERE doc_id = ?1",
+            [doc_id],
+            |r| r.get(0),
+        )?;
+        if live_max != *max_seq {
+            continue;
+        }
+
+        // Freeze this issue's claim overlaps before its evidence moves out —
+        // and if the history ends with a lease still open past the cutoff
+        // (e.g. done via a status edit without a release), keep the issue
+        // live: archiving would discard the replay state that lets the audit
+        // flag a conflicting claim after a reopen.
+        let mut ev = tx.prepare(
+            "SELECT ?1, author, at, body FROM activity
+             WHERE doc_id = ?2 AND kind = 'event'
+               AND (body LIKE 'claimed (%' OR body LIKE 'claim renewed%'
+                    OR body LIKE 'claim taken over from%' OR body LIKE 'released; status:%')
+             ORDER BY seq",
+        )?;
+        let events: Vec<(String, String, String, String)> = ev
+            .query_map(params![key, doc_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(ev);
+        let (overlaps, trailing_lease) = replay_overlaps(&tx, events)?;
+        if matches!(&trailing_lease, Some(exp) if exp.as_str() >= cutoff.as_str()) {
+            continue;
+        }
+        for o in overlaps {
+            tx.execute(
+                "INSERT INTO archived_overlaps(issue, holder, claimant, at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![o.issue, o.holder, o.claimant, o.at],
+            )?;
+        }
+
+        // Completion boundaries for this issue, from the rows about to move.
+        // Stored raw (not as a precomputed cycle) and MAX/MIN-merged with any
+        // earlier archive pass, so stats can span a history split across
+        // archive runs exactly as if it were never archived.
+        let (done_at, first_claim): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT MAX(CASE WHEN kind='event' AND body LIKE '%→ done' THEN at END),
+                    MIN(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
+                         OR body LIKE 'claim taken over from%') THEN at END)
+             FROM activity WHERE doc_id = ?1",
+            [doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.execute(
+            "INSERT INTO issue_metrics(issue_key, done_at, first_claim_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(issue_key) DO UPDATE SET
+               done_at = CASE
+                 WHEN excluded.done_at IS NULL THEN done_at
+                 WHEN done_at IS NULL THEN excluded.done_at
+                 ELSE MAX(done_at, excluded.done_at) END,
+               first_claim_at = CASE
+                 WHEN excluded.first_claim_at IS NULL THEN first_claim_at
+                 WHEN first_claim_at IS NULL THEN excluded.first_claim_at
+                 ELSE MIN(first_claim_at, excluded.first_claim_at) END,
+               archived_at = excluded.archived_at",
+            params![key, done_at, first_claim, now],
+        )?;
+
+        // Per-agent rollups from exactly the rows being moved. Claims are a
+        // plain event count (increments are exact); completions are keyed
+        // (agent, issue_key) so re-archiving a recompleted issue can never
+        // count the same agent+issue twice — mirroring agents()'s
+        // COUNT(DISTINCT issue) semantics across the archive boundary.
+        let mut per_agent = tx.prepare(
+            "SELECT author,
+                    SUM(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
+                         OR body LIKE 'claim taken over from%') THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN kind='event' AND body LIKE '%→ done' THEN 1 ELSE 0 END),
+                    MAX(at)
+             FROM activity WHERE doc_id = ?1 GROUP BY author",
+        )?;
+        let rollups: Vec<(String, i64, i64, String)> = per_agent
+            .query_map([doc_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(per_agent);
+        for (author, claims, did_complete, last_at) in rollups {
+            tx.execute(
+                "INSERT INTO agent_rollup(agent, claims, last_activity)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(agent) DO UPDATE SET
+                   claims = claims + excluded.claims,
+                   last_activity = MAX(COALESCE(last_activity, ''), excluded.last_activity)",
+                params![author, claims, last_at],
+            )?;
+            if did_complete > 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO agent_completions(agent, issue_key) VALUES (?1, ?2)",
+                    params![author, key],
+                )?;
+            }
+        }
+
+        // Replace the moved rows with one marker. Its seq continues past the
+        // archived range so a reopened issue's future activity can never
+        // collide with archived seqs (the archive is keyed by (issue_key, seq)).
+        let moved: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM activity WHERE doc_id = ?1",
+            [doc_id],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM activity WHERE doc_id = ?1", [doc_id])?;
+        tx.execute(
+            "INSERT INTO activity(doc_id, seq, at, author, kind, body)
+             VALUES (?1, ?2, ?3, ?4, 'event', ?5)",
+            params![
+                doc_id,
+                max_seq + 1,
+                now,
+                agent,
+                format!("activity archived ({moved} entries)")
+            ],
+        )?;
+        issues_archived += 1;
+        rows_archived += moved;
+    }
+    tx.commit()?;
+
+    Ok(ArchiveReport {
+        issues_archived,
+        rows_archived,
     })
 }
 

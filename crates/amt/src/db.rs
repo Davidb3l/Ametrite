@@ -2,9 +2,13 @@ use crate::error::{msg, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 pub const DB_DIR: &str = ".ametrite";
 pub const DB_FILE: &str = "ametrite.db";
+/// Side database that `amt gc --archive-older-than` moves old activity into.
+/// Separate file (not a table in the main DB) so the main DB's VACUUM actually
+/// reclaims the space — that shrink is the point of archiving.
+pub const ARCHIVE_FILE: &str = "archive.db";
 
 const SCHEMA: &str = r#"
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -96,6 +100,32 @@ CREATE TABLE blocks (
 );
 CREATE INDEX idx_blocks_blocked ON blocks(blocked);
 CREATE INDEX idx_blocks_blocker ON blocks(blocker);
+
+CREATE TABLE issue_metrics (
+  issue_key      TEXT PRIMARY KEY,
+  done_at        TEXT,
+  first_claim_at TEXT,
+  archived_at    TEXT NOT NULL
+);
+
+CREATE TABLE agent_rollup (
+  agent         TEXT PRIMARY KEY,
+  claims        INTEGER NOT NULL DEFAULT 0,
+  last_activity TEXT
+);
+
+CREATE TABLE agent_completions (
+  agent     TEXT NOT NULL,
+  issue_key TEXT NOT NULL,
+  PRIMARY KEY (agent, issue_key)
+);
+
+CREATE TABLE archived_overlaps (
+  issue    TEXT NOT NULL,
+  holder   TEXT NOT NULL,
+  claimant TEXT NOT NULL,
+  at       TEXT NOT NULL
+);
 "#;
 
 /// v1 → v2: allow the 'decision' document type (requires rebuilding the
@@ -163,6 +193,39 @@ CREATE TABLE blocks (
 CREATE INDEX idx_blocks_blocked ON blocks(blocked);
 CREATE INDEX idx_blocks_blocker ON blocks(blocker);
 UPDATE meta SET value = '4' WHERE key = 'schema_version';
+"#;
+
+/// v4 -> v5: activity archival (AMT-20). Rollup tables that preserve exact
+/// `stats`/`agents`/claim-integrity results after old activity rows move out to
+/// the archive.db side file. issue_metrics keeps the completion boundary times
+/// (done_at MAX-merged, first_claim_at MIN-merged) so a reopened-and-redone
+/// issue still reports one completion spanning its whole history; per-agent
+/// completions are keyed (agent, issue_key) so re-archiving can never double
+/// count; claim overlaps found in archived history are frozen verbatim.
+const MIGRATE_V4_V5: &str = r#"
+CREATE TABLE issue_metrics (
+  issue_key      TEXT PRIMARY KEY,
+  done_at        TEXT,
+  first_claim_at TEXT,
+  archived_at    TEXT NOT NULL
+);
+CREATE TABLE agent_rollup (
+  agent         TEXT PRIMARY KEY,
+  claims        INTEGER NOT NULL DEFAULT 0,
+  last_activity TEXT
+);
+CREATE TABLE agent_completions (
+  agent     TEXT NOT NULL,
+  issue_key TEXT NOT NULL,
+  PRIMARY KEY (agent, issue_key)
+);
+CREATE TABLE archived_overlaps (
+  issue    TEXT NOT NULL,
+  holder   TEXT NOT NULL,
+  claimant TEXT NOT NULL,
+  at       TEXT NOT NULL
+);
+UPDATE meta SET value = '5' WHERE key = 'schema_version';
 "#;
 
 /// Walk up from `start` looking for `.ametrite/ametrite.db`.
@@ -277,11 +340,41 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
             }
             2 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V2_V3}COMMIT;"))?,
             3 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V3_V4}COMMIT;"))?,
+            4 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V4_V5}COMMIT;"))?,
             v => return Err(msg(format!("no migration path from schema v{v}"))),
         }
         version += 1;
     }
     Ok(())
+}
+
+/// Rows archived out of the live `activity` table live here, keyed by issue
+/// key (not doc_id — keys are the stable identifier across export/import).
+/// The UNIQUE (issue_key, seq) primary key makes re-copying idempotent: the
+/// archive copy and the live delete are separate commits (WAL mode cannot make
+/// a cross-database transaction atomic), so a crash between them leaves rows in
+/// both places, and the next archive run re-copies them harmlessly.
+const ARCHIVE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT OR IGNORE INTO meta(key, value) VALUES ('archive_schema_version', '1');
+CREATE TABLE IF NOT EXISTS activity (
+  issue_key   TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  at          TEXT NOT NULL,
+  author      TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  archived_at TEXT NOT NULL,
+  PRIMARY KEY (issue_key, seq)
+);
+"#;
+
+/// Open (creating on first use) the archive side database.
+pub fn open_archive(archive_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(archive_path)?;
+    conn.pragma_update(None, "busy_timeout", 10_000)?;
+    conn.execute_batch(ARCHIVE_SCHEMA)?;
+    Ok(conn)
 }
 
 /// On-disk size of the main database file in bytes (`page_count * page_size`),

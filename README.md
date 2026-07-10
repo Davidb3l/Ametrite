@@ -138,7 +138,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt ws add/list/remove` | Global workspace registry (`~/.ametrite/registry.json`) |
 | `amt doctor` | Workspace health: unresolved links, stale claims, missing refs |
 | `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
-| `amt gc` | Compact the database: FTS optimize, `VACUUM`, WAL checkpoint |
+| `amt gc [--archive-older-than N]` | Compact the database; optionally archive activity of issues closed >N days to `archive.db` (stats stay exact) |
 | `amt upgrade` | Update `amt` in place via brew / installer / cargo (`--dry-run`) |
 | `amt mcp` | MCP stdio server |
 

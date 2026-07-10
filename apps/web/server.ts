@@ -326,6 +326,14 @@ setInterval(() => {
       continue;
     }
     if (!cursors.has(ws.alias)) cursors.set(ws.alias, eventsTip(ws.db)); // start at tip
+    else {
+      // `amt gc --archive-older-than` deletes high-rowid activity, and SQLite
+      // reuses freed rowids — after archival the tip can sit BELOW our cursor,
+      // which would silence the stream forever (new rows never exceed it).
+      // Clamp back to the live tip so the stream resumes with the next event.
+      const tip = eventsTip(ws.db);
+      if (tip < cursors.get(ws.alias)!) cursors.set(ws.alias, tip);
+    }
     if (versions.has(ws.alias) && versions.get(ws.alias) !== v) {
       broadcast("change", `{"ws":"${ws.alias}"}`);
       // Push the actual new activity rows so live consumers (R4 event stream)
