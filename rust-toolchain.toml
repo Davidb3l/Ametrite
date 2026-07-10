@@ -1,0 +1,15 @@
+# Pin the toolchain so builds, formatting, and lints are reproducible for every
+# contributor, CI job, and release build (rustup auto-installs this version).
+#
+# Why an exact pin: `cargo fmt --check` is a CI gate, and rustfmt's output
+# drifts between stable releases — when CI floated on `stable`, a new stable
+# reformatted the tree and turned the gate into a false failure for everyone.
+# The release pipeline (cargo-dist) also builds with whatever rustup resolves
+# here, so the pin keeps shipped binaries reproducible too.
+#
+# Bumping: update the version here AND the dtolnay/rust-toolchain ref in
+# .github/workflows/ci.yml, run `cargo fmt`, and commit any reflow in the same
+# change.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
