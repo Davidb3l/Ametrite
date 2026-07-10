@@ -884,7 +884,12 @@ fn soonest_retry(
 
 /// Whole seconds from `now` until (`instant` + `offset_secs`), clamped at 0.
 /// Uses SQLite's julianday for the diff to avoid a time crate.
-fn secs_until(conn: &Connection, now: &str, instant: &str, offset_secs: i64) -> Result<Option<i64>> {
+fn secs_until(
+    conn: &Connection,
+    now: &str,
+    instant: &str,
+    offset_secs: i64,
+) -> Result<Option<i64>> {
     let secs: f64 = conn.query_row(
         "SELECT (julianday(?1, '+' || ?2 || ' seconds') - julianday(?3)) * 86400.0",
         params![instant, offset_secs, now],
@@ -1065,8 +1070,20 @@ pub fn add_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &st
         "INSERT OR IGNORE INTO blocks(blocker, blocked) VALUES (?1, ?2)",
         params![bk, bd],
     )?;
-    append_activity(&tx, blocked_doc, agent, "event", &format!("blocked by [[{bk}]]"))?;
-    append_activity(&tx, blocker_doc, agent, "event", &format!("blocks [[{bd}]]"))?;
+    append_activity(
+        &tx,
+        blocked_doc,
+        agent,
+        "event",
+        &format!("blocked by [[{bk}]]"),
+    )?;
+    append_activity(
+        &tx,
+        blocker_doc,
+        agent,
+        "event",
+        &format!("blocks [[{bd}]]"),
+    )?;
     touch(&tx, blocked_doc)?;
     tx.commit()?;
     Ok(())
@@ -1074,7 +1091,12 @@ pub fn add_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &st
 
 /// Remove a `blocker` → `blocked` dependency edge. If removing it leaves the
 /// blocked issue with no open blocker, emit an unblock event for it.
-pub fn remove_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: &str) -> Result<()> {
+pub fn remove_block(
+    conn: &mut Connection,
+    blocker: &str,
+    blocked: &str,
+    agent: &str,
+) -> Result<()> {
     let tx = immediate(conn)?;
     let (bk, blocker_doc) = issue_key_and_doc(&tx, blocker)?;
     let (bd, blocked_doc) = issue_key_and_doc(&tx, blocked)?;
@@ -1103,7 +1125,13 @@ pub fn remove_block(conn: &mut Connection, blocker: &str, blocked: &str, agent: 
         |r| r.get(0),
     )?;
     if bk_was_open && !still_blocked {
-        append_activity(&tx, blocked_doc, agent, "event", &format!("unblocked [[{bk}]]"))?;
+        append_activity(
+            &tx,
+            blocked_doc,
+            agent,
+            "event",
+            &format!("unblocked [[{bk}]]"),
+        )?;
     }
     touch(&tx, blocked_doc)?;
     tx.commit()?;
@@ -1362,7 +1390,11 @@ pub fn search_related(conn: &Connection, query: &str, f: &SearchFilter) -> Resul
 
 /// Run a prepared FTS5 match expression (already quoted/joined by a `fts_query*`
 /// builder) through the shared ranked-hit query. Empty expr → no hits.
-fn search_with_expr(conn: &Connection, match_expr: &str, f: &SearchFilter) -> Result<Vec<SearchHit>> {
+fn search_with_expr(
+    conn: &Connection,
+    match_expr: &str,
+    f: &SearchFilter,
+) -> Result<Vec<SearchHit>> {
     if match_expr.is_empty() {
         return Ok(Vec::new());
     }
@@ -1500,7 +1532,11 @@ pub fn find_similar_notes(conn: &Connection, title: &str) -> Result<Vec<SimilarN
             });
         }
     }
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(out)
 }
 
@@ -1837,9 +1873,26 @@ pub fn seed(conn: &mut Connection, count: usize, author: &str) -> Result<usize> 
         return Ok(0);
     }
     const TOPICS: &[&str] = &[
-        "auth", "token", "rotation", "cache", "index", "search", "migration",
-        "registry", "claim", "lease", "webhook", "export", "import", "graph",
-        "budget", "vacuum", "checkpoint", "schema", "cursor", "backlink",
+        "auth",
+        "token",
+        "rotation",
+        "cache",
+        "index",
+        "search",
+        "migration",
+        "registry",
+        "claim",
+        "lease",
+        "webhook",
+        "export",
+        "import",
+        "graph",
+        "budget",
+        "vacuum",
+        "checkpoint",
+        "schema",
+        "cursor",
+        "backlink",
     ];
     const PROJECTS: &[&str] = &["core", "web", "cli", "ops"];
     const LABELS: &[&str] = &["engine", "ops", "ux", "perf", "docs"];
@@ -1897,7 +1950,10 @@ pub fn seed(conn: &mut Connection, count: usize, author: &str) -> Result<usize> 
         // Every fifth issue (past the first window) links a prior seeded issue.
         let links_back = k >= 5 && k % 5 == 0;
         let body = if links_back {
-            format!("Work on {topic_a} and {topic_b}. Relates to [[{prefix}-{}]].", num - 5)
+            format!(
+                "Work on {topic_a} and {topic_b}. Relates to [[{prefix}-{}]].",
+                num - 5
+            )
         } else {
             format!("Work on {topic_a} and {topic_b}.")
         };
@@ -1942,7 +1998,15 @@ pub fn seed(conn: &mut Connection, count: usize, author: &str) -> Result<usize> 
             // Claimed then released to review/done: one claim, one release, no
             // overlap — clean under `stats`'s claim-integrity replay.
             "in_review" | "done" => {
-                activity(&tx, doc_id, 2, (created_age - 60).max(0), worker, "event", "claimed (+900s)")?;
+                activity(
+                    &tx,
+                    doc_id,
+                    2,
+                    (created_age - 60).max(0),
+                    worker,
+                    "event",
+                    "claimed (+900s)",
+                )?;
                 activity(
                     &tx,
                     doc_id,
@@ -1956,7 +2020,15 @@ pub fn seed(conn: &mut Connection, count: usize, author: &str) -> Result<usize> 
             // Abandoned work: a status change, no claim (so it doesn't inflate
             // claim/throughput counts).
             "canceled" => {
-                activity(&tx, doc_id, 2, (created_age - 300).max(0), worker, "event", "status: backlog → canceled")?;
+                activity(
+                    &tx,
+                    doc_id,
+                    2,
+                    (created_age - 300).max(0),
+                    worker,
+                    "event",
+                    "status: backlog → canceled",
+                )?;
             }
             // backlog / todo: created only — still open and claimable.
             _ => {}
@@ -2091,7 +2163,11 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
 /// The current tip of the event stream (max activity rowid, 0 if empty). A
 /// follower with no `--since` starts here so it only sees *new* events.
 pub fn events_cursor(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM activity", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM activity", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Activity events with cursor strictly greater than `since`, oldest first,
@@ -2179,9 +2255,11 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
             .iter()
             .any(|(_, e)| matches!(e, Some(exp) if exp.as_str() < now.as_str()));
         let last_activity: Option<String> = conn
-            .query_row("SELECT MAX(at) FROM activity WHERE author = ?1", [&name], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT MAX(at) FROM activity WHERE author = ?1",
+                [&name],
+                |r| r.get(0),
+            )
             .optional()?
             .flatten();
         let claims: i64 = conn.query_row(
@@ -2234,9 +2312,10 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
     }
     let mut stmt = conn.prepare(&sql)?;
     let cycles: Vec<Option<f64>> = stmt
-        .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
-            r.get::<_, Option<f64>>(0)
-        })?
+        .query_map(
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            |r| r.get::<_, Option<f64>>(0),
+        )?
         .collect::<std::result::Result<_, _>>()?;
     let throughput = cycles.len() as i64;
     // Keep only non-negative cycles for avg/median: an inverted interval
@@ -2346,7 +2425,8 @@ fn find_dependency_cycles(conn: &Connection) -> Result<Vec<DependencyCycle>> {
     let edges: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
-    let mut adj: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut adj: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (b, d) in edges {
         adj.entry(b).or_default().push(d);
     }
@@ -2411,9 +2491,7 @@ fn canonical_cycle(ring: &[String]) -> Option<Vec<String>> {
         return None;
     }
     let n = ring.len();
-    let start = (0..n)
-        .min_by(|&a, &b| ring[a].cmp(&ring[b]))
-        .unwrap_or(0);
+    let start = (0..n).min_by(|&a, &b| ring[a].cmp(&ring[b])).unwrap_or(0);
     let mut rot = Vec::with_capacity(n);
     for k in 0..n {
         rot.push(ring[(start + k) % n].clone());

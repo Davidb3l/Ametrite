@@ -28,9 +28,7 @@ fn key_re() -> &'static Regex {
 /// Extract the first issue key from a branch name, uppercased.
 /// `AMT-7-fix-foo` → `Some("AMT-7")`; `main` → `None`.
 pub fn extract_key(branch: &str) -> Option<String> {
-    key_re()
-        .captures(branch)
-        .map(|c| c[1].to_uppercase())
+    key_re().captures(branch).map(|c| c[1].to_uppercase())
 }
 
 /// The commit-msg hook body we install. It re-derives the issue key from the
@@ -460,8 +458,14 @@ mod tests {
         assert_eq!(
             commits,
             vec![
-                Commit { hash: "abc1234".into(), subject: "AMT-7: do the thing".into() },
-                Commit { hash: "def5678".into(), subject: "fix: tidy up".into() },
+                Commit {
+                    hash: "abc1234".into(),
+                    subject: "AMT-7: do the thing".into()
+                },
+                Commit {
+                    hash: "def5678".into(),
+                    subject: "fix: tidy up".into()
+                },
             ]
         );
         assert!(parse_log("").is_empty());
@@ -470,15 +474,24 @@ mod tests {
     #[test]
     fn release_comment_merges_user_and_commits() {
         let commits = vec![
-            Commit { hash: "abc1234".into(), subject: "AMT-7: part one".into() },
-            Commit { hash: "def5678".into(), subject: "AMT-7: part two".into() },
+            Commit {
+                hash: "abc1234".into(),
+                subject: "AMT-7: part one".into(),
+            },
+            Commit {
+                hash: "def5678".into(),
+                subject: "AMT-7: part two".into(),
+            },
         ];
         // No comment, no commits → None (release passes nothing through).
         assert_eq!(build_release_comment(None, &[]), None);
         // Blank user comment is treated as absent.
         assert_eq!(build_release_comment(Some("   "), &[]), None);
         // Only a user comment survives verbatim.
-        assert_eq!(build_release_comment(Some("done"), &[]), Some("done".into()));
+        assert_eq!(
+            build_release_comment(Some("done"), &[]),
+            Some("done".into())
+        );
         // Only commits → a Commits: block.
         let only_commits = build_release_comment(None, &commits).unwrap();
         assert!(only_commits.starts_with("Commits:\n"));

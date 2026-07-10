@@ -377,13 +377,20 @@ fn decisions_export_import_round_trip() {
     )
     .unwrap();
 
-    let src_act: i64 = conn.query_row("SELECT COUNT(*) FROM activity", [], |r| r.get(0)).unwrap();
+    let src_act: i64 = conn
+        .query_row("SELECT COUNT(*) FROM activity", [], |r| r.get(0))
+        .unwrap();
     let out = TempDir::new().unwrap();
     export::export(&conn, out.path()).unwrap();
     let mut fpath = String::new();
-    for e in std::fs::read_dir(out.path().join("issues")).unwrap() { fpath = e.unwrap().path().to_string_lossy().into(); }
+    for e in std::fs::read_dir(out.path().join("issues")).unwrap() {
+        fpath = e.unwrap().path().to_string_lossy().into();
+    }
     eprintln!("SRC_ACT={src_act} FILE={fpath}");
-    eprintln!("--CONTENT--\n{}\n--END--", std::fs::read_to_string(&fpath).unwrap());
+    eprintln!(
+        "--CONTENT--\n{}\n--END--",
+        std::fs::read_to_string(&fpath).unwrap()
+    );
     assert!(out.path().join("decisions/D-1-use-sqlite.md").is_file());
 
     let dir2 = TempDir::new().unwrap();
@@ -455,12 +462,13 @@ fn cross_workspace_claim_drains_both_in_global_priority_order() {
     // one agent, cross-workspace claim loop — every poll yields work (zero
     // idle polls) until both backlogs are drained, in global priority order.
     let mut order = Vec::new();
-    while let Some((ws, issue)) =
-        registry::claim_any_workspace("solo", 900, 0, &any()).unwrap()
-    {
+    while let Some((ws, issue)) = registry::claim_any_workspace("solo", 900, 0, &any()).unwrap() {
         order.push((ws, issue.id, issue.priority));
     }
-    let seq: Vec<(&str, &str)> = order.iter().map(|(w, i, _)| (w.as_str(), i.as_str())).collect();
+    let seq: Vec<(&str, &str)> = order
+        .iter()
+        .map(|(w, i, _)| (w.as_str(), i.as_str()))
+        .collect();
     assert_eq!(
         seq,
         vec![
@@ -486,7 +494,11 @@ fn cross_workspace_links_are_not_flagged_by_doctor() {
     // a link into workspace "web" and a genuinely broken local link
     store::create_issue(
         &mut conn,
-        new_issue("Depends on other repo", "Blocked by [[web:API-9]]; see [[Ghost Note]].", "high"),
+        new_issue(
+            "Depends on other repo",
+            "Blocked by [[web:API-9]]; see [[Ghost Note]].",
+            "high",
+        ),
     )
     .unwrap();
 
@@ -514,8 +526,16 @@ fn registry_round_trips_and_rejects_non_workspaces() {
     let repo = TempDir::new().unwrap();
     db::init(repo.path(), "proj", "PRJ").unwrap();
     registry::add("proj", repo.path()).unwrap();
-    assert_eq!(registry::load().unwrap().get("proj").map(String::as_str),
-               Some(repo.path().canonicalize().unwrap().to_string_lossy().as_ref()));
+    assert_eq!(
+        registry::load().unwrap().get("proj").map(String::as_str),
+        Some(
+            repo.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
 
     // a directory with no .ametrite workspace is rejected
     let empty = TempDir::new().unwrap();
@@ -581,8 +601,7 @@ fn dedupe_detects_near_duplicate_title() {
     )
     .unwrap();
     // Same significant words, minor wording change → above the Jaccard gate.
-    let dupes =
-        store::find_similar_notes(&conn, "Auth token rotation strategy notes").unwrap();
+    let dupes = store::find_similar_notes(&conn, "Auth token rotation strategy notes").unwrap();
     assert_eq!(dupes.len(), 1);
     assert_eq!(dupes[0].title, "Auth token rotation strategy");
     assert!(dupes[0].score >= 0.6, "score was {}", dupes[0].score);
@@ -783,7 +802,9 @@ fn blocked_issue_is_not_claimed_while_blocker_open() {
         "blocked issue must not be served while its blocker is open"
     );
     // peek agrees with claim (shared predicate).
-    assert!(store::peek_next(&conn, "agent-b", 0, &any()).unwrap().is_none());
+    assert!(store::peek_next(&conn, "agent-b", 0, &any())
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -796,7 +817,7 @@ fn closing_blocker_frees_blocked_and_emits_unblock_event() {
     store::claim_next(&mut conn, "agent-a", 900, 0, &any())
         .unwrap()
         .unwrap(); // takes AMT-1
-    // Release the blocker as done → AMT-2 becomes claimable + gets an event.
+                   // Release the blocker as done → AMT-2 becomes claimable + gets an event.
     store::release_issue(&mut conn, "AMT-1", "agent-a", "done", None).unwrap();
 
     let freed = store::get_issue(&conn, "AMT-2").unwrap();
@@ -812,7 +833,10 @@ fn closing_blocker_frees_blocked_and_emits_unblock_event() {
     let got = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
         .unwrap()
         .unwrap();
-    assert_eq!(got.id, "AMT-2", "blocked issue is claimable once blocker closes");
+    assert_eq!(
+        got.id, "AMT-2",
+        "blocked issue is claimable once blocker closes"
+    );
 }
 
 #[test]
@@ -828,7 +852,10 @@ fn unblock_event_only_after_last_blocker_closes() {
     store::update_issue(
         &mut conn,
         "AMT-1",
-        store::IssuePatch { status: Some("done".into()), ..Default::default() },
+        store::IssuePatch {
+            status: Some("done".into()),
+            ..Default::default()
+        },
         "test",
     )
     .unwrap();
@@ -838,7 +865,11 @@ fn unblock_event_only_after_last_blocker_closes() {
         "must not announce unblock while another blocker is still open"
     );
     assert!(
-        store::peek_next(&conn, "agent-a", 0, &any()).unwrap().unwrap().id != "AMT-3"
+        store::peek_next(&conn, "agent-a", 0, &any())
+            .unwrap()
+            .unwrap()
+            .id
+            != "AMT-3"
             || store::blockers_of(&conn, "AMT-3").unwrap().len() == 1
     );
     assert_eq!(store::blockers_of(&conn, "AMT-3").unwrap().len(), 1);
@@ -847,7 +878,10 @@ fn unblock_event_only_after_last_blocker_closes() {
     store::update_issue(
         &mut conn,
         "AMT-2",
-        store::IssuePatch { status: Some("done".into()), ..Default::default() },
+        store::IssuePatch {
+            status: Some("done".into()),
+            ..Default::default()
+        },
         "test",
     )
     .unwrap();
@@ -858,7 +892,11 @@ fn unblock_event_only_after_last_blocker_closes() {
         .filter(|a| a.body.starts_with("unblocked"))
         .map(|a| a.body.as_str())
         .collect();
-    assert_eq!(unblocks, vec!["unblocked [[AMT-2]]"], "one event, from the last blocker");
+    assert_eq!(
+        unblocks,
+        vec!["unblocked [[AMT-2]]"],
+        "one event, from the last blocker"
+    );
     assert!(store::blockers_of(&conn, "AMT-3").unwrap().is_empty());
 }
 
@@ -925,7 +963,10 @@ fn no_work_reason_counts_blocked_by_dep() {
     store::update_issue(
         &mut conn,
         "AMT-1",
-        store::IssuePatch { status: Some("in_review".into()), ..Default::default() },
+        store::IssuePatch {
+            status: Some("in_review".into()),
+            ..Default::default()
+        },
         "test",
     )
     .unwrap();
@@ -1024,8 +1065,10 @@ fn context_fixture() -> (TempDir, Connection) {
         &mut conn,
         new_note(
             "Token Notes",
-            &format!("Rotation cadence and pitfalls. Relates to [[AMT-1]].\n\n{}",
-                "detail ".repeat(200)),
+            &format!(
+                "Rotation cadence and pitfalls. Relates to [[AMT-1]].\n\n{}",
+                "detail ".repeat(200)
+            ),
         ),
     )
     .unwrap();
@@ -1067,7 +1110,12 @@ fn context_pack_bundles_issue_decision_backlink_and_fts() {
 
     // Issue with its body is present.
     assert_eq!(pack.issue.id, "AMT-1");
-    assert!(pack.issue.body.as_deref().unwrap().contains("Rotate session tokens"));
+    assert!(pack
+        .issue
+        .body
+        .as_deref()
+        .unwrap()
+        .contains("Rotate session tokens"));
     // The decision resolving AMT-1 is included, with its body.
     assert_eq!(pack.decisions.len(), 1);
     assert_eq!(pack.decisions[0].id, "D-1");
@@ -1109,11 +1157,17 @@ fn context_pack_trims_fts_before_backlinks_before_activity() {
 
     // FTS hits go first, then the backlink body — both gone.
     assert!(pack.fts_hits.is_empty(), "FTS hits should drop first");
-    assert!(pack.linked_docs.is_empty(), "backlink bodies drop after FTS");
+    assert!(
+        pack.linked_docs.is_empty(),
+        "backlink bodies drop after FTS"
+    );
     // The issue body, decisions, and (at this budget) activity survive.
     assert!(pack.issue.body.is_some(), "issue body is never dropped");
     assert_eq!(pack.decisions.len(), 1, "decisions are never dropped");
-    assert!(!pack.issue.activity.is_empty(), "activity survives a mid budget");
+    assert!(
+        !pack.issue.activity.is_empty(),
+        "activity survives a mid budget"
+    );
     // The dropped manifest names the cuts, FTS before backlinks.
     assert!(pack.dropped.iter().any(|x| x.starts_with("fts_hit")));
     assert!(pack.dropped.iter().any(|x| x.starts_with("backlink")));
@@ -1149,7 +1203,11 @@ fn context_pack_includes_forward_linked_docs() {
         new_issue("Build login", "Implement per [[Login Design]].", "high"),
     )
     .unwrap();
-    store::create_doc(&mut conn, new_note("Login Design", "OAuth PKCE flow, 15m tokens.")).unwrap();
+    store::create_doc(
+        &mut conn,
+        new_note("Login Design", "OAuth PKCE flow, 15m tokens."),
+    )
+    .unwrap();
 
     let pack = store::context_pack(&conn, "AMT-1", None).unwrap();
     // The forward-linked note is bundled even though it has no backlink to the
@@ -1188,7 +1246,7 @@ fn blocked_by_dep_is_disjoint_from_lease_bucket() {
     store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap(); // AMT-1
     store::create_issue(&mut conn, new_issue("Leased+blocked", "", "high")).unwrap(); // AMT-2
     store::create_issue(&mut conn, new_issue("Only blocked", "", "high")).unwrap(); // AMT-3
-    // AMT-1 blocks both AMT-2 and AMT-3.
+                                                                                    // AMT-1 blocks both AMT-2 and AMT-3.
     store::add_block(&mut conn, "AMT-1", "AMT-2", "t").unwrap();
     store::add_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
     // AMT-2 is ALSO held under a live lease; AMT-1 gets claimed too.
@@ -1255,7 +1313,10 @@ fn stats_throughput_cycle_and_clean_integrity() {
 
     let s = store::stats(&conn, None).unwrap();
     assert_eq!(s.throughput, 1);
-    assert!(s.avg_cycle_secs.is_some(), "a claimed+done issue has a cycle time");
+    assert!(
+        s.avg_cycle_secs.is_some(),
+        "a claimed+done issue has a cycle time"
+    );
     assert!(s.integrity.ok, "no overlaps in a normal run");
     assert!(s.integrity.overlaps.is_empty());
 }
@@ -1269,7 +1330,9 @@ fn stats_integrity_flags_overlapping_claims() {
     // Tamper the log: inject a bob claim WHILE alice's lease is still live —
     // an overlap the engine would never allow. The audit must catch it.
     let doc_id: i64 = conn
-        .query_row("SELECT doc_id FROM documents WHERE id = 'AMT-1'", [], |r| r.get(0))
+        .query_row("SELECT doc_id FROM documents WHERE id = 'AMT-1'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     conn.execute(
         "INSERT INTO activity(doc_id, seq, at, author, kind, body)
@@ -1381,7 +1444,10 @@ fn events_drain_covers_everything_past_the_batch_limit() {
             break;
         }
     }
-    assert_eq!(total, 31, "drain must cover every event past the batch limit");
+    assert_eq!(
+        total, 31,
+        "drain must cover every event past the batch limit"
+    );
 }
 
 // ---------- review-sweep regressions ----------
@@ -1396,16 +1462,26 @@ fn from_stage_does_not_reclaim_out_of_stage_expired_lease() {
     store::update_issue(
         &mut conn,
         "AMT-1",
-        store::IssuePatch { status: Some("in_review".into()), ..Default::default() },
+        store::IssuePatch {
+            status: Some("in_review".into()),
+            ..Default::default()
+        },
         "alice",
     )
     .unwrap();
     let todo = ["todo".to_string()];
-    let f = store::ClaimFilter { stages: Some(&todo), ..Default::default() };
+    let f = store::ClaimFilter {
+        stages: Some(&todo),
+        ..Default::default()
+    };
     // A --from todo builder must NOT reclaim the out-of-stage in_review issue,
     // and neither should the default filter (reclaim is scoped to in_progress).
-    assert!(store::claim_next(&mut conn, "bob", 900, 0, &f).unwrap().is_none());
-    assert!(store::claim_next(&mut conn, "bob", 900, 0, &any()).unwrap().is_none());
+    assert!(store::claim_next(&mut conn, "bob", 900, 0, &f)
+        .unwrap()
+        .is_none());
+    assert!(store::claim_next(&mut conn, "bob", 900, 0, &any())
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -1424,7 +1500,10 @@ fn remove_block_unblocks_only_on_last_open_blocker() {
     store::remove_block(&mut conn, "AMT-2", "AMT-3", "t").unwrap();
     let a = store::get_issue(&conn, "AMT-3").unwrap();
     assert_eq!(
-        a.activity.iter().filter(|e| e.body == "unblocked [[AMT-2]]").count(),
+        a.activity
+            .iter()
+            .filter(|e| e.body == "unblocked [[AMT-2]]")
+            .count(),
         1
     );
 }
@@ -1443,14 +1522,21 @@ fn remove_label_keeps_body_derived_tag() {
     store::update_issue(
         &mut conn,
         "AMT-1",
-        store::IssuePatch { remove_labels: vec!["mytag".into()], ..Default::default() },
+        store::IssuePatch {
+            remove_labels: vec!["mytag".into()],
+            ..Default::default()
+        },
         "t",
     )
     .unwrap();
     // The body still contains #mytag, so the label filter must still match.
     let hits = store::list_issues(
         &conn,
-        &store::IssueFilter { label: Some("mytag".into()), limit: 10, ..Default::default() },
+        &store::IssueFilter {
+            label: Some("mytag".into()),
+            limit: 10,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(hits.len(), 1);
@@ -1462,7 +1548,10 @@ fn stats_ignores_comment_ending_in_done() {
     store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap(); // stays backlog
     store::add_comment(&mut conn, "AMT-1", "t", "moved from todo → done").unwrap();
     let s = store::stats(&conn, None).unwrap();
-    assert_eq!(s.throughput, 0, "a comment ending in → done is not a completion");
+    assert_eq!(
+        s.throughput, 0,
+        "a comment ending in → done is not a completion"
+    );
 }
 
 #[test]
@@ -1479,7 +1568,11 @@ fn export_import_preserves_comment_with_activity_markers() {
     export::import(&mut conn2, out.path()).unwrap();
 
     let issue = store::get_issue(&conn2, "AMT-1").unwrap();
-    let comments: Vec<_> = issue.activity.iter().filter(|a| a.kind == "comment").collect();
+    let comments: Vec<_> = issue
+        .activity
+        .iter()
+        .filter(|a| a.kind == "comment")
+        .collect();
     assert_eq!(comments.len(), 1, "no injection split");
     assert_eq!(comments[0].author, "alice", "author not spoofed");
     assert!(comments[0].body.contains("### @mallory"));
@@ -1551,7 +1644,10 @@ fn seed_produces_real_stats_and_agent_metrics() {
     // Done issues carry a backdated claim→done lifecycle, so stats has real
     // throughput and a positive cycle time (not zeros).
     let stats = store::stats(&conn, None).unwrap();
-    assert!(stats.throughput > 0, "seeded done issues count toward throughput");
+    assert!(
+        stats.throughput > 0,
+        "seeded done issues count toward throughput"
+    );
     assert!(
         stats.median_cycle_secs.unwrap_or(0) > 0,
         "claim precedes done, so cycle time is positive"
@@ -1575,7 +1671,9 @@ fn seed_zero_is_a_noop() {
     let (_d, mut conn) = workspace();
     assert_eq!(store::seed(&mut conn, 0, "seed-agent").unwrap(), 0);
     // No issues and no stray project docs created.
-    assert!(store::list_issues(&conn, &store::IssueFilter::default()).unwrap().is_empty());
+    assert!(store::list_issues(&conn, &store::IssueFilter::default())
+        .unwrap()
+        .is_empty());
     assert!(store::list_docs(&conn, "project").unwrap().is_empty());
 }
 
@@ -1587,18 +1685,28 @@ fn gc_reclaims_freed_pages_and_preserves_data() {
     store::seed(&mut conn, 1000, "seed").unwrap();
     // Delete ~half the issues (FK cascade drops their issues/tags/activity/fts
     // rows too), leaving free pages for VACUUM to reclaim.
-    conn.execute("DELETE FROM documents WHERE type = 'issue' AND doc_id % 2 = 0", [])
-        .unwrap();
+    conn.execute(
+        "DELETE FROM documents WHERE type = 'issue' AND doc_id % 2 = 0",
+        [],
+    )
+    .unwrap();
     let survivors = store::list_issues(
         &conn,
-        &store::IssueFilter { include_closed: true, limit: 100000, ..Default::default() },
+        &store::IssueFilter {
+            include_closed: true,
+            limit: 100000,
+            ..Default::default()
+        },
     )
     .unwrap()
     .len();
     assert!(survivors > 0);
 
     let report = db::gc(&conn).unwrap();
-    assert!(report.bytes_after <= report.bytes_before, "gc never grows the db");
+    assert!(
+        report.bytes_after <= report.bytes_before,
+        "gc never grows the db"
+    );
     assert!(
         report.bytes_before - report.bytes_after > 0,
         "gc reclaims the freed pages"
@@ -1608,7 +1716,11 @@ fn gc_reclaims_freed_pages_and_preserves_data() {
     // search.
     let after = store::list_issues(
         &conn,
-        &store::IssueFilter { include_closed: true, limit: 100000, ..Default::default() },
+        &store::IssueFilter {
+            include_closed: true,
+            limit: 100000,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(after.len(), survivors, "gc preserves surviving issues");
@@ -1667,8 +1779,11 @@ fn open_ro_reads_current_schema_but_cannot_write() {
     assert_eq!(n, 1);
     // ...but the connection is genuinely read-only: SQLite rejects any write.
     assert!(
-        ro.execute("UPDATE meta SET value = 'x' WHERE key = 'workspace_name'", [])
-            .is_err(),
+        ro.execute(
+            "UPDATE meta SET value = 'x' WHERE key = 'workspace_name'",
+            []
+        )
+        .is_err(),
         "open_ro must yield a read-only connection"
     );
 }
@@ -1703,10 +1818,16 @@ fn open_ro_refuses_schema_mismatch_and_never_migrates() {
     // so the skip is open_ro-specific, not a broken database.
     Connection::open(&path)
         .unwrap()
-        .execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'", [])
+        .execute(
+            "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
         .unwrap();
     let _ = db::open(&path).unwrap();
-    assert_eq!(schema_version_on_disk(&path), db::SCHEMA_VERSION.to_string());
+    assert_eq!(
+        schema_version_on_disk(&path),
+        db::SCHEMA_VERSION.to_string()
+    );
 }
 
 #[test]
@@ -1775,7 +1896,10 @@ fn cross_workspace_claim_migrates_and_claims_from_a_stale_workspace() {
     assert_eq!(ws, "stale");
     assert_eq!(issue.id, "ST-1");
     // The claim path migrated the workspace up to the current schema.
-    assert_eq!(schema_version_on_disk(&stale_path), db::SCHEMA_VERSION.to_string());
+    assert_eq!(
+        schema_version_on_disk(&stale_path),
+        db::SCHEMA_VERSION.to_string()
+    );
 
     std::env::remove_var("AMT_REGISTRY");
 }
@@ -1790,7 +1914,10 @@ fn priority_rank_sql_agrees_with_rust_rank_from_one_source() {
     for (i, p) in amt::model::PRIORITIES.iter().enumerate() {
         let sql_rank: i64 = conn
             .query_row(
-                &format!("SELECT {}", amt::model::priority_rank_sql(&format!("'{p}'"))),
+                &format!(
+                    "SELECT {}",
+                    amt::model::priority_rank_sql(&format!("'{p}'"))
+                ),
                 [],
                 |r| r.get(0),
             )
@@ -1826,7 +1953,10 @@ fn list_orders_by_generated_priority_rank() {
         .into_iter()
         .map(|i| i.priority)
         .collect();
-    let expected: Vec<String> = amt::model::PRIORITIES.iter().map(|s| s.to_string()).collect();
+    let expected: Vec<String> = amt::model::PRIORITIES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(listed, expected);
 }
 
@@ -1836,12 +1966,19 @@ fn list_orders_by_generated_priority_rank() {
 fn context_pack_surfaces_partially_overlapping_docs() {
     let (_d, mut conn) = workspace();
     // AMT-1: a multi-term title.
-    store::create_issue(&mut conn, new_issue("Session token rotation", "Body.", "high")).unwrap();
+    store::create_issue(
+        &mut conn,
+        new_issue("Session token rotation", "Body.", "high"),
+    )
+    .unwrap();
     // A related note sharing only ONE term ("rotation") — under store::search's
     // AND semantics it would not match the full title.
     store::create_doc(
         &mut conn,
-        new_note("Certificate rotation policy", "How we rotate TLS certificates."),
+        new_note(
+            "Certificate rotation policy",
+            "How we rotate TLS certificates.",
+        ),
     )
     .unwrap();
 
@@ -1861,7 +1998,9 @@ fn context_pack_surfaces_partially_overlapping_docs() {
     // surfaces as related context.
     let pack = store::context_pack(&conn, "AMT-1", None).unwrap();
     assert!(
-        pack.fts_hits.iter().any(|h| h.id == "certificate-rotation-policy"),
+        pack.fts_hits
+            .iter()
+            .any(|h| h.id == "certificate-rotation-policy"),
         "context_pack OR-recall must surface partially-overlapping docs"
     );
 }

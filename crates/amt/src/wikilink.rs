@@ -138,7 +138,10 @@ mod tests {
     #[test]
     fn cross_workspace_targets() {
         assert_eq!(cross_workspace("web:AMT-3"), Some(("web", "AMT-3")));
-        assert_eq!(cross_workspace("my-app:CLAP-12"), Some(("my-app", "CLAP-12")));
+        assert_eq!(
+            cross_workspace("my-app:CLAP-12"),
+            Some(("my-app", "CLAP-12"))
+        );
         // local links (no colon) are not cross-workspace
         assert_eq!(cross_workspace("AMT-1"), None);
         assert_eq!(cross_workspace("D-2"), None);

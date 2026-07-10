@@ -326,10 +326,7 @@ enum DepCmd {
         blocked: String,
     },
     /// Remove a blocker → blocked dependency edge
-    Rm {
-        blocker: String,
-        blocked: String,
-    },
+    Rm { blocker: String, blocked: String },
     /// List an issue's blockers (open) and the issues it blocks
     List { id: String },
 }
@@ -646,7 +643,10 @@ fn print_context_pack(pack: &ContextPack) {
     if !pack.fts_hits.is_empty() {
         println!("\n=== related (search) ===");
         for h in &pack.fts_hits {
-            println!("{:<12} {:<8} {}\n             {}", h.id, h.doc_type, h.title, h.snippet);
+            println!(
+                "{:<12} {:<8} {}\n             {}",
+                h.id, h.doc_type, h.title, h.snippet
+            );
         }
     }
     if let Some(budget) = pack.budget {
@@ -918,7 +918,11 @@ fn run(cli: Cli) -> Result<()> {
                         } else {
                             println!(
                                 "{id} is blocked by: {}",
-                                blockers.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join(", ")
+                                blockers
+                                    .iter()
+                                    .map(|b| b.id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             );
                         }
                         if blocks.is_empty() {
@@ -926,7 +930,11 @@ fn run(cli: Cli) -> Result<()> {
                         } else {
                             println!(
                                 "{id} blocks: {}",
-                                blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join(", ")
+                                blocks
+                                    .iter()
+                                    .map(|b| b.id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             );
                         }
                     }
@@ -1156,7 +1164,9 @@ fn run(cli: Cli) -> Result<()> {
                     if *strict && !dupes.is_empty() {
                         let list = dupes
                             .iter()
-                            .map(|d| format!("{} ({:.0}% match) {}", d.id, d.score * 100.0, d.title))
+                            .map(|d| {
+                                format!("{} ({:.0}% match) {}", d.id, d.score * 100.0, d.title)
+                            })
                             .collect::<Vec<_>>()
                             .join("; ");
                         return Err(amt::error::msg(format!(
@@ -1196,12 +1206,7 @@ fn run(cli: Cli) -> Result<()> {
                         if !dupes.is_empty() {
                             eprintln!("warning: near-duplicate note(s) already exist:");
                             for d in &dupes {
-                                eprintln!(
-                                    "  {} ({:.0}% match) {}",
-                                    d.id,
-                                    d.score * 100.0,
-                                    d.title
-                                );
+                                eprintln!("  {} ({:.0}% match) {}", d.id, d.score * 100.0, d.title);
                             }
                         }
                     }
@@ -1440,17 +1445,12 @@ fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 print_json(&stats);
             } else {
-                println!(
-                    "Stats ({})",
-                    stats.since.as_deref().unwrap_or("all time")
-                );
+                println!("Stats ({})", stats.since.as_deref().unwrap_or("all time"));
                 println!("  throughput:  {} issue(s) done", stats.throughput);
                 match (stats.avg_cycle_secs, stats.median_cycle_secs) {
-                    (Some(a), Some(m)) => println!(
-                        "  cycle time:  avg {}, median {}",
-                        fmt_secs(a),
-                        fmt_secs(m)
-                    ),
+                    (Some(a), Some(m)) => {
+                        println!("  cycle time:  avg {}, median {}", fmt_secs(a), fmt_secs(m))
+                    }
                     _ => println!("  cycle time:  —"),
                 }
                 if stats.integrity.ok {

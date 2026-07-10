@@ -46,7 +46,10 @@ fn repo_root_and_branch_resolve() {
         std::fs::canonicalize(&root).unwrap(),
         std::fs::canonicalize(dir.path()).unwrap()
     );
-    assert_eq!(git::current_branch(dir.path()).unwrap().as_deref(), Some("main"));
+    assert_eq!(
+        git::current_branch(dir.path()).unwrap().as_deref(),
+        Some("main")
+    );
 }
 
 #[test]
@@ -54,7 +57,9 @@ fn repo_root_none_outside_git() {
     let dir = TempDir::new().unwrap(); // not a git repo
     assert_eq!(git::repo_root(dir.path()).unwrap(), None);
     // Downstream helpers degrade to empty rather than erroring.
-    assert!(git::commits_for_key(dir.path(), "AMT-1").unwrap().is_empty());
+    assert!(git::commits_for_key(dir.path(), "AMT-1")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -63,7 +68,10 @@ fn install_hook_is_idempotent() {
     let repo = dir.path();
     assert_eq!(git::install_hook(repo).unwrap(), HookAction::Installed);
     // Second install is a no-op.
-    assert_eq!(git::install_hook(repo).unwrap(), HookAction::AlreadyInstalled);
+    assert_eq!(
+        git::install_hook(repo).unwrap(),
+        HookAction::AlreadyInstalled
+    );
     let hook = repo.join(".git/hooks/commit-msg");
     assert!(hook.exists());
     let body = std::fs::read_to_string(&hook).unwrap();
@@ -137,7 +145,10 @@ fn hook_noop_on_keyless_branch() {
     git(repo, &["add", "."]);
     git(repo, &["commit", "-q", "-m", "plain commit"]);
     let body = git(repo, &["log", "-1", "--pretty=%B"]);
-    assert!(!body.contains("Refs:"), "keyless branch adds nothing: {body:?}");
+    assert!(
+        !body.contains("Refs:"),
+        "keyless branch adds nothing: {body:?}"
+    );
 }
 
 #[test]
@@ -208,5 +219,8 @@ fn hook_appends_refs_on_first_commit_of_unborn_branch() {
     git(repo, &["add", "."]);
     git(repo, &["commit", "-q", "-m", "first commit"]);
     let body = git(repo, &["log", "-1", "--pretty=%B"]);
-    assert!(body.contains("Refs: AMT-9"), "unborn-branch first commit: {body:?}");
+    assert!(
+        body.contains("Refs: AMT-9"),
+        "unborn-branch first commit: {body:?}"
+    );
 }

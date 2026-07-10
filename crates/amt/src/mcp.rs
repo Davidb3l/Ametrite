@@ -231,8 +231,10 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
 
             if peek {
                 let peeked = if any_ws {
-                    run!(crate::registry::peek_any_workspace(&agent, cooldown, &filter))
-                        .map(|(ws, issue)| (Some(ws), issue))
+                    run!(crate::registry::peek_any_workspace(
+                        &agent, cooldown, &filter
+                    ))
+                    .map(|(ws, issue)| (Some(ws), issue))
                 } else {
                     run!(store::peek_next(conn, &agent, cooldown, &filter)).map(|i| (None, i))
                 };
@@ -248,7 +250,9 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                         text_result(id, &v)
                     }
                     None if any_ws => {
-                        let nw = run!(crate::registry::no_work_any_workspace(&agent, cooldown, &filter));
+                        let nw = run!(crate::registry::no_work_any_workspace(
+                            &agent, cooldown, &filter
+                        ));
                         no_work_result(id, &nw)
                     }
                     None => {
@@ -259,7 +263,9 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             }
 
             if any_ws {
-                let won = run!(crate::registry::claim_any_workspace(&agent, ttl, cooldown, &filter));
+                let won = run!(crate::registry::claim_any_workspace(
+                    &agent, ttl, cooldown, &filter
+                ));
                 return match won {
                     Some((ws, issue)) => {
                         let mut v = json!(issue);
@@ -267,7 +273,9 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                         text_result(id, &v)
                     }
                     None => {
-                        let nw = run!(crate::registry::no_work_any_workspace(&agent, cooldown, &filter));
+                        let nw = run!(crate::registry::no_work_any_workspace(
+                            &agent, cooldown, &filter
+                        ));
                         no_work_result(id, &nw)
                     }
                 };
@@ -443,10 +451,7 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
         "get_context" => {
             let key = try_arg!(req("id"));
             let budget = opt_i(&args, "budget");
-            text_result(
-                id.clone(),
-                &run!(store::context_pack(conn, &key, budget)),
-            )
+            text_result(id.clone(), &run!(store::context_pack(conn, &key, budget)))
         }
         "get_backlinks" => text_result(
             id.clone(),

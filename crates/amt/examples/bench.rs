@@ -45,7 +45,10 @@ fn main() {
     let seed_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let list = median_ms(iters, || {
-        let f = store::IssueFilter { limit: 50, ..Default::default() };
+        let f = store::IssueFilter {
+            limit: 50,
+            ..Default::default()
+        };
         store::list_issues(&conn, &f).expect("list");
     });
     let search = median_ms(iters, || {

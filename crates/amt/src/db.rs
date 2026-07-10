@@ -308,7 +308,10 @@ pub struct GcReport {
 pub fn gc(conn: &Connection) -> Result<GcReport> {
     let bytes_before = db_bytes(conn)?;
     // Merge the FTS5 b-tree segments so search touches fewer pages.
-    conn.execute("INSERT INTO documents_fts(documents_fts) VALUES('optimize')", [])?;
+    conn.execute(
+        "INSERT INTO documents_fts(documents_fts) VALUES('optimize')",
+        [],
+    )?;
     // Let SQLite refresh stale query-planner statistics.
     conn.execute_batch("PRAGMA optimize;")?;
     // Rewrite the file without free pages (must be outside any transaction).
@@ -333,9 +336,7 @@ pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
     // The prefix becomes part of every issue id (`PREFIX-1`), which flows into
     // URLs and the web UI — restrict it to a safe, id-shaped token so an id can
     // never carry markup/path characters (prevents stored-XSS / route breakage).
-    if prefix.is_empty()
-        || prefix.len() > 16
-        || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
+    if prefix.is_empty() || prefix.len() > 16 || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
     {
         return Err(msg(format!(
             "invalid prefix '{prefix}': use 1-16 ASCII letters/digits (e.g. AMT)"
