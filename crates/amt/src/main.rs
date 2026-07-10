@@ -1388,27 +1388,43 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open_workspace(&cli.workspace)?;
             let report = store::doctor(&conn)?;
             if cli.json {
-                // Suite doctor handshake (SUITE_CONTRACTS §3): every suite tool
-                // answers `<tool> doctor --json` with this stable envelope so
-                // peers (the 6969 hub, sirius) can discover each other without
-                // tool-specific knowledge. Tool detail lives under `checks`;
-                // `capabilities.ui` is where this tool's web UI is served
-                // (honoring AMT_PORT, like the web server itself).
+                // Suite doctor handshake (SUITE_CONTRACTS §3, schemaVersion 1):
+                // every suite tool answers `<tool> doctor --json` with this
+                // stable envelope so peers (the 6969 hub, sirius) can discover
+                // each other without tool-specific knowledge. `capabilities`
+                // is the spec's string array; the optional top-level `ui` says
+                // where this tool's web UI is served (honoring AMT_PORT, like
+                // the web server itself) — an additive v1 extension. `checks`
+                // carries the spec's {name, ok, detail} rows; the full
+                // workspace report stays available under `report` (additive).
                 let ui_port = std::env::var("AMT_PORT")
                     .ok()
                     .and_then(|p| p.parse::<u16>().ok())
                     .unwrap_or(1776);
+                let check = |name: &str, n: usize| {
+                    serde_json::json!({
+                        "name": name,
+                        "ok": n == 0,
+                        "detail": format!("{n} found"),
+                    })
+                };
+                let checks = vec![
+                    check("unresolved_links", report.unresolved_links.len()),
+                    check("stale_claims", report.stale_claims.len()),
+                    check("missing_parents", report.missing_parents.len()),
+                    check("missing_projects", report.missing_projects.len()),
+                    check("dangling_decisions", report.dangling_decisions.len()),
+                    check("dependency_cycles", report.dependency_cycles.len()),
+                ];
                 print_json(&serde_json::json!({
-                    "tool": "ametrite",
+                    "tool": "amt",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "schemaVersion": db::SCHEMA_VERSION,
+                    "schemaVersion": 1,
                     "ok": report.ok,
-                    "capabilities": {
-                        "ui": format!("http://localhost:{ui_port}"),
-                        "mcp": true,
-                        "events": true,
-                    },
-                    "checks": report,
+                    "capabilities": ["ui", "mcp"],
+                    "ui": format!("http://localhost:{ui_port}"),
+                    "checks": checks,
+                    "report": report,
                 }));
             } else if report.ok {
                 println!("workspace healthy ✓");
