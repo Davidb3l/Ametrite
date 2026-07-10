@@ -3,7 +3,9 @@ resolver = "2"
 members = ["crates/amt"]
 
 [workspace.package]
-version = "0.1.0"
+# cargo-dist requires the git tag to match this version exactly (a `v0.1.0-rc.2`
+# tag needs version `0.1.0-rc.2`). Bump to `0.1.0` for the real release.
+version = "0.1.0-rc.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Davidb3l/Ametrite"
