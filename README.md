@@ -117,6 +117,8 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt export <dir>` / `amt import <dir>` | Round-trip the workspace as an Obsidian-compatible markdown vault |
 | `amt ws add/list/remove` | Global workspace registry (`~/.ametrite/registry.json`) |
 | `amt doctor` | Workspace health: unresolved links, stale claims, missing refs |
+| `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
+| `amt gc` | Compact the database: FTS optimize, `VACUUM`, WAL checkpoint |
 | `amt mcp` | MCP stdio server |
 
 Statuses: `backlog → todo → in_progress → in_review → done` (or `canceled`).
