@@ -432,7 +432,9 @@ fn split_words(name: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut prev_was_lower = false;
     for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
+        // Unicode-aware membership so an accent inside a word isn't a separator
+        // ("Björk" is one word); non-ASCII is filtered when the prefix is built.
+        if c.is_alphanumeric() {
             // lower→Upper marks a camelCase seam ("carBill" → car | Bill).
             if prev_was_lower && c.is_ascii_uppercase() && !cur.is_empty() {
                 words.push(std::mem::take(&mut cur));
@@ -455,11 +457,29 @@ fn split_words(name: &str) -> Vec<String> {
 /// Derive an issue-key prefix from a workspace name (AMT-24): initials for a
 /// multi-word name ("PIN Golfing" → PG, "CarBillPro" → CBP), the first three
 /// characters for a single word ("Ametrite" → AME). Falls back to `AMT` only
-/// when nothing is derivable (e.g. a name with no ASCII alphanumerics) — the
-/// registry uniqueness check is what keeps that fallback from silently
-/// colliding. Always returns a value `init` accepts (1-16 alphanumerics).
+/// when nothing is derivable (e.g. a name with no ASCII letters) — the registry
+/// uniqueness check is what keeps that fallback from silently colliding.
+///
+/// The result always starts with a LETTER, because the git half of the product
+/// only recognizes letter-leading keys: both `git::extract_key` and the
+/// installed commit-msg hook match `[A-Za-z][A-Za-z0-9]*-[0-9]+`, so a `2G`
+/// prefix would make the hook stamp `Refs: G-1` — a key belonging to no issue,
+/// written permanently into git history. Leading digits are therefore stripped
+/// per word ("2048-game" → GAM, "3d-printer" → DP).
 pub fn derive_prefix(name: &str) -> String {
-    let words = split_words(name);
+    // Per word: drop leading digits, then keep only ASCII alphanumerics, so a
+    // non-ASCII name degrades to its ASCII skeleton ("Björk" → BJR) instead of
+    // splitting into fragments.
+    let words: Vec<String> = split_words(name)
+        .iter()
+        .map(|w| {
+            w.chars()
+                .skip_while(|c| c.is_ascii_digit())
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
     let derived: String = if words.len() >= 2 {
         // Initials, capped so a very long name can't produce a wall of letters.
         words
@@ -474,7 +494,9 @@ pub fn derive_prefix(name: &str) -> String {
             .unwrap_or_default()
     };
     let derived = derived.to_ascii_uppercase();
-    if derived.is_empty() {
+    // Belt-and-braces on the letter-leading invariant the doc comment promises:
+    // digit-only words are dropped above, so this should be unreachable.
+    if derived.is_empty() || !derived.starts_with(|c: char| c.is_ascii_alphabetic()) {
         "AMT".to_string()
     } else {
         derived
@@ -501,15 +523,50 @@ pub fn suggest_prefixes(base: &str, taken: &[String]) -> Vec<String> {
 /// Any failure (missing file, corrupt db, unreadable) is None, so a broken
 /// registry entry can never block `init`.
 pub fn peek_prefix(db_path: &Path) -> Option<String> {
-    let conn = Connection::open_with_flags(
+    fn read(conn: &Connection) -> Option<String> {
+        conn.query_row("SELECT value FROM meta WHERE key='id_prefix'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+    }
+    // Normal read-only open. Note this materializes -shm/-wal sidecars next to
+    // a WAL database (a read-only connection can't checkpoint them away on
+    // close) — harmless, and `.ametrite/.gitignore` is `*` so nothing leaks.
+    if let Ok(conn) = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        // Don't let a transient lock (recovery, truncating checkpoint) read as
+        // "no prefix here" and wave a duplicate through.
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(2_000));
+        if let Some(p) = read(&conn) {
+            return Some(p);
+        }
+    }
+    // Fallback for a workspace whose directory isn't writable (read-only mount,
+    // someone else's checkout): creating the -shm sidecar fails there, so open
+    // it immutably instead — otherwise the probe silently reports "no prefix"
+    // and the collision it exists to catch slips through.
+    let uri = format!(
+        "file:{}?immutable=1",
+        db_path
+            .to_string_lossy()
+            .replace('?', "%3f")
+            .replace('#', "%23")
+    );
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key='id_prefix'", [], |r| {
-        r.get::<_, String>(0)
-    })
-    .ok()
+    read(&conn)
+}
+
+/// Path of the workspace database under `dir`, whether or not it exists.
+pub fn workspace_db_path(dir: &Path) -> PathBuf {
+    dir.join(DB_DIR).join(DB_FILE)
 }
 
 /// Create a new workspace under `dir/.ametrite/ametrite.db`.
@@ -517,10 +574,17 @@ pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
     // The prefix becomes part of every issue id (`PREFIX-1`), which flows into
     // URLs and the web UI — restrict it to a safe, id-shaped token so an id can
     // never carry markup/path characters (prevents stored-XSS / route breakage).
-    if prefix.is_empty() || prefix.len() > 16 || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
+    // Must also START with a letter: `git::extract_key` and the commit-msg hook
+    // both match `[A-Za-z][A-Za-z0-9]*-[0-9]+`, so a digit-leading prefix like
+    // `2G` makes the hook stamp `Refs: G-1` — a key belonging to no issue —
+    // into git history, and `amt issue show` then finds no commits for it.
+    if prefix.is_empty()
+        || prefix.len() > 16
+        || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
+        || !prefix.starts_with(|c: char| c.is_ascii_alphabetic())
     {
         return Err(msg(format!(
-            "invalid prefix '{prefix}': use 1-16 ASCII letters/digits (e.g. AMT)"
+            "invalid prefix '{prefix}': use 1-16 ASCII letters/digits starting with a letter (e.g. AMT)"
         )));
     }
     let db_dir = dir.join(DB_DIR);

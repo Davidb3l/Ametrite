@@ -2276,7 +2276,23 @@ fn derive_prefix_maps_names_to_readable_keys() {
     // not this value, is what prevents a silent collision).
     assert_eq!(db::derive_prefix("日本語"), "AMT");
     assert_eq!(db::derive_prefix(""), "AMT");
-    // Every derivation must be a prefix `init` accepts.
+
+    // Digit-leading names must NOT yield digit-leading prefixes: git's key
+    // regex is `[A-Za-z][A-Za-z0-9]*-[0-9]+`, so a "2G" prefix would make the
+    // commit-msg hook stamp `Refs: G-1` — a key belonging to no issue.
+    assert_eq!(db::derive_prefix("2048-game"), "GAM");
+    assert_eq!(db::derive_prefix("3d-printer"), "DP");
+    assert_eq!(db::derive_prefix("2024 Goals"), "GOA");
+    assert_eq!(db::derive_prefix("2024"), "AMT"); // no letters at all
+
+    // An accent inside a word is not a word boundary (this used to split
+    // "Cafés" into C+S); the prefix degrades to the ASCII skeleton instead.
+    assert_eq!(db::derive_prefix("Björk"), "BJR");
+    assert_eq!(db::derive_prefix("Cafés Golf"), "CG");
+
+    // Every derivation must be a prefix `init` accepts — including the
+    // letter-leading rule the git integration depends on.
+    let long = "z".repeat(200);
     for name in [
         "PIN Golfing",
         "my-project",
@@ -2284,10 +2300,48 @@ fn derive_prefix_maps_names_to_readable_keys() {
         "Ametrite",
         "",
         "日本語",
+        "2048-game",
+        "3d-printer",
+        "2024",
+        "!!!",
+        "🎉🎉",
+        "-",
+        "_",
+        "x",
+        "  leading spaces",
+        "trailing- ",
+        "a1B2",
+        "HTTPServer",
+        "iOS App",
+        "Version2Point",
+        &long,
     ] {
         let p = db::derive_prefix(name);
-        assert!(!p.is_empty() && p.len() <= 16 && p.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(
+            !p.is_empty()
+                && p.len() <= 16
+                && p.chars().all(|c| c.is_ascii_alphanumeric())
+                && p.starts_with(|c: char| c.is_ascii_alphabetic()),
+            "derive_prefix({name:?}) = {p:?} is not a valid, letter-leading prefix"
+        );
+        // And whatever it derives, init must actually accept it.
+        let d = TempDir::new().unwrap();
+        assert!(db::init(d.path(), name, &p).is_ok(), "init rejected {p:?}");
     }
+}
+
+#[test]
+fn init_rejects_digit_leading_prefixes() {
+    // Explicit digit-leading prefixes are refused too: from branch `2g-1-x`
+    // the commit-msg hook would extract "G-1" and stamp a key that belongs to
+    // no issue, permanently, into git history.
+    let d1 = TempDir::new().unwrap();
+    assert!(db::init(d1.path(), "n", "2G").is_err());
+    let d2 = TempDir::new().unwrap();
+    assert!(db::init(d2.path(), "n", "2024").is_err());
+    // Digits later in the prefix are fine — git parses those.
+    let d3 = TempDir::new().unwrap();
+    assert!(db::init(d3.path(), "n", "G2").is_ok());
 }
 
 #[test]

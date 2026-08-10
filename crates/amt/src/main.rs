@@ -738,9 +738,23 @@ fn run(cli: Cli) -> Result<()> {
             // unambiguous to the engine (boards are federated) but genuinely
             // confusing to people. So: derive a per-workspace prefix by default,
             // and never mint a duplicate silently (AMT-24).
+            // Re-init check first: an existing workspace is registered under its
+            // own prefix, so running the collision check ahead of this would
+            // report the workspace conflicting with ITSELF and hand out advice
+            // ("pass --prefix") that leads nowhere.
+            let db_path = db::workspace_db_path(&dir);
+            if db_path.exists() {
+                return Err(amt::error::msg(format!(
+                    "workspace already exists at {}",
+                    db_path.display()
+                )));
+            }
             let explicit = prefix.is_some();
             let prefix = prefix.unwrap_or_else(|| db::derive_prefix(&name));
-            match registry::prefix_owner(&prefix)? {
+            // Best-effort: a corrupt registry file, or no HOME at all (containers,
+            // CI, `env -i`), must never block creating a workspace — a workspace
+            // is fully usable without a registry. Worst case we skip the check.
+            match registry::prefix_owner(&prefix).unwrap_or(None) {
                 // The human asked for this prefix by name — respect it, but say
                 // so, since the collision is the kind you notice hours later.
                 Some(owner) if explicit => {
@@ -751,17 +765,18 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 // Derived: refuse rather than hand out a confusing default.
                 Some(owner) => {
-                    let taken: Vec<String> = registry::prefixes_in_use()?
+                    let taken: Vec<String> = registry::prefixes_in_use()
+                        .unwrap_or_default()
                         .into_iter()
                         .map(|(_, p)| p)
                         .collect();
                     let hint = match db::suggest_prefixes(&prefix, &taken).first() {
-                        Some(s) => format!(" (e.g. --prefix {s})"),
-                        None => String::new(),
+                        Some(s) => format!("rerun with --prefix {s} (or any unused prefix)"),
+                        None => "rerun with --prefix <PREFIX> to pick another".to_string(),
                     };
                     return Err(amt::error::msg(format!(
                         "prefix '{prefix}' derived from '{name}' is already used by workspace \
-                         '{owner}' — pass --prefix to choose another{hint}"
+                         '{owner}' — {hint}"
                     )));
                 }
                 None => {}
