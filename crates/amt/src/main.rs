@@ -30,9 +30,10 @@ enum Cmd {
         /// Workspace name
         #[arg(long)]
         name: Option<String>,
-        /// Issue key prefix (AMT → AMT-1, AMT-2, …)
-        #[arg(long, default_value = "AMT")]
-        prefix: String,
+        /// Issue key prefix (PIN → PIN-1, PIN-2, …).
+        /// Defaults to one derived from the workspace name.
+        #[arg(long)]
+        prefix: Option<String>,
     },
     /// Manage issues
     Issue {
@@ -732,12 +733,52 @@ fn run(cli: Cli) -> Result<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "workspace".into())
             });
+            // Issue keys are what humans read in commit trailers, branch names,
+            // and the cross-workspace inbox — two boards minting `AMT-1` is
+            // unambiguous to the engine (boards are federated) but genuinely
+            // confusing to people. So: derive a per-workspace prefix by default,
+            // and never mint a duplicate silently (AMT-24).
+            let explicit = prefix.is_some();
+            let prefix = prefix.unwrap_or_else(|| db::derive_prefix(&name));
+            match registry::prefix_owner(&prefix)? {
+                // The human asked for this prefix by name — respect it, but say
+                // so, since the collision is the kind you notice hours later.
+                Some(owner) if explicit => {
+                    eprintln!(
+                        "warning: prefix '{prefix}' is already used by workspace '{owner}' — \
+                         issue keys will look identical across the two boards"
+                    );
+                }
+                // Derived: refuse rather than hand out a confusing default.
+                Some(owner) => {
+                    let taken: Vec<String> = registry::prefixes_in_use()?
+                        .into_iter()
+                        .map(|(_, p)| p)
+                        .collect();
+                    let hint = match db::suggest_prefixes(&prefix, &taken).first() {
+                        Some(s) => format!(" (e.g. --prefix {s})"),
+                        None => String::new(),
+                    };
+                    return Err(amt::error::msg(format!(
+                        "prefix '{prefix}' derived from '{name}' is already used by workspace \
+                         '{owner}' — pass --prefix to choose another{hint}"
+                    )));
+                }
+                None => {}
+            }
             let path = db::init(&dir, &name, &prefix)?;
             registry::try_register(&amt::wikilink::slugify(&name), &dir);
             if cli.json {
-                print_json(&serde_json::json!({ "workspace": name, "db": path }));
+                print_json(&serde_json::json!({
+                    "workspace": name, "prefix": prefix, "db": path,
+                }));
             } else {
-                println!("initialized workspace '{name}' at {}", path.display());
+                // Name the prefix: a surprising derivation should be visible now,
+                // not after the first issue is filed.
+                println!(
+                    "initialized workspace '{name}' at {} (issue keys: {prefix}-1, {prefix}-2, …)",
+                    path.display()
+                );
             }
             Ok(())
         }

@@ -21,10 +21,12 @@ yourself — never hand the user a list of steps:
    (ask before cloning/building), then symlink it into a writable PATH dir
    (e.g. `~/.bun/bin` or `~/.local/bin`): `ln -sf <path>/amt <pathdir>/amt`.
 2. **Init the workspace** (if no `.ametrite/` exists): from the repo root run
-   `amt init --name <repo-name> --prefix <PREFIX>` — derive PREFIX from the repo
-   name (short, uppercase, memorable: claude-app → CLAP; confirm with the user
-   only if ambiguous). Init is fully self-contained: `.ametrite/` git-ignores
-   itself, nothing else to configure.
+   `amt init --name <repo-name>`. The issue-key prefix is derived from the name
+   ("PIN Golfing" → `PG-1`, `PG-2`, …) and `init` refuses a derived prefix that
+   another registered workspace already uses, so boards never mint confusingly
+   identical keys. Pass `--prefix <PREFIX>` only to override (short, uppercase,
+   memorable); never hardcode `AMT` — that's Ametrite's own board. Init is fully
+   self-contained: `.ametrite/` git-ignores itself, nothing else to configure.
 3. **Seed from context**: if the user described work in the conversation, create
    the initial issues/notes for them immediately (with priorities and labels).
 4. Mention (don't do unasked): `claude mcp add ametrite -- amt mcp` for MCP. The web

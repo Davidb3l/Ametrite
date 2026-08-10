@@ -51,7 +51,8 @@ irm https://github.com/Davidb3l/Ametrite/releases/latest/download/amt-installer.
 
 ```sh
 cd ~/code/your-project
-amt init --name my-project --prefix AMT   # creates .ametrite/ (git-ignores itself)
+amt init --name my-project   # creates .ametrite/ (git-ignores itself); keys: MP-1, MP-2, …
+                             # --prefix overrides the name-derived issue-key prefix
 
 amt issue create --title "Fix login token refresh" --priority urgent --label bug
 amt issue list

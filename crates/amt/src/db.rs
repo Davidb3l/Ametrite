@@ -424,6 +424,94 @@ pub fn gc(conn: &Connection) -> Result<GcReport> {
     })
 }
 
+/// Split a workspace name into words on non-alphanumeric separators AND
+/// camelCase boundaries: "PIN Golfing" → [PIN, Golfing], "CarBillPro" →
+/// [Car, Bill, Pro], "my-project" → [my, project].
+fn split_words(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_was_lower = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            // lower→Upper marks a camelCase seam ("carBill" → car | Bill).
+            if prev_was_lower && c.is_ascii_uppercase() && !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+            prev_was_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        } else {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_was_lower = false;
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+/// Derive an issue-key prefix from a workspace name (AMT-24): initials for a
+/// multi-word name ("PIN Golfing" → PG, "CarBillPro" → CBP), the first three
+/// characters for a single word ("Ametrite" → AME). Falls back to `AMT` only
+/// when nothing is derivable (e.g. a name with no ASCII alphanumerics) — the
+/// registry uniqueness check is what keeps that fallback from silently
+/// colliding. Always returns a value `init` accepts (1-16 alphanumerics).
+pub fn derive_prefix(name: &str) -> String {
+    let words = split_words(name);
+    let derived: String = if words.len() >= 2 {
+        // Initials, capped so a very long name can't produce a wall of letters.
+        words
+            .iter()
+            .filter_map(|w| w.chars().next())
+            .take(5)
+            .collect()
+    } else {
+        words
+            .first()
+            .map(|w| w.chars().take(3).collect())
+            .unwrap_or_default()
+    };
+    let derived = derived.to_ascii_uppercase();
+    if derived.is_empty() {
+        "AMT".to_string()
+    } else {
+        derived
+    }
+}
+
+/// Alternative prefixes near `base` that aren't in `taken`, for the error
+/// message when a derived prefix collides. Numeric suffixes keep the
+/// suggestion recognizably related to the workspace name.
+pub fn suggest_prefixes(base: &str, taken: &[String]) -> Vec<String> {
+    let is_free = |p: &str| !taken.iter().any(|t| t.eq_ignore_ascii_case(p)) && p.len() <= 16;
+    (2..=9)
+        .map(|n| format!("{base}{n}"))
+        .filter(|p| is_free(p))
+        .take(3)
+        .collect()
+}
+
+/// The `id_prefix` of an existing workspace, or None if it can't be read.
+///
+/// Deliberately does NOT go through `open_ro`'s exact-schema gate: `meta` has
+/// existed since v1, and for collision detection a workspace on an older
+/// schema still owns its prefix — skipping it would let a duplicate through.
+/// Any failure (missing file, corrupt db, unreadable) is None, so a broken
+/// registry entry can never block `init`.
+pub fn peek_prefix(db_path: &Path) -> Option<String> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row("SELECT value FROM meta WHERE key='id_prefix'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+}
+
 /// Create a new workspace under `dir/.ametrite/ametrite.db`.
 pub fn init(dir: &Path, name: &str, prefix: &str) -> Result<PathBuf> {
     // The prefix becomes part of every issue id (`PREFIX-1`), which flows into

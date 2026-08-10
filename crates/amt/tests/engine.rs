@@ -2255,3 +2255,98 @@ fn v4_workspace_migrates_to_v5_and_archives() {
     assert!(report.issues_archived > 0);
     assert!(store::stats(&conn, None).unwrap().throughput > 0);
 }
+
+// ---------- AMT-24: derived, non-colliding issue-key prefixes ----------
+
+#[test]
+fn derive_prefix_maps_names_to_readable_keys() {
+    // Multi-word → initials; the real case that motivated this (a Sothis
+    // install on "PIN Golfing" minted AMT-1, colliding with Ametrite's board).
+    assert_eq!(db::derive_prefix("PIN Golfing"), "PG");
+    assert_eq!(db::derive_prefix("my-project"), "MP");
+    assert_eq!(db::derive_prefix("Pin Golf Website"), "PGW");
+    // camelCase counts as word boundaries.
+    assert_eq!(db::derive_prefix("CarBillPro"), "CBP");
+    // Single word → first three characters.
+    assert_eq!(db::derive_prefix("Ametrite"), "AME");
+    assert_eq!(db::derive_prefix("hi"), "HI");
+    // Very long names stay short enough to read in a commit trailer.
+    assert!(db::derive_prefix("one two three four five six seven").len() <= 5);
+    // Nothing derivable → the documented AMT fallback (the uniqueness check,
+    // not this value, is what prevents a silent collision).
+    assert_eq!(db::derive_prefix("日本語"), "AMT");
+    assert_eq!(db::derive_prefix(""), "AMT");
+    // Every derivation must be a prefix `init` accepts.
+    for name in [
+        "PIN Golfing",
+        "my-project",
+        "CarBillPro",
+        "Ametrite",
+        "",
+        "日本語",
+    ] {
+        let p = db::derive_prefix(name);
+        assert!(!p.is_empty() && p.len() <= 16 && p.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+}
+
+#[test]
+fn suggest_prefixes_skips_taken_ones() {
+    let taken = vec!["PG".to_string(), "PG2".to_string()];
+    let s = db::suggest_prefixes("PG", &taken);
+    assert!(
+        !s.contains(&"PG2".to_string()),
+        "already-taken suggestions are filtered"
+    );
+    assert_eq!(s.first().map(String::as_str), Some("PG3"));
+}
+
+#[test]
+fn peek_prefix_reads_any_schema_version_and_tolerates_junk() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "PIN Golfing", "PIN").unwrap();
+    assert_eq!(db::peek_prefix(&path).as_deref(), Some("PIN"));
+    // An older-schema workspace still owns its prefix: unlike open_ro, the
+    // collision probe must NOT skip it, or a duplicate slips through.
+    downgrade_to_v3(&path);
+    assert_eq!(db::peek_prefix(&path).as_deref(), Some("PIN"));
+    // Nonexistent / non-database files are simply unknown, never an error.
+    assert_eq!(
+        db::peek_prefix(std::path::Path::new("/nope/missing.db")),
+        None
+    );
+}
+
+#[test]
+fn prefix_owner_finds_conflicts_across_the_registry() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    std::env::set_var("AMT_REGISTRY", home.path().join("registry.json"));
+
+    let repo = TempDir::new().unwrap();
+    db::init(repo.path(), "Ametrite", "AMT").unwrap();
+    registry::add("ametrite", repo.path()).unwrap();
+    // A stale entry (registered path whose DB is gone) must not break lookup.
+    let dead = TempDir::new().unwrap();
+    db::init(dead.path(), "Dead", "DED").unwrap();
+    registry::add("dead", dead.path()).unwrap();
+    std::fs::remove_file(dead.path().join(".ametrite").join("ametrite.db")).unwrap();
+
+    assert_eq!(
+        registry::prefix_owner("AMT").unwrap().as_deref(),
+        Some("ametrite")
+    );
+    // Issue ids collate NOCASE, so the check is case-insensitive.
+    assert_eq!(
+        registry::prefix_owner("amt").unwrap().as_deref(),
+        Some("ametrite")
+    );
+    assert_eq!(registry::prefix_owner("PG").unwrap(), None);
+    // The unreadable workspace is skipped, not fatal.
+    assert!(registry::prefixes_in_use()
+        .unwrap()
+        .iter()
+        .all(|(a, _)| a != "dead"));
+
+    std::env::remove_var("AMT_REGISTRY");
+}

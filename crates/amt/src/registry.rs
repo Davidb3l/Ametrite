@@ -89,6 +89,28 @@ fn db_path(root: &str) -> PathBuf {
     Path::new(root).join(db::DB_DIR).join(db::DB_FILE)
 }
 
+/// Issue-key prefixes already claimed by registered workspaces, as
+/// `(alias, prefix)` pairs (AMT-24). Unreadable/stale workspaces are skipped
+/// silently — a broken registry entry must never block `amt init`.
+pub fn prefixes_in_use() -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (alias, root) in load()? {
+        if let Some(prefix) = db::peek_prefix(&db_path(&root)) {
+            out.push((alias, prefix));
+        }
+    }
+    Ok(out)
+}
+
+/// The alias of a registered workspace already using `prefix` (case-insensitive,
+/// since issue ids collate NOCASE), if any.
+pub fn prefix_owner(prefix: &str) -> Result<Option<String>> {
+    Ok(prefixes_in_use()?
+        .into_iter()
+        .find(|(_, p)| p.eq_ignore_ascii_case(prefix))
+        .map(|(alias, _)| alias))
+}
+
 /// Open every registered workspace and run `f` against its connection,
 /// returning `(alias, T)` pairs. Unreachable/stale workspaces are silently
 /// skipped (that's `amt ws doctor`'s job to surface), so a fan-out over a
