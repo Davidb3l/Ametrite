@@ -46,6 +46,8 @@ irm https://github.com/Davidb3l/Ametrite/releases/latest/download/amt-installer.
 ```
 
 `amt upgrade` updates in place, delegating to whichever of those installed it.
+(If the board service is installed, follow up with `amt serve --install` so it
+serves the new version.)
 
 ## Quickstart
 
@@ -83,7 +85,10 @@ workspace healthy ✓
 Run `amt serve` for a foreground board, or `amt serve --install` to register a
 per-user login service (launchd on macOS, a logon Scheduled Task on Windows, a
 systemd user unit on Linux — no sudo anywhere) so the board survives closing
-your terminal, an agent session ending, and reboots. `amt serve --status` says
+your terminal, an agent session ending, and reboots. The web app ships inside
+the binary: with no checkout around, `serve` extracts it to the per-user data
+dir and serves that, so a brew/installer `amt` is a complete board setup. A
+checkout, when present, wins — local edits show up live. `amt serve --status` says
 whether the service is installed and whether the board is actually answering;
 `--uninstall` removes it. Agents are unaffected either way: the CLI and MCP
 open the workspace database directly, so the board is a viewport, not the
@@ -91,8 +96,9 @@ system.
 
 On macOS, a login service that reads from `~/Documents`, `~/Desktop`, or
 `~/Downloads` needs a privacy grant you have to approve once; `--install`
-warns when your checkout is in one of those. Moving the checkout elsewhere
-avoids the prompt entirely.
+warns when your checkout is in one of those. The embedded copy extracts
+outside those folders, so packaged installs skip the prompt for the app
+itself (workspace databases living under protected folders still need it).
 
 ```sh
 bun run web          # → http://localhost:1776 (AMT_PORT to change)

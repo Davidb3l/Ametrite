@@ -7,6 +7,12 @@
 //! server started inside a session dies with that session, which reads to a
 //! human as "Ametrite stopped".
 //!
+//! The web app itself ships INSIDE the binary (AMT-26): with no checkout in
+//! sight, `serve` extracts the embedded copy into the per-user data dir and
+//! runs that, so `brew install amt && amt serve --install` is a complete
+//! board setup. A checkout, when present, still wins — dogfooders see their
+//! local edits.
+//!
 //! Two design choices worth knowing:
 //!
 //! 1. **No Rust supervisor.** On Unix `serve` `exec()`s bun, replacing its own
@@ -55,18 +61,12 @@ pub fn resolve(
     bun_override: Option<&Path>,
     cwd: &Path,
 ) -> Result<ServeConfig> {
-    let app = match app_override {
-        Some(p) => p.to_path_buf(),
-        None => match std::env::var_os("AMT_WEB_APP") {
-            Some(p) => PathBuf::from(p),
-            None => find_web_app(cwd).ok_or_else(|| {
-                msg(
-                    "no web app found — run `amt serve` from an Ametrite checkout, \
-                     or pass --app <path-to-apps/web/server.ts>",
-                )
-            })?,
-        },
-    };
+    let app = resolve_app(
+        app_override,
+        std::env::var_os("AMT_WEB_APP").map(PathBuf::from),
+        cwd,
+        &web_data_dir()?,
+    )?;
     if !app.is_file() {
         return Err(msg(format!("web app not found at {}", app.display())));
     }
@@ -96,6 +96,31 @@ pub fn port_from_env() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
+/// The app-source resolution order, explicit flag strongest: `--app`, then
+/// `$AMT_WEB_APP` (both error loudly downstream if bad — explicit config must
+/// never fall through silently), then a checkout found by walking up (so
+/// dogfooders see local edits), and finally the embedded copy extracted to the
+/// data dir — the packaged-install path that makes `brew install amt` a
+/// complete board setup. Separated from `resolve` so the ordering is testable
+/// without bun on PATH.
+fn resolve_app(
+    app_override: Option<&Path>,
+    env_app: Option<PathBuf>,
+    cwd: &Path,
+    data_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(p) = app_override {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(p) = env_app {
+        return Ok(p);
+    }
+    if let Some(p) = find_web_app(cwd) {
+        return Ok(p);
+    }
+    extract_embedded_web_app(data_dir)
+}
+
 /// Walk up from `start` looking for `apps/web/server.ts`.
 fn find_web_app(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
@@ -107,6 +132,78 @@ fn find_web_app(start: &Path) -> Option<PathBuf> {
         dir = d.parent().map(Path::to_path_buf);
     }
     None
+}
+
+// ------------------------------------------------------------ embedded app
+
+/// The web app's source files, compiled into the binary (AMT-26) so released
+/// `amt` serves the board without a checkout. The app is deliberately tiny
+/// (~124 KB, vanilla TS, zero npm dependencies — verified to serve from a bare
+/// copy of exactly these files), which is what makes include_str! reasonable.
+const EMBEDDED_WEB_APP: &[(&str, &str)] = &[
+    ("server.ts", include_str!("../../../apps/web/server.ts")),
+    ("index.html", include_str!("../../../apps/web/index.html")),
+    (
+        "package.json",
+        include_str!("../../../apps/web/package.json"),
+    ),
+    ("src/app.ts", include_str!("../../../apps/web/src/app.ts")),
+    ("src/time.ts", include_str!("../../../apps/web/src/time.ts")),
+    (
+        "src/style.css",
+        include_str!("../../../apps/web/src/style.css"),
+    ),
+];
+
+/// Per-user data dir for the extracted app. ONE stable, unversioned path, on
+/// purpose: service units bake this path into ExecStart, so a versioned dir
+/// would leave every installed service pointing at the old version after an
+/// upgrade — permanently stale, or crash-looping if the dir were cleaned.
+/// Freshness comes from extraction instead: every serve-path command converges
+/// the dir to the running binary's embedded content, and a running service
+/// picks up refreshed frontend files on its next request (Bun re-bundles from
+/// disk per request in dev serving). Outside ~/Documents by construction, so
+/// on macOS the login service reads it without any TCC grant — packaged users
+/// skip the trap that checkout users can hit.
+pub fn web_data_dir() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Local"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"))
+    };
+    Ok(base.join("ametrite").join("web").join("current"))
+}
+
+/// Write the embedded app under `dir`, overwriting so the extracted copy
+/// always matches this binary. Returns the path to `server.ts`.
+pub fn extract_embedded_web_app(dir: &Path) -> Result<PathBuf> {
+    for (rel, content) in EMBEDDED_WEB_APP {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Skip the write when identical: a running service's Bun re-bundles
+        // from disk per request, so gratuitous rewrites would churn it (and a
+        // source-built and released binary sharing this dir would flip-flop).
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|c| c == *content)
+            .unwrap_or(false);
+        if !unchanged {
+            // Write-then-rename so a service racing this extraction can never
+            // read a torn file (fs::write is not atomic; rename in-dir is).
+            let tmp = path.with_extension("tmp-extract");
+            std::fs::write(&tmp, content)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+    }
+    Ok(dir.join("server.ts"))
 }
 
 /// First match for `name` on PATH.
@@ -138,8 +235,11 @@ pub fn child_path(exe_dir: Option<&Path>, bun_dir: Option<&Path>, current: &str)
     parts.join(":")
 }
 
-/// The repo root that owns `apps/web/server.ts` — bun resolves the workspace's
-/// node_modules from there.
+/// The directory three levels above `server.ts` — the repo root for a
+/// checkout. The server itself resolves its files via `import.meta.dir`, so
+/// for the extracted layout (where this lands on `~/…/ametrite`) the cwd is
+/// inert; it exists so a checkout's `node_modules`, if one ever appears,
+/// resolves correctly.
 pub fn project_root(app: &Path) -> PathBuf {
     app.parent()
         .and_then(|p| p.parent())
@@ -693,6 +793,157 @@ mod tests {
             "runs from the project root"
         );
         assert!(a.last().unwrap().contains("log.txt"));
+    }
+
+    #[test]
+    fn embedded_app_mirrors_the_real_apps_web_tree() {
+        // NOT a hardcoded list: walk the actual apps/web directory so adding a
+        // new source file without embedding it fails THIS test instead of
+        // shipping released binaries whose board 500s on a missing import.
+        let web_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/web");
+        let mut expected: Vec<(String, String)> = Vec::new();
+        let mut walk = vec![web_root.clone()];
+        while let Some(dir) = walk.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "node_modules") {
+                        continue;
+                    }
+                    walk.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&web_root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                // Tests and lockfiles aren't needed to serve (the app has zero
+                // npm deps; verified against a live bare-copy serve).
+                if rel.ends_with(".test.ts") || rel == "bun.lock" {
+                    continue;
+                }
+                expected.push((rel, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+        assert!(!expected.is_empty(), "walk found nothing — wrong root?");
+        for (rel, content) in &expected {
+            let embedded = EMBEDDED_WEB_APP
+                .iter()
+                .find(|(n, _)| n == rel)
+                .unwrap_or_else(|| panic!("{rel} exists in apps/web but is NOT embedded"));
+            assert_eq!(embedded.1, content, "{rel} embedded stale vs the tree");
+        }
+        for (name, _) in EMBEDDED_WEB_APP {
+            assert!(
+                expected.iter().any(|(rel, _)| rel == name),
+                "{name} is embedded but no longer exists in apps/web"
+            );
+        }
+
+        // And extraction reproduces the set verbatim.
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = extract_embedded_web_app(dir.path()).unwrap();
+        assert_eq!(server, dir.path().join("server.ts"));
+        for (name, content) in EMBEDDED_WEB_APP {
+            let on_disk = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert_eq!(&on_disk, content, "{name} extracted differently");
+        }
+    }
+
+    #[test]
+    fn resolution_order_is_flag_env_checkout_embedded() {
+        let data = tempfile::TempDir::new().unwrap();
+        let no_checkout = tempfile::TempDir::new().unwrap();
+
+        // 1. Explicit flag wins over everything.
+        let flag = Path::new("/explicit/server.ts");
+        assert_eq!(
+            resolve_app(
+                Some(flag),
+                Some("/env/server.ts".into()),
+                no_checkout.path(),
+                data.path()
+            )
+            .unwrap(),
+            flag
+        );
+        // 2. Env beats discovery — and is returned verbatim even when bad, so
+        //    a typo errors loudly downstream instead of silently falling back.
+        assert_eq!(
+            resolve_app(
+                None,
+                Some("/env/server.ts".into()),
+                no_checkout.path(),
+                data.path()
+            )
+            .unwrap(),
+            Path::new("/env/server.ts")
+        );
+        // 3. A checkout above cwd wins over the embedded copy.
+        let repo = tempfile::TempDir::new().unwrap();
+        let app_dir = repo.path().join("apps").join("web");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("server.ts"), "// local").unwrap();
+        let deep = repo.path().join("crates").join("x");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_app(None, None, &deep, data.path()).unwrap(),
+            app_dir.join("server.ts")
+        );
+        // 4. Nothing anywhere: the embedded copy is extracted and used — the
+        //    packaged-install path.
+        let resolved = resolve_app(None, None, no_checkout.path(), data.path()).unwrap();
+        assert_eq!(resolved, data.path().join("server.ts"));
+        assert!(resolved.is_file(), "fallback must actually extract");
+    }
+
+    #[test]
+    fn re_extract_leaves_identical_files_untouched() {
+        // The service manager restarts `serve` after a crash; rewriting
+        // unchanged sources would spin bun's file watcher in a reload loop.
+        let dir = tempfile::TempDir::new().unwrap();
+        extract_embedded_web_app(dir.path()).unwrap();
+        let before = std::fs::metadata(dir.path().join("server.ts"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        extract_embedded_web_app(dir.path()).unwrap();
+        let after = std::fs::metadata(dir.path().join("server.ts"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "identical content must not be rewritten");
+
+        // A tampered file is healed back to the embedded content.
+        std::fs::write(dir.path().join("server.ts"), "corrupted").unwrap();
+        extract_embedded_web_app(dir.path()).unwrap();
+        let healed = std::fs::read_to_string(dir.path().join("server.ts")).unwrap();
+        assert!(healed.len() > 100, "extraction heals a tampered copy");
+    }
+
+    #[test]
+    fn web_data_dir_is_stable_and_outside_protected_folders() {
+        let d = web_data_dir().unwrap();
+        // Stable on purpose: service units bake this path into ExecStart, so a
+        // versioned dir would strand every installed service on upgrade.
+        assert!(
+            d.ends_with(PathBuf::from("ametrite").join("web").join("current")),
+            "unit paths must survive upgrades: {}",
+            d.display()
+        );
+        // The whole point of the data dir on macOS: no TCC-protected segment,
+        // so the login service can read the app without a grant.
+        for guarded in ["Documents", "Desktop", "Downloads"] {
+            assert!(
+                !d.components().any(|c| c.as_os_str() == guarded),
+                "{} sits in a protected folder",
+                d.display()
+            );
+        }
     }
 
     #[test]

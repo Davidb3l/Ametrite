@@ -1960,6 +1960,7 @@ fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 if !dry_run {
                     amt::upgrade::execute(&program, &args, true)?;
+                    board_refresh_hint();
                 }
                 print_json(&serde_json::json!({
                     "version": version,
@@ -1975,10 +1976,20 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     println!("running: {rendered}");
                     amt::upgrade::execute(&program, &args, false)?;
+                    board_refresh_hint();
                 }
             }
             Ok(())
         }
+    }
+}
+
+/// After an upgrade, an installed board service keeps running the previous
+/// binary's extracted web app until something re-extracts it — remind the user
+/// (on stderr, so --json stdout stays one object).
+fn board_refresh_hint() {
+    if amt::serve::unit_path().map(|u| u.exists()).unwrap_or(false) {
+        eprintln!("note: board service detected — run `amt serve --install` to refresh it to this version");
     }
 }
 
