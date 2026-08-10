@@ -304,7 +304,11 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 &try_arg!(req("id")),
                 &agent_of(&args),
                 &opt_s(&args, "status").unwrap_or_else(|| "in_review".into()),
-                opt_s(&args, "comment").as_deref()
+                opt_s(&args, "comment").as_deref(),
+                // Agents always get the safe defaults: they may not force
+                // another agent's live lease, and their release records the
+                // requeue cooldown. The overrides are operator-only (AMT-25).
+                store::ReleaseOpts::default()
             ));
             text_result(id, &issue)
         }

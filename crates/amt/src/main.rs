@@ -82,6 +82,13 @@ enum Cmd {
         status: String,
         #[arg(long, short = 'm')]
         comment: Option<String>,
+        /// Operator override: release another agent's live lease (audit-logged)
+        #[arg(long)]
+        force: bool,
+        /// Operator override: leave no requeue cooldown, so any agent —
+        /// including the previous holder — can claim it immediately
+        #[arg(long)]
+        no_cooldown: bool,
     },
     /// Record a decision that resolves an issue (ADR-for-agents)
     Decide {
@@ -1171,6 +1178,8 @@ fn run(cli: Cli) -> Result<()> {
             agent,
             status,
             comment,
+            force,
+            no_cooldown,
         } => {
             let mut conn = open_workspace(&cli.workspace)?;
             // Resolve the canonical key first so the git grep matches how commits
@@ -1186,6 +1195,7 @@ fn run(cli: Cli) -> Result<()> {
                 &identity(agent),
                 &status,
                 final_comment.as_deref(),
+                store::ReleaseOpts { force, no_cooldown },
             )?;
             if cli.json {
                 print_json(&issue);

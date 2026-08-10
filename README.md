@@ -124,7 +124,7 @@ throughput, cycle time, and a claim-integrity audit.
 |---|---|
 | `amt init` | Create `.ametrite/ametrite.db` workspace in the current directory |
 | `amt issue create/list/show/update/comment` | Issue CRUD (labels, projects, parents, due dates) |
-| `amt claim` / `amt release` | Atomic claim-loop primitives (`--peek`, `--project`, `--label`, `--all-workspaces`) |
+| `amt claim` / `amt release` | Atomic claim-loop primitives (`--peek`, `--project`, `--label`, `--all-workspaces`). Operator resets: `release --force --no-cooldown` |
 | `amt dep add/rm/list` | Blocker → blocked dependencies (cycle-checked; blocked issues aren't claimable) |
 | `amt decide` / `amt decision list/show` | Record ADR-style decisions against issues; supersede old ones |
 | `amt note create/show/append/list` | Knowledge base (`--dedupe` warns on near-duplicate titles) |

@@ -954,12 +954,28 @@ fn do_claim(tx: &Transaction<'_>, key: &str, agent: &str, ttl_secs: i64) -> Resu
     Ok(())
 }
 
+/// Operator overrides for `release_issue` (AMT-25). Both defaults are the
+/// agent-facing behavior; these exist for a HUMAN resetting state after a
+/// fleet died holding leases, and are deliberately not exposed over MCP.
+#[derive(Default, Clone, Copy)]
+pub struct ReleaseOpts {
+    /// Release a lease held by a DIFFERENT agent that is still live. Without
+    /// this, only the holder can release (leases protect work in progress), so
+    /// an operator had to impersonate the dead worker with `--agent`.
+    pub force: bool,
+    /// Leave no requeue-cooldown marker, and clear any existing one, so the
+    /// issue is immediately claimable by ANY agent — including its previous
+    /// holder. "Put it back exactly as if it was never claimed."
+    pub no_cooldown: bool,
+}
+
 pub fn release_issue(
     conn: &mut Connection,
     key: &str,
     agent: &str,
     status: &str,
     comment: Option<&str>,
+    opts: ReleaseOpts,
 ) -> Result<Issue> {
     if !valid_status(status) {
         return Err(msg(format!(
@@ -969,31 +985,51 @@ pub fn release_issue(
     let tx = immediate(conn)?;
     let now = db::now(&tx)?;
     let issue = load_issue(&tx, key, false)?;
+    // Whose live lease (if any) this release is taking away from someone else —
+    // recorded in the event so a forced release is auditable, not a silent steal.
+    let mut displaced: Option<String> = None;
     if let (Some(holder), Some(expires)) = (&issue.claimed_by, &issue.claim_expires_at) {
         if holder != agent && *expires >= now {
-            return Err(msg(format!(
-                "'{}' is claimed by {holder} until {expires}",
-                issue.id
-            )));
+            if !opts.force {
+                return Err(msg(format!(
+                    "'{}' is claimed by {holder} until {expires} \
+                     (use --force to release it anyway)",
+                    issue.id
+                )));
+            }
+            displaced = Some(holder.clone());
         }
     }
     let doc_id = doc_id_of(&tx, &issue.id)?;
-    tx.execute(
-        "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL, status = ?1,
-            last_released_by = ?2, last_released_at = ?3
-         WHERE doc_id = ?4",
-        params![status, agent, now, doc_id],
-    )?;
+    if opts.no_cooldown {
+        tx.execute(
+            "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL, status = ?1,
+                last_released_by = NULL, last_released_at = NULL
+             WHERE doc_id = ?2",
+            params![status, doc_id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL, status = ?1,
+                last_released_by = ?2, last_released_at = ?3
+             WHERE doc_id = ?4",
+            params![status, agent, now, doc_id],
+        )?;
+    }
     if let Some(c) = comment {
         append_activity(&tx, doc_id, agent, "comment", c)?;
     }
-    append_activity(
-        &tx,
-        doc_id,
-        agent,
-        "event",
-        &format!("released; status: {} → {status}", issue.status),
-    )?;
+    // The body must keep its "released; status:" prefix: the claim-integrity
+    // replay matches on it, and a forced release IS a release — it must clear
+    // the holder there, not read as an overlapping claim.
+    let event = match &displaced {
+        Some(holder) => format!(
+            "released; status: {} → {status} (forced by {agent}, lease taken from {holder})",
+            issue.status
+        ),
+        None => format!("released; status: {} → {status}", issue.status),
+    };
+    append_activity(&tx, doc_id, agent, "event", &event)?;
     // If this release closes the issue, anything it was blocking whose last open
     // blocker just went away should learn it's now free to be claimed.
     if is_terminal(status) && !is_terminal(&issue.status) {

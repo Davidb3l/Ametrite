@@ -167,6 +167,7 @@ fn release_sets_status_and_clears_claim() {
         "agent-a",
         "done",
         Some("all tests pass"),
+        store::ReleaseOpts::default(),
     )
     .unwrap();
     assert_eq!(released.status, "done");
@@ -555,7 +556,15 @@ fn requeue_cooldown_blocks_self_but_not_others() {
     store::claim_next(&mut conn, "agent-a", 900, 3600, &any())
         .unwrap()
         .unwrap();
-    store::release_issue(&mut conn, "AMT-1", "agent-a", "todo", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "agent-a",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     // agent-a is in cooldown for its own released issue…
     assert!(
@@ -569,7 +578,15 @@ fn requeue_cooldown_blocks_self_but_not_others() {
         .unwrap()
         .unwrap();
     assert_eq!(by_b.id, "AMT-1");
-    store::release_issue(&mut conn, "AMT-1", "agent-b", "todo", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "agent-b",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     // …and cooldown 0 disables the guard entirely.
     let again = store::claim_next(&mut conn, "agent-b", 900, 0, &any())
@@ -577,7 +594,15 @@ fn requeue_cooldown_blocks_self_but_not_others() {
         .unwrap();
     assert_eq!(again.id, "AMT-1");
     // explicit claim of a specific issue always bypasses cooldown
-    store::release_issue(&mut conn, "AMT-1", "agent-b", "todo", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "agent-b",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
     let explicit = store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
     assert_eq!(explicit.claimed_by.as_deref(), Some("agent-b"));
 }
@@ -722,7 +747,15 @@ fn from_todo_skips_backlog_issues() {
         .unwrap()
         .unwrap();
     assert_eq!(claimed.id, "AMT-2");
-    store::release_issue(&mut conn, "AMT-2", "agent-a", "in_review", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-2",
+        "agent-a",
+        "in_review",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     // With only the backlog item left, --from todo finds nothing…
     assert!(store::claim_next(&mut conn, "agent-a", 900, 0, &filter)
@@ -745,7 +778,15 @@ fn no_work_counts_distinguish_lease_from_cooldown() {
     store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
     // AMT-2: claimed then released to todo by agent-a → in agent-a's cooldown.
     store::claim_issue(&mut conn, "AMT-2", "agent-a", 900).unwrap();
-    store::release_issue(&mut conn, "AMT-2", "agent-a", "todo", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-2",
+        "agent-a",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     // agent-a can't claim: AMT-1 is leased, AMT-2 is in its own cooldown.
     assert!(store::claim_next(&mut conn, "agent-a", 900, 3600, &any())
@@ -818,7 +859,15 @@ fn closing_blocker_frees_blocked_and_emits_unblock_event() {
         .unwrap()
         .unwrap(); // takes AMT-1
                    // Release the blocker as done → AMT-2 becomes claimable + gets an event.
-    store::release_issue(&mut conn, "AMT-1", "agent-a", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "agent-a",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     let freed = store::get_issue(&conn, "AMT-2").unwrap();
     assert!(
@@ -934,7 +983,15 @@ fn three_issue_chain_drains_in_dependency_order_with_no_wasted_claims() {
                     "claimed {} while it still had an open blocker",
                     issue.id
                 );
-                store::release_issue(&mut conn, &issue.id, agent, "done", None).unwrap();
+                store::release_issue(
+                    &mut conn,
+                    &issue.id,
+                    agent,
+                    "done",
+                    None,
+                    store::ReleaseOpts::default(),
+                )
+                .unwrap();
             }
             None => break,
         }
@@ -1291,7 +1348,15 @@ fn agents_roster_reports_leases_and_counts() {
     store::create_issue(&mut conn, new_issue("a", "", "high")).unwrap();
     store::create_issue(&mut conn, new_issue("b", "", "high")).unwrap();
     store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
-    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "alice",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
     store::claim_issue(&mut conn, "AMT-2", "alice", 900).unwrap(); // still held
 
     let roster = store::agents(&conn).unwrap();
@@ -1309,7 +1374,15 @@ fn stats_throughput_cycle_and_clean_integrity() {
     store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
     store::claim_issue(&mut conn, "alice-agent", "alice", 900).unwrap_err(); // wrong key, ignored
     store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
-    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "alice",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     let s = store::stats(&conn, None).unwrap();
     assert_eq!(s.throughput, 1);
@@ -1368,7 +1441,15 @@ fn agents_completed_dedupes_reopened_issue() {
     let (_d, mut conn) = workspace();
     store::create_issue(&mut conn, new_issue("x", "", "high")).unwrap();
     store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
-    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "alice",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
     // reopen, then complete again → two '→ done' events for one issue.
     store::update_issue(
         &mut conn,
@@ -1381,7 +1462,15 @@ fn agents_completed_dedupes_reopened_issue() {
     )
     .unwrap();
     store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
-    store::release_issue(&mut conn, "AMT-1", "alice", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "alice",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     let roster = store::agents(&conn).unwrap();
     let alice = roster.iter().find(|a| a.name == "alice").unwrap();
@@ -2197,7 +2286,15 @@ fn archived_issue_can_reopen_and_complete_again() {
     )
     .unwrap();
     store::claim_issue(&mut conn, &done_key, "agent-x", 900).unwrap();
-    store::release_issue(&mut conn, &done_key, "agent-x", "done", None).unwrap();
+    store::release_issue(
+        &mut conn,
+        &done_key,
+        "agent-x",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
 
     let s = store::stats(&conn, None).unwrap();
     assert_eq!(
@@ -2403,4 +2500,182 @@ fn prefix_owner_finds_conflicts_across_the_registry() {
         .all(|(a, _)| a != "dead"));
 
     std::env::remove_var("AMT_REGISTRY");
+}
+
+// ---------- AMT-25: operator lease reset (--force / --no-cooldown) ----------
+
+#[test]
+fn force_releases_a_live_foreign_lease_and_logs_who_did_it() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("stuck work", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "sirius/oak", 900).unwrap();
+
+    // Default: an operator cannot release someone else's LIVE lease — that
+    // guard is what protects work in progress.
+    let denied = store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "operator",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    );
+    assert!(denied.is_err());
+    assert!(
+        format!("{}", denied.unwrap_err()).contains("--force"),
+        "error points at the way out"
+    );
+
+    // --force takes it, and says so in the log rather than stealing silently.
+    let issue = store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "operator",
+        "todo",
+        None,
+        store::ReleaseOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(issue.status, "todo");
+    assert!(issue.claimed_by.is_none());
+
+    let full = store::get_issue(&conn, "AMT-1").unwrap();
+    let ev = full
+        .activity
+        .iter()
+        .rev()
+        .find(|a| a.kind == "event" && a.body.starts_with("released; status:"))
+        .expect("forced release is still a 'released' event");
+    assert!(
+        ev.body.contains("forced by operator"),
+        "names the operator: {}",
+        ev.body
+    );
+    assert!(
+        ev.body.contains("sirius/oak"),
+        "names the displaced holder: {}",
+        ev.body
+    );
+    assert_eq!(ev.author, "operator");
+
+    // The audit must not read the takeover as an overlapping claim.
+    assert!(store::stats(&conn, None).unwrap().integrity.ok);
+}
+
+#[test]
+fn no_cooldown_lets_the_previous_holder_reclaim_immediately() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("stuck work", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "sirius/oak", 900).unwrap();
+
+    // A plain release records the requeue cooldown, so the releasing agent is
+    // NOT re-served its own issue — right for agents, wrong for an operator
+    // resetting a fleet that died mid-run.
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "sirius/oak",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
+    let f = any();
+    assert!(
+        store::peek_next(&conn, "sirius/oak", 3600, &f)
+            .unwrap()
+            .is_none(),
+        "cooldown hides the issue from the agent that released it"
+    );
+
+    // Re-claim and reset properly this time.
+    store::claim_issue(&mut conn, "AMT-1", "sirius/oak", 900).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "operator",
+        "todo",
+        None,
+        store::ReleaseOpts {
+            force: true,
+            no_cooldown: true,
+        },
+    )
+    .unwrap();
+    let peeked = store::peek_next(&conn, "sirius/oak", 3600, &f).unwrap();
+    assert_eq!(
+        peeked.map(|i| i.id).as_deref(),
+        Some("AMT-1"),
+        "no_cooldown puts it back as if never claimed — the old holder retakes it"
+    );
+}
+
+#[test]
+fn no_cooldown_clears_a_pre_existing_cooldown_marker() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("stuck work", "", "high")).unwrap();
+    // Agent releases normally → cooldown marker set.
+    store::claim_issue(&mut conn, "AMT-1", "worker", 900).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "worker",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
+    // The operator's reset must clear that marker even though the issue is no
+    // longer claimed (the exact state a stopped fleet leaves behind).
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "operator",
+        "todo",
+        None,
+        store::ReleaseOpts {
+            no_cooldown: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store::peek_next(&conn, "worker", 3600, &any())
+            .unwrap()
+            .map(|i| i.id)
+            .as_deref(),
+        Some("AMT-1")
+    );
+}
+
+#[test]
+fn force_is_unnecessary_for_your_own_or_an_expired_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("mine", "", "high")).unwrap();
+    store::create_issue(&mut conn, new_issue("expired", "", "high")).unwrap();
+    // Your own lease: no force needed.
+    store::claim_issue(&mut conn, "AMT-1", "worker", 900).unwrap();
+    assert!(store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "worker",
+        "todo",
+        None,
+        store::ReleaseOpts::default()
+    )
+    .is_ok());
+    // Someone else's EXPIRED lease: already releasable, force changes nothing.
+    store::claim_issue(&mut conn, "AMT-2", "gone", -1).unwrap();
+    assert!(store::release_issue(
+        &mut conn,
+        "AMT-2",
+        "operator",
+        "todo",
+        None,
+        store::ReleaseOpts::default()
+    )
+    .is_ok());
 }
