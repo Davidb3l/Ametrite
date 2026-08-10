@@ -354,9 +354,15 @@ fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
 /// archive copy and the live delete are separate commits (WAL mode cannot make
 /// a cross-database transaction atomic), so a crash between them leaves rows in
 /// both places, and the next archive run re-copies them harmlessly.
+/// Archive schema v2 (AMT-21): rows are identified by their full CONTENT, not
+/// by `(issue_key, seq)`. Seq is only unique per issue *within one workspace
+/// lifetime* — `amt import` renumbers activity from 1 — so a (key, seq) primary
+/// key let a re-imported workspace's next archive run REPLACE previously
+/// archived rows, destroying history. Content-keyed + INSERT OR IGNORE keeps
+/// the crash-recovery idempotency (re-copying an identical row is a no-op)
+/// while making a renumbered row a new row instead of an overwrite.
 const ARCHIVE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT OR IGNORE INTO meta(key, value) VALUES ('archive_schema_version', '1');
 CREATE TABLE IF NOT EXISTS activity (
   issue_key   TEXT NOT NULL,
   seq         INTEGER NOT NULL,
@@ -364,9 +370,31 @@ CREATE TABLE IF NOT EXISTS activity (
   author      TEXT NOT NULL,
   kind        TEXT NOT NULL,
   body        TEXT NOT NULL,
-  archived_at TEXT NOT NULL,
-  PRIMARY KEY (issue_key, seq)
+  archived_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS activity_row
+  ON activity(issue_key, seq, at, author, kind, body);
+INSERT OR IGNORE INTO meta(key, value) VALUES ('archive_schema_version', '2');
+"#;
+
+/// Rebuild a v1 archive (PRIMARY KEY (issue_key, seq)) into the v2 shape.
+/// Existing rows are preserved verbatim; only the key changes.
+const ARCHIVE_MIGRATE_V1_V2: &str = r#"
+CREATE TABLE activity_new (
+  issue_key   TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  at          TEXT NOT NULL,
+  author      TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  archived_at TEXT NOT NULL
+);
+INSERT INTO activity_new SELECT issue_key, seq, at, author, kind, body, archived_at FROM activity;
+DROP TABLE activity;
+ALTER TABLE activity_new RENAME TO activity;
+CREATE UNIQUE INDEX IF NOT EXISTS activity_row
+  ON activity(issue_key, seq, at, author, kind, body);
+UPDATE meta SET value = '2' WHERE key = 'archive_schema_version';
 "#;
 
 /// Open (creating on first use) the archive side database.
@@ -374,6 +402,18 @@ pub fn open_archive(archive_path: &Path) -> Result<Connection> {
     let conn = Connection::open(archive_path)?;
     conn.pragma_update(None, "busy_timeout", 10_000)?;
     conn.execute_batch(ARCHIVE_SCHEMA)?;
+    let version: i64 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='archive_schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if version < 2 {
+        conn.execute_batch(&format!("BEGIN;{ARCHIVE_MIGRATE_V1_V2}COMMIT;"))?;
+    }
     Ok(conn)
 }
 

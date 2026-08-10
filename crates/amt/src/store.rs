@@ -2609,7 +2609,7 @@ pub fn archive_activity(
              WHERE doc_id = ?1 AND seq <= ?2 ORDER BY seq",
         )?;
         let mut write = archive.prepare(
-            "INSERT OR REPLACE INTO activity(issue_key, seq, at, author, kind, body, archived_at)
+            "INSERT OR IGNORE INTO activity(issue_key, seq, at, author, kind, body, archived_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for (doc_id, key, max_seq) in &candidates {

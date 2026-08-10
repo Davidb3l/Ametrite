@@ -2679,3 +2679,209 @@ fn force_is_unnecessary_for_your_own_or_an_expired_lease() {
     )
     .is_ok());
 }
+
+// ---------- AMT-21: export/import carries archived history ----------
+
+#[test]
+fn export_import_round_trips_archived_metrics() {
+    let (dir, mut conn) = workspace();
+    store::seed(&mut conn, 40, "operator").unwrap();
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    let before = metrics_snapshot(&conn);
+    assert!(before.0 > 0, "fixture has archived completions to lose");
+
+    let out = TempDir::new().unwrap();
+    export::export(&conn, out.path()).unwrap();
+    // The rollups ride along in a sidecar; the markdown tree stays documents.
+    assert!(out.path().join(export::ROLLUP_FILE).is_file());
+
+    // Import into a FRESH workspace: without the sidecar this reported zero
+    // throughput, because archived completions live only in the rollups.
+    let dir2 = TempDir::new().unwrap();
+    let path2 = db::init(dir2.path(), "copy", "AMT").unwrap();
+    let mut conn2 = db::open(&path2).unwrap();
+    export::import(&mut conn2, out.path()).unwrap();
+
+    let after = metrics_snapshot(&conn2);
+    assert_eq!(before.0, after.0, "throughput survives the round trip");
+    assert_eq!(before.1, after.1, "avg cycle survives");
+    assert_eq!(before.2, after.2, "median cycle survives");
+    assert_eq!(before.3, after.3, "integrity verdict survives");
+    let agents_before: Vec<_> = before.4.iter().filter(|(n, _, _)| n != "gc-bot").collect();
+    let agents_after: Vec<_> = after.4.iter().filter(|(n, _, _)| n != "gc-bot").collect();
+    assert_eq!(agents_before, agents_after, "per-agent counts survive");
+}
+
+#[test]
+fn export_of_a_never_archived_workspace_has_no_sidecar() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("plain", "", "low")).unwrap();
+    let out = TempDir::new().unwrap();
+    export::export(&conn, out.path()).unwrap();
+    assert!(
+        !out.path().join(export::ROLLUP_FILE).exists(),
+        "no archival, no sidecar clutter"
+    );
+    // And importing an export without a sidecar is a no-op, not an error.
+    let dir2 = TempDir::new().unwrap();
+    let mut conn2 = db::open(&db::init(dir2.path(), "copy", "AMT").unwrap()).unwrap();
+    assert!(export::import(&mut conn2, out.path()).is_ok());
+}
+
+#[test]
+fn re_importing_does_not_multiply_archived_overlaps() {
+    let (dir, mut conn) = workspace();
+    store::seed(&mut conn, 20, "operator").unwrap();
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    // Plant an audit finding in the rollups so the sidecar carries one.
+    conn.execute(
+        "INSERT INTO archived_overlaps(issue, holder, claimant, at)
+         VALUES ('AMT-1','a','b','2026-01-01T00:00:00.000Z')",
+        [],
+    )
+    .unwrap();
+    let out = TempDir::new().unwrap();
+    export::export(&conn, out.path()).unwrap();
+
+    let dir2 = TempDir::new().unwrap();
+    let mut conn2 = db::open(&db::init(dir2.path(), "copy", "AMT").unwrap()).unwrap();
+    export::import(&mut conn2, out.path()).unwrap();
+    export::import(&mut conn2, out.path()).unwrap(); // twice
+    let n: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM archived_overlaps", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "an audit finding must not multiply on re-import");
+}
+
+#[test]
+fn renumbered_seqs_cannot_clobber_previously_archived_rows() {
+    // The AMT-21 hazard: `import` renumbers activity seq from 1, so a later
+    // archive run would write (issue_key, 1..n) — the same keys as rows already
+    // in archive.db. Under the old (key, seq) primary key those rows were
+    // REPLACED and their content lost.
+    let (dir, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("first life", "", "high")).unwrap();
+    store::claim_issue(&mut conn, "AMT-1", "worker", 900).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "worker",
+        "done",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
+    // Age the history past the cutoff — archival only touches issues that have
+    // been quiet, and this one was written milliseconds ago.
+    conn.execute("UPDATE activity SET at = '2026-01-01T00:00:00.000Z'", [])
+        .unwrap();
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    let arch = Connection::open(archive_path(&dir)).unwrap();
+    let first: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM activity WHERE issue_key='AMT-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        first >= 3,
+        "expected the first life's rows in the archive, got {first}"
+    );
+
+    // Simulate the post-import state: activity renumbered from 1 with new
+    // content, then archived again into the SAME archive file.
+    conn.execute("DELETE FROM activity", []).unwrap();
+    conn.execute(
+        "INSERT INTO activity(doc_id, seq, at, author, kind, body)
+         VALUES ((SELECT doc_id FROM documents WHERE id='AMT-1'), 1,
+                 '2026-01-01T00:00:00.000Z', 'reimported', 'event', 'created')",
+        [],
+    )
+    .unwrap();
+    store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+
+    let arch = Connection::open(archive_path(&dir)).unwrap();
+    let after: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM activity WHERE issue_key='AMT-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        after > first,
+        "the re-archived row is added, not swapped in"
+    );
+    // The original history is still there, verbatim.
+    let kept: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM activity WHERE issue_key='AMT-1' AND author='worker'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        kept >= 2,
+        "the first life's rows survived the renumbered re-archive"
+    );
+}
+
+#[test]
+fn a_v1_archive_migrates_and_keeps_its_rows() {
+    let dir = TempDir::new().unwrap();
+    let apath = dir.path().join("archive.db");
+    // Build the old v1 shape by hand: PRIMARY KEY (issue_key, seq).
+    {
+        let c = Connection::open(&apath).unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES ('archive_schema_version', '1');
+             CREATE TABLE activity (
+               issue_key TEXT NOT NULL, seq INTEGER NOT NULL, at TEXT NOT NULL,
+               author TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+               archived_at TEXT NOT NULL, PRIMARY KEY (issue_key, seq));
+             INSERT INTO activity VALUES
+               ('OLD-1', 1, '2026-01-01T00:00:00.000Z', 'worker', 'event', 'created', '2026-01-02T00:00:00.000Z');",
+        )
+        .unwrap();
+    }
+    // Opening it migrates to v2 without losing the row.
+    let c = db::open_archive(&apath).unwrap();
+    let version: String = c
+        .query_row(
+            "SELECT value FROM meta WHERE key='archive_schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "2");
+    let body: String = c
+        .query_row(
+            "SELECT body FROM activity WHERE issue_key='OLD-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(body, "created");
+    // Re-copying the identical row stays a no-op (crash-recovery idempotency)…
+    c.execute(
+        "INSERT OR IGNORE INTO activity VALUES ('OLD-1', 1, '2026-01-01T00:00:00.000Z', 'worker', 'event', 'created', 'x')",
+        [],
+    )
+    .unwrap();
+    // …while a DIFFERENT row at the same (key, seq) is now kept, not swapped in.
+    c.execute(
+        "INSERT OR IGNORE INTO activity VALUES ('OLD-1', 1, '2026-02-02T00:00:00.000Z', 'other', 'event', 'reimported', 'x')",
+        [],
+    )
+    .unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM activity WHERE issue_key='OLD-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2);
+}

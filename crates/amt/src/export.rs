@@ -173,7 +173,142 @@ pub fn export(conn: &Connection, dir: &Path) -> Result<usize> {
         fs::write(out_dir.join(filename), content)?;
         count += 1;
     }
+    export_rollups(conn, dir)?;
     Ok(count)
+}
+
+/// Sidecar holding the archival rollups (AMT-21). These are workspace-level
+/// tables, not documents, so they can't live in a per-document markdown file —
+/// and without them an export→import silently loses every completion whose
+/// activity was archived, which `stats`/`agents`/integrity read from the
+/// rollups rather than from live activity. JSON keeps the markdown tree pure
+/// documents; Obsidian ignores the file.
+pub const ROLLUP_FILE: &str = "_ametrite-rollups.json";
+
+fn export_rollups(conn: &Connection, dir: &Path) -> Result<()> {
+    // A workspace that has never archived has nothing to carry — don't litter
+    // the export with an empty sidecar.
+    let total: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM issue_metrics) + (SELECT COUNT(*) FROM agent_rollup)
+              + (SELECT COUNT(*) FROM agent_completions) + (SELECT COUNT(*) FROM archived_overlaps)",
+        [],
+        |r| r.get(0),
+    )?;
+    if total == 0 {
+        return Ok(());
+    }
+    let rows = |sql: &str, cols: &[&str]| -> Result<Vec<serde_json::Value>> {
+        let mut stmt = conn.prepare(sql)?;
+        let out = stmt
+            .query_map([], |r| {
+                let mut o = serde_json::Map::new();
+                for (i, c) in cols.iter().enumerate() {
+                    o.insert(
+                        (*c).to_string(),
+                        match r.get::<_, Option<String>>(i)? {
+                            Some(v) => serde_json::Value::String(v),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                }
+                Ok(serde_json::Value::Object(o))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    };
+    let payload = serde_json::json!({
+        "issue_metrics": rows(
+            "SELECT issue_key, done_at, first_claim_at, archived_at FROM issue_metrics ORDER BY issue_key",
+            &["issue_key", "done_at", "first_claim_at", "archived_at"],
+        )?,
+        // claims is an integer; read it as text so one helper covers every table.
+        "agent_rollup": rows(
+            "SELECT agent, CAST(claims AS TEXT), last_activity FROM agent_rollup ORDER BY agent",
+            &["agent", "claims", "last_activity"],
+        )?,
+        "agent_completions": rows(
+            "SELECT agent, issue_key FROM agent_completions ORDER BY agent, issue_key",
+            &["agent", "issue_key"],
+        )?,
+        "archived_overlaps": rows(
+            "SELECT issue, holder, claimant, at FROM archived_overlaps ORDER BY at",
+            &["issue", "holder", "claimant", "at"],
+        )?,
+    });
+    fs::create_dir_all(dir)?;
+    fs::write(
+        dir.join(ROLLUP_FILE),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
+    Ok(())
+}
+
+/// Restore the rollup sidecar, if the export carried one. Rows are upserted by
+/// their natural key (the export is a snapshot of truth, same as documents).
+fn import_rollups(tx: &rusqlite::Transaction<'_>, dir: &Path) -> Result<()> {
+    let path = dir.join(ROLLUP_FILE);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let text = fs::read_to_string(&path)?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| msg(format!("corrupt rollup sidecar at {}", path.display())))?;
+    let get = |o: &serde_json::Value, k: &str| -> Option<String> {
+        o.get(k).and_then(|x| x.as_str()).map(str::to_string)
+    };
+    let arr = |k: &str| -> Vec<serde_json::Value> {
+        v.get(k)
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    for r in arr("issue_metrics") {
+        if let Some(key) = get(&r, "issue_key") {
+            tx.execute(
+                "INSERT OR REPLACE INTO issue_metrics(issue_key, done_at, first_claim_at, archived_at)
+                 VALUES (?1, ?2, ?3, COALESCE(?4, strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+                params![key, get(&r, "done_at"), get(&r, "first_claim_at"), get(&r, "archived_at")],
+            )?;
+        }
+    }
+    for r in arr("agent_rollup") {
+        if let Some(agent) = get(&r, "agent") {
+            let claims: i64 = get(&r, "claims").and_then(|c| c.parse().ok()).unwrap_or(0);
+            tx.execute(
+                "INSERT OR REPLACE INTO agent_rollup(agent, claims, last_activity)
+                 VALUES (?1, ?2, ?3)",
+                params![agent, claims, get(&r, "last_activity")],
+            )?;
+        }
+    }
+    for r in arr("agent_completions") {
+        if let (Some(agent), Some(key)) = (get(&r, "agent"), get(&r, "issue_key")) {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_completions(agent, issue_key) VALUES (?1, ?2)",
+                params![agent, key],
+            )?;
+        }
+    }
+    // Overlaps have no natural key, so clear and restore rather than append —
+    // re-importing must not multiply an audit finding.
+    if v.get("archived_overlaps").is_some() {
+        tx.execute("DELETE FROM archived_overlaps", [])?;
+        for r in arr("archived_overlaps") {
+            if let (Some(issue), Some(holder), Some(claimant), Some(at)) = (
+                get(&r, "issue"),
+                get(&r, "holder"),
+                get(&r, "claimant"),
+                get(&r, "at"),
+            ) {
+                tx.execute(
+                    "INSERT INTO archived_overlaps(issue, holder, claimant, at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![issue, holder, claimant, at],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Frontmatter {
@@ -456,6 +591,7 @@ pub fn import(conn: &mut Connection, dir: &Path) -> Result<usize> {
             )?;
         }
     }
+    import_rollups(&tx, dir)?;
     tx.commit()?;
     Ok(count)
 }
