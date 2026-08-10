@@ -208,6 +208,25 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Run the web board, or install it as a login service that outlives this
+    /// session (`--install`)
+    Serve {
+        /// Install (or refresh) the per-user login service and start it
+        #[arg(long)]
+        install: bool,
+        /// Remove the login service
+        #[arg(long)]
+        uninstall: bool,
+        /// Report whether the service is installed and the board is answering
+        #[arg(long)]
+        status: bool,
+        /// Path to apps/web/server.ts (default: $AMT_WEB_APP, else walk up)
+        #[arg(long)]
+        app: Option<PathBuf>,
+        /// Path to the bun executable (default: found on PATH)
+        #[arg(long)]
+        bun: Option<PathBuf>,
+    },
     /// Compact the workspace database (FTS optimize, VACUUM, WAL checkpoint)
     Gc {
         /// Also archive the activity of done/canceled issues untouched for this
@@ -1803,6 +1822,83 @@ fn run(cli: Cli) -> Result<()> {
                 println!("seeded {n} issues in {elapsed_ms}ms");
             }
             Ok(())
+        }
+        Cmd::Serve {
+            install,
+            uninstall,
+            status,
+            app,
+            bun,
+        } => {
+            // `serve` manages the binary and the web app, never a workspace —
+            // it must work from anywhere, including outside a repo.
+            if uninstall {
+                amt::serve::uninstall()?;
+                if cli.json {
+                    print_json(&serde_json::json!({ "ok": true, "installed": false }));
+                } else {
+                    println!("removed the Ametrite web service");
+                }
+                return Ok(());
+            }
+            if status {
+                let s = amt::serve::status()?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "installed": s.installed,
+                        "responding": s.responding,
+                        "port": s.port,
+                        "url": format!("http://localhost:{}", s.port),
+                        "unit": s.unit,
+                        "log": s.log,
+                    }));
+                } else {
+                    println!(
+                        "service:   {}",
+                        if s.installed {
+                            "installed"
+                        } else {
+                            "not installed"
+                        }
+                    );
+                    println!(
+                        "board:     {} at http://localhost:{}",
+                        if s.responding {
+                            "responding"
+                        } else {
+                            "not responding"
+                        },
+                        s.port
+                    );
+                    if let Some(u) = &s.unit {
+                        println!("unit:      {}", u.display());
+                    }
+                    if let Some(l) = &s.log {
+                        println!("log:       {}", l.display());
+                    }
+                }
+                return Ok(());
+            }
+            let cwd = std::env::current_dir()?;
+            let cfg = amt::serve::resolve(app.as_deref(), bun.as_deref(), &cwd)?;
+            if install {
+                let unit = amt::serve::install(&cfg)?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "ok": true, "installed": true, "unit": unit,
+                        "port": cfg.port, "url": format!("http://localhost:{}", cfg.port),
+                    }));
+                } else {
+                    println!("installed {}", unit.display());
+                    println!("board will start at login: http://localhost:{}", cfg.port);
+                }
+                return Ok(());
+            }
+            if !cli.json {
+                println!("serving http://localhost:{} (ctrl-c to stop)", cfg.port);
+            }
+            // On Unix this replaces the process — nothing after it runs.
+            amt::serve::run(&cfg)
         }
         Cmd::Gc { archive_older_than } => {
             let mut conn = open_workspace(&cli.workspace)?;

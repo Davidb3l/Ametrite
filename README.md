@@ -80,6 +80,20 @@ workspace healthy ✓
 
 ### Web UI (optional, requires [Bun](https://bun.sh))
 
+Run `amt serve` for a foreground board, or `amt serve --install` to register a
+per-user login service (launchd on macOS, a logon Scheduled Task on Windows, a
+systemd user unit on Linux — no sudo anywhere) so the board survives closing
+your terminal, an agent session ending, and reboots. `amt serve --status` says
+whether the service is installed and whether the board is actually answering;
+`--uninstall` removes it. Agents are unaffected either way: the CLI and MCP
+open the workspace database directly, so the board is a viewport, not the
+system.
+
+On macOS, a login service that reads from `~/Documents`, `~/Desktop`, or
+`~/Downloads` needs a privacy grant you have to approve once; `--install`
+warns when your checkout is in one of those. Moving the checkout elsewhere
+avoids the prompt entirely.
+
 ```sh
 bun run web          # → http://localhost:1776 (AMT_PORT to change)
 ```
@@ -138,6 +152,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt export <dir>` / `amt import <dir>` | Round-trip the workspace as an Obsidian-compatible markdown vault |
 | `amt ws add/list/remove` | Global workspace registry (`~/.ametrite/registry.json`) |
 | `amt doctor` | Workspace health: unresolved links, stale claims, missing refs |
+| `amt serve [--install]` | Run the web board; `--install` registers a login service so it outlives your session (`--status`, `--uninstall`) |
 | `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
 | `amt gc [--archive-older-than N]` | Compact the database; optionally archive activity of issues closed >N days to `archive.db` (stats stay exact) |
 | `amt upgrade` | Update `amt` in place via brew / installer / cargo (`--dry-run`) |
