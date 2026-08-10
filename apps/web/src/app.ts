@@ -1,5 +1,7 @@
 // Ametrite web app — vanilla TS, zero dependencies.
 
+import { ago, agoLabel } from "./time";
+
 type Issue = {
   id: string; title: string; status: string; priority: string;
   project?: string; assignee?: string; parent?: string; due?: string;
@@ -65,14 +67,6 @@ const post = (path: string, body: any) =>
   api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const patch = (path: string, body: any) =>
   api(path, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-
-function ago(iso: string): string {
-  const s = (Date.now() - Date.parse(iso)) / 1000;
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
-}
 
 function prioSvg(p: string): string {
   return `<svg class="prio p-${p}" viewBox="0 0 14 14" aria-label="${p}">
@@ -377,7 +371,7 @@ async function renderAgents() {
       <span class="leases">${lease}</span>
       <span class="num">${a.claims}</span>
       <span class="num">${a.completed}</span>
-      <span class="last">${a.last_activity ? ago(a.last_activity) + " ago" : "—"}</span>
+      <span class="last">${a.last_activity ? agoLabel(a.last_activity) : "—"}</span>
     </div>`));
   }
 }
@@ -534,7 +528,7 @@ async function renderIssue(id: string) {
   act.innerHTML = compactActivity(i.activity ?? []).map((a) =>
     a.kind === "comment"
       ? `<div class="activity-entry comment"><div><span class="who">@${esc(a.author)}</span>
-           <span class="when">${ago(a.at)} ago</span><div class="prose">${md(a.body)}</div></div></div>`
+           <span class="when">${agoLabel(a.at)}</span><div class="prose">${md(a.body)}</div></div></div>`
       : `<div class="activity-entry event"><span class="when">${ago(a.at)}</span>
            <span class="what"><span class="who">@${esc(a.author)}</span> ${esc(a.body)}${(a as any).n > 1 ? ` <span class="xn">×${(a as any).n}</span>` : ""}</span></div>`
   ).join("") || '<div class="empty" style="padding:6px 0">No activity.</div>';
@@ -608,7 +602,7 @@ async function renderNotes(selected?: string) {
   list.innerHTML = notes.length
     ? notes.map((n) =>
         `<a class="note-item ${n.id === selected ? "active" : ""}" href="#/notes/${encodeURIComponent(n.id)}">
-           <span class="t">${esc(n.title)}</span><span class="d">${ago(n.updated_at)} ago</span></a>`).join("")
+           <span class="t">${esc(n.title)}</span><span class="d">${agoLabel(n.updated_at)}</span></a>`).join("")
     : '<div class="empty">No notes yet.</div>';
 
   main.querySelector("#new-note")!.addEventListener("click", () => {
@@ -1005,7 +999,7 @@ async function renderDecisions() {
       return `<a class="d-node ${superseded ? "superseded" : d.status}" href="#/doc/${encodeURIComponent(d.id)}">
         <span class="d-dot"></span>
         <span class="d-body"><span class="d-key">${esc(d.id)}</span> <span class="d-title">${esc(d.title)}</span>
-          <span class="d-meta">${superseded ? `superseded by ${esc(d.superseded_by || "")}` : d.status}${d.created_at ? ` · ${ago(d.created_at)} ago` : ""}</span>
+          <span class="d-meta">${superseded ? `superseded by ${esc(d.superseded_by || "")}` : d.status}${d.created_at ? ` · ${agoLabel(d.created_at)}` : ""}</span>
         </span></a>`;
     }).join('<span class="d-link"></span>');
     return `<div class="d-group">
