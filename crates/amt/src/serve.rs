@@ -150,6 +150,10 @@ const EMBEDDED_WEB_APP: &[(&str, &str)] = &[
     ("src/app.ts", include_str!("../../../apps/web/src/app.ts")),
     ("src/time.ts", include_str!("../../../apps/web/src/time.ts")),
     (
+        "src/drafts.ts",
+        include_str!("../../../apps/web/src/drafts.ts"),
+    ),
+    (
         "src/style.css",
         include_str!("../../../apps/web/src/style.css"),
     ),

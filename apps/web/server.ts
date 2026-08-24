@@ -80,9 +80,33 @@ const defaultAlias =
 
 function dbOf(ws: Workspace): Database {
   // Not readonly: a WAL database needs the connection to be able to
-  // (re)create -shm/-wal sidecars. This connection still never writes —
-  // all mutations shell out to `amt`.
-  ws.db ??= new Database(join(ws.root, ".ametrite", "ametrite.db"));
+  // (re)create -shm/-wal sidecars — which is also why we can NOT open with
+  // create:false: stripping SQLITE_OPEN_CREATE forbids creating a missing
+  // -wal sidecar too, and a workspace whose -wal was cleaned up then fails
+  // every query with SQLITE_CANTOPEN while opening fine (seen live on
+  // carbillpro). A deleted workspace must still read as GONE rather than be
+  // resurrected as an empty db inside someone's repo, so check the file
+  // ourselves and throw the same shape the recovery layer already handles.
+  const path = join(ws.root, ".ametrite", "ametrite.db");
+  if (!ws.db) {
+    if (!existsSync(path)) {
+      throw Object.assign(new Error(`no database at ${path}`), { code: "SQLITE_CANTOPEN" });
+    }
+    const db = new Database(path);
+    // A freshly-opened file with no meta table is not a workspace: either the
+    // existsSync/open race just resurrected an empty db, or an `amt init` is
+    // mid-flight. Don't cache it (and NEVER delete it — init may own it);
+    // report gone so the recovery layer treats it like a missing db.
+    try {
+      db.query("SELECT 1 FROM meta LIMIT 1").get();
+    } catch {
+      try {
+        db.close();
+      } catch {}
+      throw Object.assign(new Error(`not an ametrite database at ${path}`), { code: "SQLITE_CANTOPEN" });
+    }
+    ws.db = db;
+  }
   return ws.db;
 }
 
@@ -330,7 +354,10 @@ setInterval(() => {
     let v: number;
     try {
       v = (ws.db.query("PRAGMA data_version").get() as any).data_version;
-    } catch {
+    } catch (e) {
+      // AMT-27: a workspace re-created underneath us kills the cached handle
+      // with SQLITE_IOERR_VNODE — reopen so polling (and the board) heal.
+      if (isDbGoneError(e)) evictDb(ws);
       continue;
     }
     if (!cursors.has(ws.alias)) cursors.set(ws.alias, eventsTip(ws.db)); // start at tip
@@ -368,21 +395,30 @@ function json(data: any, status = 200): Response {
 
 const flag = (name: string, v: any): string[] => (v === undefined || v === null ? [] : [`--${name}`, String(v)]);
 
-Bun.serve({
-  port: PORT,
-  idleTimeout: 0,
-  routes: {
+const routes: Record<string, any> = {
     "/": index,
+    // Aggregate routes iterate EVERY workspace, so one dead workspace must
+    // degrade to a skipped entry — never an error. Letting the error reach the
+    // recovery wrapper is actively harmful here: wsOf(req) resolves to the
+    // CLIENT'S workspace, so the wrapper would evict (and broadcast for) a
+    // healthy db while the whole sidebar 503s — a self-sustaining refetch
+    // storm. Review finding; the per-workspace catch is the fix.
     "/api/workspaces": () =>
       json(
-        [...workspaces.values()].map((ws) => {
-          const meta = Object.fromEntries(
-            (dbOf(ws).query("SELECT key, value FROM meta").all() as any[]).map((r) => [r.key, r.value])
-          );
-          const open = (dbOf(ws).query(
-            "SELECT COUNT(*) AS n FROM issues WHERE status NOT IN ('done','canceled')"
-          ).get() as any).n;
-          return { alias: ws.alias, name: meta.workspace_name, prefix: meta.id_prefix, root: ws.root, open_issues: open };
+        [...workspaces.values()].flatMap((ws) => {
+          try {
+            const meta = Object.fromEntries(
+              (dbOf(ws).query("SELECT key, value FROM meta").all() as any[]).map((r) => [r.key, r.value])
+            );
+            const open = (dbOf(ws).query(
+              "SELECT COUNT(*) AS n FROM issues WHERE status NOT IN ('done','canceled')"
+            ).get() as any).n;
+            return [{ alias: ws.alias, name: meta.workspace_name, prefix: meta.id_prefix, root: ws.root, open_issues: open }];
+          } catch (e) {
+            if (!isDbGoneError(e)) throw e;
+            evictDb(ws); // heals it if it's back; stays quietly absent if not
+            return [];
+          }
         })
       ),
     // Inbox: every workspace's open issues in one globally priority-sorted
@@ -390,12 +426,18 @@ Bun.serve({
     "/api/inbox": () => {
         const out: any[] = [];
         for (const ws of workspaces.values()) {
-            const db = dbOf(ws);
-            const name = (db.query("SELECT value FROM meta WHERE key = 'workspace_name'").get() as any)?.value ?? ws.alias;
-            for (const r of listIssues(db, new URLSearchParams())) {
-                r.workspace = ws.alias;
-                r.workspace_name = name;
-                out.push(r);
+            try {
+                const db = dbOf(ws);
+                const name = (db.query("SELECT value FROM meta WHERE key = 'workspace_name'").get() as any)?.value ?? ws.alias;
+                for (const r of listIssues(db, new URLSearchParams())) {
+                    r.workspace = ws.alias;
+                    r.workspace_name = name;
+                    out.push(r);
+                }
+            } catch (e) {
+                // Same degradation rule as /api/workspaces (see comment there).
+                if (!isDbGoneError(e)) throw e;
+                evictDb(ws);
             }
         }
         out.sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.created_at.localeCompare(b.created_at));
@@ -515,8 +557,22 @@ Bun.serve({
       // the live SSE stream (hello + change/activity/workspaces frames).
       const sinceParam = new URL(req.url).searchParams.get("since");
       if (sinceParam !== null) {
+        // This route is excluded from the recovery wrapper for the SSE
+        // stream's sake, so the REST branch carries its own evict+retry.
         const since = Number(sinceParam) || 0;
-        return json(eventsSince(dbOf(wsOf(req)), since, 500));
+        const ws = wsOf(req);
+        try {
+          return json(eventsSince(dbOf(ws), since, 500));
+        } catch (e) {
+          if (!isDbGoneError(e)) throw e;
+          evictDb(ws);
+          try {
+            return json(eventsSince(dbOf(ws), since, 500));
+          } catch (e2) {
+            if (isDbGoneError(e2)) return json({ error: `workspace '${ws.alias}' database is unavailable` }, 503);
+            throw e2;
+          }
+        }
       }
       let ctrl: ReadableStreamDefaultController;
       const stream = new ReadableStream({
@@ -537,7 +593,92 @@ Bun.serve({
         },
       });
     },
-  },
+};
+
+// ---------- AMT-27: self-heal cached connections ----------
+// A workspace whose ametrite.db is deleted and re-created (amt init anew)
+// leaves this long-running server holding a handle to the unlinked inode;
+// every query then fails with SQLITE_IOERR_VNODE until a human restarts the
+// service. Instead: recognize the io-flavored errors, drop the cached
+// connection, reopen from the registry path, and retry the request once.
+function isDbGoneError(e: any): boolean {
+  const code = String(e?.code ?? "");
+  return (
+    code.startsWith("SQLITE_IOERR") ||
+    code === "SQLITE_NOTADB" ||
+    code === "SQLITE_CANTOPEN" ||
+    code === "SQLITE_READONLY_DBMOVED"
+  );
+}
+
+const lastRecoveryBroadcast = new Map<string, number>();
+function evictDb(ws: Workspace) {
+  try {
+    ws.db?.close();
+  } catch {}
+  ws.db = null;
+  versions.delete(ws.alias);
+  // Reopen eagerly when the db is back so SSE polling resumes, and nudge open
+  // boards to refetch — the workspace heals live, no reload needed. VERIFY
+  // with a real query first: a bare open can succeed while every query still
+  // fails, and broadcasting that false recovery creates a feedback storm
+  // (browser refetch → error → evict → broadcast → …) that also starves the
+  // client's change debounce for every other workspace. Seen live.
+  try {
+    dbOf(ws).query("SELECT 1 FROM meta LIMIT 1").get();
+    // Rate-limit the recovery announcement: a verify that passes while real
+    // queries still fail (page-selective IOERR) would otherwise turn every
+    // refetch into another evict+broadcast — an unthrottled feedback loop.
+    const now = Date.now();
+    if ((lastRecoveryBroadcast.get(ws.alias) ?? 0) + 5000 < now) {
+      lastRecoveryBroadcast.set(ws.alias, now);
+      broadcast("change", `{"ws":"${ws.alias}"}`);
+    }
+  } catch {
+    try {
+      ws.db?.close();
+    } catch {}
+    ws.db = null; // truly gone/broken: stay evicted, a later request retries
+  }
+}
+
+// GET-only: a retried mutation would re-read an already-consumed request body,
+// and every mutation shells out to `amt` rather than touching sqlite anyway.
+function withDbRecovery(handler: (req: any) => any) {
+  return async (req: any) => {
+    try {
+      return await handler(req);
+    } catch (e) {
+      if (!isDbGoneError(e)) throw e;
+      const ws = wsOf(req);
+      console.error(`workspace '${ws.alias}': ${(e as any)?.code} — reopening (db replaced?)`);
+      evictDb(ws);
+      try {
+        return await handler(req);
+      } catch (e2) {
+        if (isDbGoneError(e2)) {
+          return json(
+            { error: `workspace '${ws.alias}' database is unavailable — re-run \`amt init\` there or \`amt ws remove ${ws.alias}\`` },
+            503
+          );
+        }
+        throw e2;
+      }
+    }
+  };
+}
+for (const [path, entry] of Object.entries(routes)) {
+  if (path === "/" || path === "/api/events") continue; // static page + SSE stream
+  if (typeof entry === "function") routes[path] = withDbRecovery(entry);
+  else if (entry && typeof entry === "object" && typeof entry.GET === "function") {
+    entry.GET = withDbRecovery(entry.GET);
+  }
+}
+
+Bun.serve({
+  port: PORT,
+  idleTimeout: 0,
+  routes,
 });
 
 console.log(`ametrite ▸ ${workspaces.size} workspace(s): ${[...workspaces.keys()].join(", ")}`);

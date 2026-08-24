@@ -1,6 +1,7 @@
 // Ametrite web app — vanilla TS, zero dependencies.
 
 import { ago, agoLabel } from "./time";
+import { bindDraft, clearDraft, draftKey } from "./drafts";
 
 type Issue = {
   id: string; title: string; status: string; priority: string;
@@ -146,6 +147,14 @@ function route(): { view: string; arg?: string } {
 
 async function render() {
   const r = route();
+  // AMT-28: live SSE updates re-render this pane under the user's hands. Note
+  // the focused main-pane field so the cursor lands back exactly where it was
+  // (the text itself survives via the draft store, not via the DOM).
+  const ae = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
+  const refocus =
+    ae && ae.id && main.contains(ae) && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")
+      ? { id: ae.id, start: ae.selectionStart, end: ae.selectionEnd }
+      : null;
   document.querySelectorAll("nav a").forEach((a) =>
     a.classList.toggle("active", (a as HTMLAnchorElement).dataset.nav === r.view));
   try {
@@ -162,6 +171,15 @@ async function render() {
     else location.hash = "#/board";
   } catch (e) {
     // toast already shown by api()
+  }
+  if (refocus) {
+    const el = main.querySelector(`#${CSS.escape(refocus.id)}`) as HTMLTextAreaElement | null;
+    if (el) {
+      el.focus();
+      try {
+        el.setSelectionRange(refocus.start ?? el.value.length, refocus.end ?? el.value.length);
+      } catch {}
+    }
   }
 }
 
@@ -533,10 +551,15 @@ async function renderIssue(id: string) {
            <span class="what"><span class="who">@${esc(a.author)}</span> ${esc(a.body)}${(a as any).n > 1 ? ` <span class="xn">×${(a as any).n}</span>` : ""}</span></div>`
   ).join("") || '<div class="empty" style="padding:6px 0">No activity.</div>';
 
+  // AMT-28: the comment box sits inside #main, so every live update rebuilds
+  // it — the draft store is what makes that lossless.
+  const commentDraft = draftKey(currentWs, i.id, "comment");
+  bindDraft(main.querySelector("#comment") as HTMLTextAreaElement, commentDraft, localStorage);
   main.querySelector("#send-comment")!.addEventListener("click", async () => {
     const ta = main.querySelector("#comment") as HTMLTextAreaElement;
     if (!ta.value.trim()) return;
     await post(`/api/issues/${encodeURIComponent(i.id)}/comments`, { body: ta.value });
+    clearDraft(commentDraft, localStorage);
     render();
   });
 }
@@ -689,6 +712,8 @@ function renderSearch() {
       : '<div class="empty big"><span class="facet"></span>No results.</div>';
   };
   q.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(run, 180); });
+  bindDraft(q, draftKey(currentWs, "search", "q"), localStorage);
+  if (q.value.trim()) run(); // a repopulated query gets its results back too
   main.querySelector("#chips")!.addEventListener("click", (e) => {
     const chip = (e.target as HTMLElement).closest(".chip") as HTMLElement | null;
     if (!chip) return;
@@ -734,14 +759,28 @@ function connectSSE() {
   const es = new EventSource("/api/events");
   const dot = document.getElementById("live-dot")!;
   es.addEventListener("hello", () => dot.classList.add("on"));
+  // Debounce bursts, but remember every workspace named while waiting: with a
+  // single last-event-wins timer, a change for another workspace arriving
+  // inside the window silently swallowed OUR workspace's re-render (and a
+  // misbehaving peer emitting continuously could starve updates entirely).
   let timer: any;
+  let firstPending = 0;
+  const pending = new Set<string | undefined>();
   es.addEventListener("change", (e) => {
-    const ws = JSON.parse((e as MessageEvent).data ?? "{}").ws;
+    pending.add(JSON.parse((e as MessageEvent).data ?? "{}").ws);
+    if (!firstPending) firstPending = Date.now();
     clearTimeout(timer);
+    // Trailing-edge debounce with a max-wait: without the cap, a peer emitting
+    // faster than the window would postpone the flush forever and freeze the
+    // board exactly when the most is happening.
+    const wait = Date.now() - firstPending > 1000 ? 0 : 150;
     timer = setTimeout(() => {
+      firstPending = 0;
       loadSidebar();
-      if (!ws || ws === currentWs) render();
-    }, 150);
+      const mine = pending.has(undefined) || pending.has(currentWs);
+      pending.clear();
+      if (mine) render();
+    }, wait);
   });
   // A workspace was registered live (e.g. `amt init` elsewhere) — refresh the
   // sidebar, and re-render the Inbox since it spans every workspace (AMT-10).
