@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.davidb3l/ametrite",
+  "title": "Ametrite",
+  "description": "Issues + knowledge base of the Sothis suite. Claude Code stdio MCP; Windows, macOS, Linux.",
+  "version": "0.2.0",
+  "websiteUrl": "https://ametrite.com",
+  "repository": {
+    "url": "https://github.com/Davidb3l/Ametrite",
+    "source": "github",
+    "id": "1287639581"
+  },
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "com.github": {
+        "serverDisplayName": "Ametrite"
+      },
+      "com.ametrite": {
+        "suite": "Sothis suite — Sirius Forester (foreman), Hayvenhurst (code graph), Ametrite (board), Catryna Wikinelli (docs), PingMyBell (the bell)",
+        "role": "issues + knowledge base",
+        "cli": "amt",
+        "mcpCommand": "amt mcp",
+        "transport": "stdio",
+        "platforms": ["windows-x64", "macos-x64", "macos-arm64", "linux-x64", "linux-arm64"],
+        "clients": ["Claude Code", "any MCP client that speaks stdio JSON-RPC"],
+        "install": "Prebuilt binaries on GitHub Releases (cargo-dist): amt-x86_64-pc-windows-msvc.zip + .sha256, or amt-installer.ps1. Then: claude mcp add ametrite -- amt mcp",
+        "projectScopeConfig": "A repo-root .mcp.json with { \"mcpServers\": { \"ametrite\": { \"command\": \"amt\", \"args\": [\"mcp\"] } } } makes the server auto-discoverable to any agent that opens the repo.",
+        "requires": "an .ametrite/ workspace in (or above) the working directory — create one with `amt init`",
+        "license": "MIT"
+      }
+    }
+  }
+}
