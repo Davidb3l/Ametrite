@@ -38,6 +38,38 @@ This workspace is shared between humans and AI agents. Follow this etiquette.
    summary comment; don't post a duplicate one).
 7. **Cooldown**: `claim_next_issue` won't re-serve you an issue you released within the
    last hour, so loops that release to `todo` naturally move on to fresh work.
+8. **Hand off**: before you stop, leave a handoff note (below). Step 0 of the next
+   session reads it.
+
+## Session handoffs
+
+The board records *what* happened; a handoff records the part it can't — "we stopped
+mid-refactor, the gotcha is X, the next step is Y". Write one at the end of every
+session (and before any long pause):
+
+```sh
+amt note create --title "Handoff 2026-08-25" --tag handoff -b "..."
+```
+
+(`create_note` with `tags: ["handoff"]` on MCP. The author is `$AMT_AGENT`.)
+
+Cover four things, in two paragraphs at most — this is a handoff, not a diary:
+
+- where work stopped mid-stream, and what state it's in;
+- anything you decided but did NOT record as a decision (and why not);
+- gotchas you discovered the hard way;
+- the concrete next step.
+
+Wikilink every issue you touched (`[[AMT-42]]`) so the note joins the link graph and
+shows up in those issues' backlinks.
+
+**Reading one**: `brief` puts the latest handoff in front of you at session start
+(`amt note list --tag handoff` / `search` finds older ones). Honor it — then verify
+before you act on it. A handoff is context from a session that has already ended, not
+a script to replay.
+
+**Never edit an old handoff.** They are append-only history: write a new one. They are
+workspace-scoped, so work spanning several repos leaves one handoff per board.
 
 ## Rules
 

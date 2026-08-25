@@ -2902,6 +2902,8 @@ pub const BRIEF_ACTIVITY_LIMIT: i64 = 25;
 /// Max rows the `my_work` / `in_flight` sections carry before truncating (and
 /// saying so in `dropped`).
 pub const BRIEF_ISSUE_LIMIT: i64 = 50;
+/// Max decisions a brief carries (newest first).
+pub const BRIEF_DECISION_LIMIT: i64 = 20;
 /// Max top-of-backlog rows a brief carries.
 pub const BRIEF_BACKLOG_LIMIT: i64 = 5;
 /// Requeue cooldown used for the backlog preview. Matches `claim`'s default so
@@ -2945,8 +2947,18 @@ pub fn resolve_since(conn: &Connection, spec: &str) -> Result<String> {
         return Err(invalid());
     }
     if let Some(secs) = duration_secs(spec) {
+        // Own query rather than `iso_plus_secs`: a duration far enough out of
+        // range makes SQLite return NULL, and this branch must answer that with
+        // the same "invalid since" message, not a column-type error.
         let now = db::now(conn)?;
-        return iso_plus_secs(conn, &now, -secs);
+        let modifier = format!("-{secs} seconds");
+        return conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, ?2)",
+                params![now, modifier],
+                |r| r.get::<_, Option<String>>(0),
+            )?
+            .ok_or_else(invalid);
     }
     // A bare number is a missing unit, not a Julian day — SQLite would happily
     // read `72` as one and hand back a date in 4713 BC.
@@ -2996,6 +3008,19 @@ fn latest_handoff(conn: &Connection) -> Result<Option<Doc>> {
     id.map(|id| get_doc(conn, &id)).transpose()
 }
 
+/// Truncate `rows` to `limit` and name the cut in `dropped`. A section silently
+/// cut to N rows reads as "that's all there is" — the exact lie a brief exists
+/// to prevent. The message doesn't claim a total: sections are over-fetched by
+/// one to *detect* truncation, so how many rows exist beyond the cap is
+/// deliberately unknown rather than guessed at.
+fn cap_rows<T>(rows: &mut Vec<T>, limit: i64, section: &str, dropped: &mut Vec<String>) {
+    let limit = limit.max(0) as usize;
+    if rows.len() > limit {
+        rows.truncate(limit);
+        dropped.push(format!("{section} (capped at {limit}; more rows exist)"));
+    }
+}
+
 /// Every issue key `agent` currently holds a live claim on, open statuses only
 /// (matching `list_issues`' default exclusion of done/canceled).
 fn claimed_keys(conn: &Connection, agent: &str) -> Result<std::collections::HashSet<String>> {
@@ -3020,7 +3045,10 @@ fn brief_size(b: &Brief) -> usize {
 /// it at every session start costs the board nothing.
 ///
 /// `since` accepts an ISO-8601 instant or a duration (`24h`, `7d`); it defaults
-/// to [`BRIEF_DEFAULT_SINCE`]. `budget` (chars) drops whole low-value sections:
+/// to [`BRIEF_DEFAULT_SINCE`]. `budget` is a target, not a guarantee: it drops
+/// whole low-value sections until the brief fits, but stops when only the
+/// untrimmable core is left, so a budget below that floor is still exceeded.
+/// The drop order is:
 /// (1) top-of-backlog, (2) the activity tail (oldest first), (3) decisions,
 /// (4) in-flight rows — never `my_work` and never the handoff note, the two
 /// things a returning agent cannot reconstruct. Each cut is named in `dropped`.
@@ -3032,21 +3060,7 @@ pub fn brief(
 ) -> Result<Brief> {
     let since = resolve_since(conn, since.unwrap_or(BRIEF_DEFAULT_SINCE))?;
 
-    // Caps are recorded like budget cuts: a section silently cut to N rows
-    // reads as "that's all there is", which is exactly the lie a brief exists
-    // to prevent. `cap` truncates and names the cut.
     let mut dropped: Vec<String> = Vec::new();
-    let mut cap = |rows: &mut Vec<Issue>, limit: i64, section: &str| {
-        let limit = limit.max(0) as usize;
-        if rows.len() > limit {
-            dropped.push(format!(
-                "{section} ({} of {} rows)",
-                rows.len() - limit,
-                rows.len()
-            ));
-            rows.truncate(limit);
-        }
-    };
 
     // Fetch one past the cap so truncation is detectable rather than assumed.
     let mut my_work = list_issues(
@@ -3057,7 +3071,7 @@ pub fn brief(
             ..Default::default()
         },
     )?;
-    cap(&mut my_work, BRIEF_ISSUE_LIMIT, "my_work");
+    cap_rows(&mut my_work, BRIEF_ISSUE_LIMIT, "my_work", &mut dropped);
     // Every key alice holds — computed independently of the capped list above,
     // so a truncated `my_work` can't leak her own 51st issue into `in_flight`
     // or the backlog preview.
@@ -3079,9 +3093,15 @@ pub fn brief(
     .into_iter()
     .filter(|i| !mine.contains(&i.id))
     .collect();
-    cap(&mut in_flight, BRIEF_ISSUE_LIMIT, "in_flight");
+    cap_rows(&mut in_flight, BRIEF_ISSUE_LIMIT, "in_flight", &mut dropped);
 
-    let activity = recent_activity(conn, &since, BRIEF_ACTIVITY_LIMIT)?;
+    let mut activity = recent_activity(conn, &since, BRIEF_ACTIVITY_LIMIT + 1)?;
+    cap_rows(
+        &mut activity,
+        BRIEF_ACTIVITY_LIMIT,
+        "activity",
+        &mut dropped,
+    );
 
     // list_decisions is decision_num ascending; the brief wants newest first.
     let mut decisions: Vec<Decision> = list_decisions(conn, None, false)?
@@ -3089,6 +3109,12 @@ pub fn brief(
         .filter(|d| d.created_at.as_str() >= since.as_str())
         .collect();
     decisions.reverse();
+    cap_rows(
+        &mut decisions,
+        BRIEF_DECISION_LIMIT,
+        "decisions",
+        &mut dropped,
+    );
 
     let handoff = latest_handoff(conn)?;
     // An issue whose lease died is claimable again, so an agent whose OWN lease

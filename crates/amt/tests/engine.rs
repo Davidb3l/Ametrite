@@ -3151,7 +3151,9 @@ fn brief_caps_rows_and_says_so_without_starving_other_agents() {
     let b = store::brief(&conn, "alice", None, None).unwrap();
     assert_eq!(b.my_work.len(), 50, "my_work is capped");
     assert!(
-        b.dropped.iter().any(|d| d.starts_with("my_work (1 of 51")),
+        b.dropped
+            .iter()
+            .any(|d| d.starts_with("my_work (capped at 50")),
         "the cap must be named: {:?}",
         b.dropped
     );
@@ -3163,4 +3165,57 @@ fn brief_caps_rows_and_says_so_without_starving_other_agents() {
             .collect::<Vec<_>>(),
         vec!["AMT-52"]
     );
+}
+
+#[test]
+fn brief_names_its_activity_and_decision_caps() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Host", "", "medium")).unwrap();
+    // Past both the activity cap (25) and the decision cap (20).
+    for n in 0..30 {
+        store::add_comment(&mut conn, "AMT-1", "alice", &format!("note {n}")).unwrap();
+        store::record_decision(
+            &mut conn,
+            store::NewDecision {
+                title: format!("Call {n}"),
+                body: String::new(),
+                resolves: "AMT-1".into(),
+                status: "accepted".into(),
+                supersedes: None,
+                author: "alice".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    assert_eq!(b.activity.len(), 25);
+    assert_eq!(b.decisions.len(), 20);
+    // Both caps are stated — a silently truncated section reads as "that's all".
+    assert!(
+        b.dropped
+            .iter()
+            .any(|d| d.starts_with("activity (capped at 25")),
+        "{:?}",
+        b.dropped
+    );
+    assert!(
+        b.dropped
+            .iter()
+            .any(|d| d.starts_with("decisions (capped at 20")),
+        "{:?}",
+        b.dropped
+    );
+    // The cap keeps the NEWEST rows, not the first page of the oldest.
+    assert_eq!(b.decisions[0].title, "Call 29");
+}
+
+#[test]
+fn since_rejects_an_out_of_range_duration_without_leaking_a_db_error() {
+    let (_d, conn) = workspace();
+    let err = store::resolve_since(&conn, "999999999999d")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid since"), "got: {err}");
+    assert!(!err.contains("column type"), "raw DB error leaked: {err}");
 }

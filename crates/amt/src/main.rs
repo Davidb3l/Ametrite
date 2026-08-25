@@ -165,8 +165,10 @@ enum Cmd {
         /// duration like 24h / 7d (default: 72h)
         #[arg(long)]
         since: Option<String>,
-        /// Hard cap on total serialized chars; drops whole low-value sections
-        /// first (backlog, then activity tail, then decisions, then in-flight)
+        /// Target size in serialized chars; drops whole low-value sections
+        /// until it fits (backlog, then the activity tail, then decisions,
+        /// then in-flight). Your own work and the handoff note always survive,
+        /// so a budget below that floor is still exceeded
         #[arg(long)]
         budget: Option<i64>,
     },
@@ -427,7 +429,11 @@ enum NoteCmd {
         #[arg(long, short = 'b')]
         body: String,
     },
-    List,
+    List {
+        /// Only notes carrying this tag (e.g. `--tag handoff`)
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -844,7 +850,7 @@ fn print_brief(b: &Brief) {
         println!("\nnothing claimed, nothing in flight, no recent activity");
     }
     if let Some(budget) = b.budget {
-        println!("\nbudget: {budget} chars");
+        println!("\nbudget: {budget} chars (target)");
     }
     if !b.dropped.is_empty() {
         println!("\nnot shown: {}", b.dropped.join(", "));
@@ -1493,8 +1499,13 @@ fn run(cli: Cli) -> Result<()> {
                         println!("appended to {}", doc.id);
                     }
                 }
-                NoteCmd::List => {
-                    let docs = store::list_docs(&conn, "note")?;
+                NoteCmd::List { tag } => {
+                    let mut docs = store::list_docs(&conn, "note")?;
+                    if let Some(tag) = tag {
+                        // Tags are stored lowercased, so match that way.
+                        let tag = tag.to_lowercase();
+                        docs.retain(|d| d.tags.contains(&tag));
+                    }
                     if cli.json {
                         print_json(&docs);
                     } else {

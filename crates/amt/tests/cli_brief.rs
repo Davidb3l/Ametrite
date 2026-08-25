@@ -127,3 +127,28 @@ fn brief_takes_no_lease_and_writes_no_activity() {
     let after = stdout(&amt(&repo, &reg, &["--json", "issue", "show", "BT-1"]));
     assert_eq!(before, after, "brief must not mutate the workspace");
 }
+
+#[test]
+fn note_list_filters_by_tag() {
+    let (_root, reg, repo) = workspace();
+    for (title, tag) in [
+        ("Handoff Thursday", "handoff"),
+        ("Handoff Friday", "Handoff"), // tags are case-insensitive
+        ("Architecture", "design"),
+    ] {
+        assert!(amt(
+            &repo,
+            &reg,
+            &["note", "create", "--title", title, "--tag", tag]
+        )
+        .status
+        .success());
+    }
+    let out = amt(&repo, &reg, &["note", "list", "--tag", "handoff"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let listed = stdout(&out);
+    assert!(listed.contains("Handoff Thursday") && listed.contains("Handoff Friday"));
+    assert!(!listed.contains("Architecture"), "got: {listed}");
+    // Unfiltered still lists everything.
+    assert!(stdout(&amt(&repo, &reg, &["note", "list"])).contains("Architecture"));
+}

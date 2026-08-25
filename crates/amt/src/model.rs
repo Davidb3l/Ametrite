@@ -294,10 +294,11 @@ pub struct ClaimOverlap {
 /// happened, why it happened, the last narrative handoff, and what to pick up
 /// next. Read-only and composed entirely from existing store reads.
 ///
-/// `--budget <chars>` drops whole low-value sections in a fixed order (backlog,
-/// then the activity tail, then decisions, then in-flight); `my_work` and the
-/// handoff note are never dropped, and every cut — including a section merely
-/// capped at its row limit — is named in `dropped`.
+/// `--budget <chars>` is a target, not a guarantee: it drops whole low-value
+/// sections in a fixed order (backlog, then the activity tail, then decisions,
+/// then in-flight) until the brief fits, but `my_work` and the handoff note are
+/// never dropped, so a budget below that floor is still exceeded. Every cut —
+/// including a section merely capped at its row limit — is named in `dropped`.
 #[derive(Debug, Serialize)]
 pub struct Brief {
     /// Agent the brief is scoped to (`my_work`, claim-order preview).

@@ -121,8 +121,13 @@ claude mcp add ametrite -- amt mcp
 
 **Claude Code skill** — this repo ships `.claude/skills/ametrite/`, picked up automatically
 inside the repo (copy to `~/.claude/skills/` for global use). It teaches agents the claim
-loop, decision recording, and wikilink etiquette. [AGENTS.md](AGENTS.md) documents the same
-conventions for any agent.
+loop, decision recording, handoff notes, and wikilink etiquette. [AGENTS.md](AGENTS.md)
+documents the same conventions for any agent.
+
+**Session continuity** — a session ends by writing a handoff note (`amt note create --tag
+handoff -b "where we stopped, the gotcha, the next step"`); the next one starts with `amt
+brief`, which puts that note — plus your open claims, what's in flight, and recent
+activity and decisions — in front of the agent in a single read-only call.
 
 **CLI loops** — `--json` everywhere. Note that "nothing claimable" returns
 `{"claimed": false, ...}` with exit code 0, so test the payload:
@@ -149,7 +154,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt claim` / `amt release` | Atomic claim-loop primitives (`--peek`, `--project`, `--label`, `--all-workspaces`). Operator resets: `release --force --no-cooldown` |
 | `amt dep add/rm/list` | Blocker → blocked dependencies (cycle-checked; blocked issues aren't claimable) |
 | `amt decide` / `amt decision list/show` | Record ADR-style decisions against issues; supersede old ones |
-| `amt note create/show/append/list` | Knowledge base (`--dedupe` warns on near-duplicate titles) |
+| `amt note create/show/append/list` | Knowledge base (`--dedupe` warns on near-duplicate titles; `list --tag`) |
 | `amt project create/list` | Projects (first-class, wikilinkable documents) |
 | `amt search <terms>` | FTS5 full-text search (`--type`, `--tag`, `--all-workspaces`) |
 | `amt context <key>` | One-bundle context read for an issue, with an optional char `--budget` |

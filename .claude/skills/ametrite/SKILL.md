@@ -53,12 +53,26 @@ amt issue update AMT-7 [--status in_review] [--priority high] [-b "new body"] [-
 amt issue comment AMT-7 -m "finding or progress note" --author $AMT_AGENT
 amt note create --title "..." -b "markdown" [--tag X]... --json
 amt note append <note-id> -b "## New section\n..."
+amt note list [--tag handoff] --json
+amt brief [--agent $AMT_AGENT] [--since 24h] [--budget 4000] --json   # session-start orientation
 amt search <terms> [--type issue|note|decision|project] [--tag X] --json   # FTS5; last term prefix-matches
 amt backlinks <id> --json            # who links here
 amt doctor                           # unresolved links, stale claims, dangling decisions
 ```
 
 ## The agent work loop
+
+Start every session with one read-only orientation read:
+
+```sh
+amt brief --agent $AMT_AGENT --json
+```
+
+It answers "where did the last session leave off?" in one call: the issues you already
+hold (with lease expiry), what's in flight elsewhere, recent activity, the decisions
+behind it, the latest handoff note in full, and the top of the claim queue. It takes no
+lease and writes nothing. `--since 24h` narrows the window; `--budget <chars>` caps the
+size. Then claim:
 
 ```sh
 amt claim --agent $AMT_AGENT [--project X] [--label Y] [--ttl 900] --json
@@ -102,9 +116,35 @@ amt decide --issue AMT-7 --title "Use SQLite as source of truth" --author $AMT_A
 - Before making a choice, check precedent: `amt decision list [--issue AMT-7]` and
   `amt search <topic> --type decision`.
 
+## Session handoffs (the narrative the board can't hold)
+
+The board records *what* happened. A handoff records what it can't: "we stopped
+mid-refactor, the gotcha is X, the next step is Y." Write one at the end of every
+session, and before any long pause:
+
+```sh
+amt note create --title "Handoff 2026-08-25" --tag handoff -b "Stopped halfway through
+the token-refresh rewrite on [[PG-14]]: the new path is written and unit-tested, the old
+one is still wired up. Gotcha: the refresh endpoint returns 200 with an error body, so
+status-code-only checks pass on failure. Leaned toward retry-once-then-fail but did not
+record it as a decision — wanted a second opinion first.
+
+Next step: flip the call site in auth/session.ts and run the integration suite."
+```
+
+- Two paragraphs at most — a handoff, not a diary. Cover: where work stopped and in what
+  state; anything decided but NOT yet recorded as a decision; gotchas found the hard way;
+  the concrete next step.
+- Wikilink every issue you touched (`[[AMT-29]]`) so the note joins the link graph.
+- Read one at session start: `amt brief` puts the latest in front of you (older ones:
+  `amt note list --tag handoff`). Honor it, then verify — it is context from a session
+  that already ended, not a script to replay.
+- Never edit an old handoff; write a new one. They are append-only history, and
+  workspace-scoped, so multi-repo work leaves one per board.
+
 ## Other surfaces
 
-- MCP server (15 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
+- MCP server (24 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
 - Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776 —
   one board serves every registered workspace (sidebar switcher; `amt ws list`).
 - Obsidian round-trip: `amt export <dir>` / `amt import <dir>`.

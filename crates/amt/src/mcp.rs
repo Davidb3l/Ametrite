@@ -630,7 +630,7 @@ fn tool_defs() -> Vec<Value> {
         tool("brief", "Session-start orientation bundle for the whole workspace (the sibling of get_context, which is per-issue): the issues you hold with their lease expiry, what other agents have in flight, recent activity, the decisions behind it, the latest handoff note in full, and the next issues claim would serve you. Read-only — takes no lease and writes no activity. Call this FIRST in a fresh session, before claiming.",
             json!({ "agent": s("Agent to scope 'my work' and the claim-order preview to"),
                     "since": s("Window for activity + decisions: ISO-8601 instant or a duration like 24h / 7d (default 72h)"),
-                    "budget": i("Hard cap on total serialized characters; drops whole low-value sections first (backlog, activity tail, decisions, in-flight) and names each cut in 'dropped'. Your claimed work and the handoff note are never dropped.") }),
+                    "budget": i("Target size in serialized characters; drops whole low-value sections until it fits (backlog, activity tail, decisions, in-flight) and names each cut in 'dropped'. Your claimed work and the handoff note are never dropped, so a budget below that floor is still exceeded.") }),
             &[]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
