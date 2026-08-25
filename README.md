@@ -5,8 +5,7 @@ knowledge base for Claude Code AI agent workflows** — think Linear + Obsidian 
 SQLite file, driven by a single Rust binary (`amt`) that is both a CLI and an MCP
 server. No cloud, no accounts, no embeddings.
 
-<!-- When github.com/Davidb3l/sothis-suite is published, retarget this link to it. -->
-> **Part of the [Sothis suite](https://github.com/Davidb3l/Sirius-Forester)** — the
+> **Part of the [Sothis suite](https://github.com/Davidb3l/Sothis)** — the
 > local-first fleet for Claude Code agents:
 > [Sirius Forester](https://siriusforester.com) (foreman) ·
 > [Hayvenhurst](https://hayvenhurst.dev) (code graph) ·
