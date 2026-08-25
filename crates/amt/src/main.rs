@@ -153,6 +153,23 @@ enum Cmd {
         #[arg(long)]
         budget: Option<i64>,
     },
+    /// Session-start orientation bundle: what you hold, what's in flight,
+    /// what just happened and why, the latest handoff note, and what to claim
+    /// next (read-only — takes no lease and writes no activity)
+    Brief {
+        /// Agent to scope "my work" and the claim-order preview to
+        /// (default: $AMT_AGENT or $USER)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Window for recent activity + decisions: an ISO-8601 instant or a
+        /// duration like 24h / 7d (default: 72h)
+        #[arg(long)]
+        since: Option<String>,
+        /// Hard cap on total serialized chars; drops whole low-value sections
+        /// first (backlog, then activity tail, then decisions, then in-flight)
+        #[arg(long)]
+        budget: Option<i64>,
+    },
     /// Show documents that link to the given document
     Backlinks { id: String },
     /// Check workspace health (unresolved links, stale claims, missing refs)
@@ -750,6 +767,90 @@ fn print_context_pack(pack: &ContextPack) {
     }
 }
 
+/// One line's worth of an activity body: whole if short, else cut to `max`
+/// chars with an ellipsis. Human output only — `--json` always carries the full
+/// text (the char `--budget` is what bounds machine reads).
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{}…", head.trim_end())
+}
+
+/// Human rendering of a session brief: sections in the documented order, empty
+/// ones omitted entirely. An empty workspace still prints a header and exits 0
+/// — "nothing is happening" is a state, not an error.
+fn print_brief(b: &Brief) {
+    println!("brief for @{} — since {}", b.agent, b.since);
+    if !b.my_work.is_empty() {
+        println!("\n=== my work ===");
+        for i in &b.my_work {
+            let lease = match &i.claim_expires_at {
+                Some(exp) => format!("  (lease expires {exp})"),
+                None => String::new(),
+            };
+            println!("{}{}", issue_line(i), lease);
+        }
+    }
+    if !b.in_flight.is_empty() {
+        println!("\n=== in flight (elsewhere) ===");
+        for i in &b.in_flight {
+            println!("{}", issue_line(i));
+        }
+    }
+    if !b.activity.is_empty() {
+        println!("\n=== recent activity ===");
+        for e in &b.activity {
+            println!(
+                "{}  {:<8} @{}: {}",
+                e.at,
+                e.id,
+                e.author,
+                ellipsize(&e.body.replace('\n', " "), 200)
+            );
+        }
+    }
+    if !b.decisions.is_empty() {
+        println!("\n=== recent decisions ===");
+        for d in &b.decisions {
+            println!(
+                "{:<6} {} (resolves {}, {})",
+                d.id, d.title, d.resolves, d.status
+            );
+        }
+    }
+    if let Some(h) = &b.handoff {
+        println!("\n=== latest handoff: {} ({}) ===", h.title, h.created_at);
+        if let Some(body) = &h.body {
+            if !body.trim().is_empty() {
+                println!("{}", body.trim_end());
+            }
+        }
+    }
+    if !b.backlog.is_empty() {
+        println!("\n=== next up (claim order) ===");
+        for i in &b.backlog {
+            println!("{}", issue_line(i));
+        }
+    }
+    if b.my_work.is_empty()
+        && b.in_flight.is_empty()
+        && b.activity.is_empty()
+        && b.decisions.is_empty()
+        && b.handoff.is_none()
+        && b.backlog.is_empty()
+    {
+        println!("\nnothing claimed, nothing in flight, no recent activity");
+    }
+    if let Some(budget) = b.budget {
+        println!("\nbudget: {budget} chars");
+    }
+    if !b.dropped.is_empty() {
+        println!("\nnot shown: {}", b.dropped.join(", "));
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init { name, prefix } => {
@@ -842,6 +943,7 @@ fn run(cli: Cli) -> Result<()> {
                     project: project.clone(),
                     label: label.clone(),
                     claimed: None,
+                    claimed_by: None,
                     include_closed: *all,
                     limit: *limit,
                 };
@@ -931,6 +1033,7 @@ fn run(cli: Cli) -> Result<()> {
                         project: project.clone(),
                         label: label.clone(),
                         claimed: None,
+                        claimed_by: None,
                         include_closed: *all,
                         limit: *limit,
                     };
@@ -1504,6 +1607,21 @@ fn run(cli: Cli) -> Result<()> {
                 print_json(&pack);
             } else {
                 print_context_pack(&pack);
+            }
+            Ok(())
+        }
+        Cmd::Brief {
+            agent,
+            since,
+            budget,
+        } => {
+            let conn = open_workspace(&cli.workspace)?;
+            let agent = identity(agent);
+            let brief = store::brief(&conn, &agent, since.as_deref(), budget)?;
+            if cli.json {
+                print_json(&brief);
+            } else {
+                print_brief(&brief);
             }
             Ok(())
         }

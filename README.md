@@ -111,8 +111,9 @@ mutations shell out to `amt --json`, so business logic lives in exactly one plac
 
 ## Using it with AI agents
 
-**MCP** — `amt mcp` is a stdio MCP server exposing 23 tools (issues, claims, notes,
-decisions, dependencies, search, context bundles, stats, events, git commits):
+**MCP** — `amt mcp` is a stdio MCP server exposing 24 tools (issues, claims, notes,
+decisions, dependencies, search, context bundles, session briefs, stats, events, git
+commits):
 
 ```sh
 claude mcp add ametrite -- amt mcp
@@ -127,6 +128,7 @@ conventions for any agent.
 `{"claimed": false, ...}` with exit code 0, so test the payload:
 
 ```sh
+amt brief --agent worker-1   # where did the last session leave off? (read-only)
 while id=$(amt --json claim --agent worker-1 | jq -r '.id // empty'); [ -n "$id" ]; do
   amt context "$id"        # issue + activity + decisions + backlinked docs + related hits
   # … do the work …
@@ -151,6 +153,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt project create/list` | Projects (first-class, wikilinkable documents) |
 | `amt search <terms>` | FTS5 full-text search (`--type`, `--tag`, `--all-workspaces`) |
 | `amt context <key>` | One-bundle context read for an issue, with an optional char `--budget` |
+| `amt brief` | Session-start orientation bundle for the whole workspace: your claims, what's in flight, recent activity + decisions, the latest handoff note, and what to claim next (`--agent`, `--since`, `--budget`) |
 | `amt backlinks <id>` | Reverse link graph |
 | `amt agents` / `amt stats` / `amt events` | Agent roster, throughput metrics, NDJSON activity stream |
 | `amt branch <key>` | Create + check out a git branch named for an issue |

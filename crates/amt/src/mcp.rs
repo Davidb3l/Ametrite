@@ -173,6 +173,7 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 project: opt_s(&args, "project"),
                 label: opt_s(&args, "label"),
                 claimed: args.get("claimed").and_then(|v| v.as_bool()),
+                claimed_by: opt_s(&args, "claimed_by"),
                 include_closed: args
                     .get("include_closed")
                     .and_then(|v| v.as_bool())
@@ -457,6 +458,15 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             let budget = opt_i(&args, "budget");
             text_result(id.clone(), &run!(store::context_pack(conn, &key, budget)))
         }
+        "brief" => {
+            let agent = agent_of(&args);
+            let since = opt_s(&args, "since");
+            let budget = opt_i(&args, "budget");
+            text_result(
+                id.clone(),
+                &run!(store::brief(conn, &agent, since.as_deref(), budget)),
+            )
+        }
         "get_backlinks" => text_result(
             id.clone(),
             &run!(store::backlinks(conn, &try_arg!(req("id")))),
@@ -556,6 +566,7 @@ fn tool_defs() -> Vec<Value> {
         tool("list_issues", "List issues with filters. Excludes done/canceled unless include_closed.",
             json!({ "status": status, "assignee": s("Filter by assignee"), "project": s("Filter by project slug"),
                     "label": s("Filter by label"), "claimed": b("Filter by claimed state"),
+                    "claimed_by": s("Only issues currently claimed by this agent"),
                     "include_closed": b("Include done/canceled"), "limit": i("Max results (default 50)") }),
             &[]),
         tool("get_issue", "Get one issue with body, activity log, and backlinks.",
@@ -616,6 +627,11 @@ fn tool_defs() -> Vec<Value> {
             json!({ "id": s("Issue key, e.g. AMT-7"),
                     "budget": i("Hard cap on total serialized characters; drops lowest-relevance items first") }),
             &["id"]),
+        tool("brief", "Session-start orientation bundle for the whole workspace (the sibling of get_context, which is per-issue): the issues you hold with their lease expiry, what other agents have in flight, recent activity, the decisions behind it, the latest handoff note in full, and the next issues claim would serve you. Read-only — takes no lease and writes no activity. Call this FIRST in a fresh session, before claiming.",
+            json!({ "agent": s("Agent to scope 'my work' and the claim-order preview to"),
+                    "since": s("Window for activity + decisions: ISO-8601 instant or a duration like 24h / 7d (default 72h)"),
+                    "budget": i("Hard cap on total serialized characters; drops whole low-value sections first (backlog, activity tail, decisions, in-flight) and names each cut in 'dropped'. Your claimed work and the handoff note are never dropped.") }),
+            &[]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
         tool("list_agents", "Agent roster (fleet visibility): each agent's live leases, soonest lease expiry, last activity time, and lifetime claim/completion counts.",

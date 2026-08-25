@@ -11,6 +11,12 @@ This workspace is shared between humans and AI agents. Follow this etiquette.
 
 ## The loop
 
+0. **Orient** (start of every session): `brief` (MCP) or `amt brief --agent <you>` —
+   one read-only bundle answering "where did the last session leave off?": the issues
+   you already hold (with lease expiry), what other agents have in flight, recent
+   activity, the decisions behind it, the latest handoff note in full, and the top of
+   the claim queue. `--since 24h` narrows the window; `--budget <chars>` caps the size.
+   It takes no lease and writes nothing, so it is always safe to run.
 1. **Claim**: `claim_next_issue` (MCP) or `amt claim --agent <you>` — atomically picks the
    highest-priority claimable issue, sets it `in_progress`, and grants you a lease
    (default 15 min). You will never receive an issue another agent holds.

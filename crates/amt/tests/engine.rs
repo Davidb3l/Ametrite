@@ -2885,3 +2885,282 @@ fn a_v1_archive_migrates_and_keeps_its_rows() {
         .unwrap();
     assert_eq!(n, 2);
 }
+
+// ---------- session-start brief (AMT-29) ----------
+
+/// Workspace with: one issue claimed by `alice`, one in_progress held by
+/// `bob`, one unclaimed `in_review`, two claimable backlog issues, a decision,
+/// two handoff notes (one older), and a plain note that must not be mistaken
+/// for a handoff.
+fn brief_fixture() -> (TempDir, Connection) {
+    let (d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Alice work", "body", "high")).unwrap(); // AMT-1
+    store::create_issue(&mut conn, new_issue("Bob work", "body", "high")).unwrap(); // AMT-2
+    store::create_issue(&mut conn, new_issue("Awaiting review", "body", "medium")).unwrap(); // AMT-3
+    store::create_issue(&mut conn, new_issue("Next up", "body", "urgent")).unwrap(); // AMT-4
+    store::create_issue(&mut conn, new_issue("After that", "body", "low")).unwrap(); // AMT-5
+
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::claim_issue(&mut conn, "AMT-2", "bob", 900).unwrap();
+    store::update_issue(
+        &mut conn,
+        "AMT-3",
+        store::IssuePatch {
+            status: Some("in_review".into()),
+            ..Default::default()
+        },
+        "alice",
+    )
+    .unwrap();
+
+    store::record_decision(
+        &mut conn,
+        store::NewDecision {
+            title: "Lease TTL stays 15 minutes".into(),
+            body: "Longer leases hide dead agents.".into(),
+            resolves: "AMT-1".into(),
+            status: "accepted".into(),
+            supersedes: None,
+            author: "alice".into(),
+        },
+    )
+    .unwrap();
+
+    let mut older = new_note("Handoff Monday", "Stopped mid-migration.");
+    older.tags = vec!["handoff".into()];
+    store::create_doc(&mut conn, older).unwrap();
+    let mut latest = new_note("Handoff Tuesday", "Stopped mid-refactor of [[AMT-1]].");
+    latest.tags = vec!["handoff".into()];
+    store::create_doc(&mut conn, latest).unwrap();
+    store::create_doc(&mut conn, new_note("Just a note", "Not a handoff.")).unwrap();
+    (d, conn)
+}
+
+#[test]
+fn brief_bundles_my_work_in_flight_activity_decisions_handoff_and_backlog() {
+    let (_d, conn) = brief_fixture();
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+
+    assert_eq!(b.agent, "alice");
+    // My work: what alice holds, with the lease she has to renew.
+    assert_eq!(
+        b.my_work.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["AMT-1"]
+    );
+    assert_eq!(b.my_work[0].claimed_by.as_deref(), Some("alice"));
+    assert!(b.my_work[0].claim_expires_at.is_some());
+
+    // In flight: bob's claim and the unclaimed in_review — but NOT alice's own
+    // issue, which is already accounted for in my_work.
+    let flight: Vec<&str> = b.in_flight.iter().map(|i| i.id.as_str()).collect();
+    assert!(
+        flight.contains(&"AMT-2") && flight.contains(&"AMT-3"),
+        "{flight:?}"
+    );
+    assert!(
+        !flight.contains(&"AMT-1"),
+        "own work must not be duplicated"
+    );
+
+    // Activity: most recent first.
+    assert!(!b.activity.is_empty());
+    let cursors: Vec<i64> = b.activity.iter().map(|e| e.cursor).collect();
+    let mut sorted = cursors.clone();
+    sorted.sort_by(|a, x| x.cmp(a));
+    assert_eq!(cursors, sorted, "activity must be newest-first");
+
+    // Decisions: title + the issue each resolves.
+    assert_eq!(b.decisions.len(), 1);
+    assert_eq!(b.decisions[0].id, "D-1");
+    assert_eq!(b.decisions[0].resolves, "AMT-1");
+
+    // Handoff: the most recent tagged note, in full.
+    let handoff = b.handoff.expect("handoff note");
+    assert_eq!(handoff.title, "Handoff Tuesday");
+    assert!(handoff.body.unwrap().contains("mid-refactor"));
+
+    // Top of backlog, in claim order: urgent before low; claimed and in_review
+    // issues are not claimable and must not appear.
+    assert_eq!(
+        b.backlog.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["AMT-4", "AMT-5"]
+    );
+    assert!(b.dropped.is_empty() && b.budget.is_none());
+}
+
+#[test]
+fn brief_is_read_only() {
+    let (_d, conn) = brief_fixture();
+    let before = store::events_cursor(&conn).unwrap();
+    let claim_before = store::get_issue(&conn, "AMT-4").unwrap();
+    store::brief(&conn, "alice", None, None).unwrap();
+    // No activity written, no lease taken on the issue it previewed.
+    assert_eq!(store::events_cursor(&conn).unwrap(), before);
+    let claim_after = store::get_issue(&conn, "AMT-4").unwrap();
+    assert!(claim_after.claimed_by.is_none() && claim_before.claimed_by.is_none());
+    assert_eq!(claim_after.status, "backlog");
+}
+
+#[test]
+fn brief_scopes_my_work_to_the_named_agent() {
+    let (_d, conn) = brief_fixture();
+    let b = store::brief(&conn, "bob", None, None).unwrap();
+    assert_eq!(
+        b.my_work.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["AMT-2"]
+    );
+    let flight: Vec<&str> = b.in_flight.iter().map(|i| i.id.as_str()).collect();
+    assert!(flight.contains(&"AMT-1"), "alice's work is bob's in-flight");
+    assert!(!flight.contains(&"AMT-2"));
+}
+
+#[test]
+fn brief_since_filters_activity_and_decisions() {
+    let (_d, conn) = brief_fixture();
+    // Backdate everything that exists so far: a fresh window must exclude it.
+    conn.execute("UPDATE activity SET at = '2020-01-01T00:00:00.000Z'", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE documents SET created_at = '2020-01-01T00:00:00.000Z' WHERE type = 'decision'",
+        [],
+    )
+    .unwrap();
+
+    let recent = store::brief(&conn, "alice", Some("24h"), None).unwrap();
+    assert!(
+        recent.activity.is_empty(),
+        "backdated activity is outside 24h"
+    );
+    assert!(recent.decisions.is_empty());
+    // …but the sections that carry no timestamp filter are untouched.
+    assert_eq!(recent.my_work.len(), 1);
+    assert!(recent.handoff.is_some());
+
+    // A window that reaches back far enough sees it again (ISO-8601 form).
+    let wide = store::brief(&conn, "alice", Some("2019-01-01"), None).unwrap();
+    assert!(!wide.activity.is_empty());
+    assert_eq!(wide.decisions.len(), 1);
+}
+
+#[test]
+fn brief_trims_backlog_then_activity_but_never_my_work_or_handoff() {
+    let (_d, conn) = brief_fixture();
+    let full = store::brief(&conn, "alice", None, None).unwrap();
+    assert!(!full.backlog.is_empty() && !full.activity.is_empty());
+
+    // A budget below the untrimmable core forces every optional section out.
+    let tiny = store::brief(&conn, "alice", None, Some(200)).unwrap();
+    assert!(tiny.backlog.is_empty(), "backlog drops first");
+    assert!(tiny.activity.is_empty());
+    assert!(tiny.decisions.is_empty());
+    assert!(tiny.in_flight.is_empty());
+    // The two things a returning agent can't reconstruct always survive.
+    assert_eq!(tiny.my_work.len(), 1, "my work is never dropped");
+    assert!(tiny.handoff.is_some(), "the handoff note is never dropped");
+    // The manifest names the cuts, backlog before activity.
+    let first_backlog = tiny.dropped.iter().position(|x| x.starts_with("backlog"));
+    let first_activity = tiny.dropped.iter().position(|x| x.starts_with("activity"));
+    assert!(
+        first_backlog.is_some() && first_activity.is_some(),
+        "{:?}",
+        tiny.dropped
+    );
+    assert!(first_backlog < first_activity, "{:?}", tiny.dropped);
+    assert_eq!(tiny.budget, Some(200));
+}
+
+#[test]
+fn brief_of_a_bare_workspace_is_empty_but_valid() {
+    let (_d, conn) = workspace();
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    assert!(b.my_work.is_empty() && b.in_flight.is_empty());
+    assert!(b.activity.is_empty() && b.decisions.is_empty() && b.backlog.is_empty());
+    assert!(b.handoff.is_none());
+    // Still serializes to one well-formed object — an empty brief is a state.
+    let v: serde_json::Value = serde_json::to_value(&b).unwrap();
+    assert!(v.is_object());
+    assert_eq!(v["agent"], "alice");
+}
+
+#[test]
+fn since_accepts_durations_and_iso_and_rejects_garbage() {
+    let (_d, conn) = workspace();
+    let now = store::resolve_since(&conn, "0s").unwrap();
+    let day = store::resolve_since(&conn, "24h").unwrap();
+    let week = store::resolve_since(&conn, "7d").unwrap();
+    assert!(week < day && day < now, "{week} < {day} < {now}");
+    // ISO-8601 instants and bare dates normalize to the stored format.
+    assert_eq!(
+        store::resolve_since(&conn, "2026-01-02T03:04:05Z").unwrap(),
+        "2026-01-02T03:04:05.000Z"
+    );
+    assert!(store::resolve_since(&conn, "2026-01-02")
+        .unwrap()
+        .starts_with("2026-01-02T00:00:00"));
+    // A bare number is a missing unit, not a Julian day.
+    assert!(store::resolve_since(&conn, "72").is_err());
+    assert!(store::resolve_since(&conn, "").is_err());
+    assert!(store::resolve_since(&conn, "yesterday").is_err());
+    assert!(store::resolve_since(&conn, "-3d").is_err());
+}
+
+#[test]
+fn brief_backlog_hides_my_own_dead_lease_but_keeps_someone_elses() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Mine, lease dead", "", "urgent")).unwrap();
+    store::create_issue(&mut conn, new_issue("Bob's, lease dead", "", "high")).unwrap();
+    // Zero-second leases: both issues are in_progress and immediately stealable.
+    store::claim_issue(&mut conn, "AMT-1", "alice", 0).unwrap();
+    store::claim_issue(&mut conn, "AMT-2", "bob", 0).unwrap();
+
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    // Alice's own expired claim is her work, not a suggestion to claim it again.
+    assert_eq!(
+        b.my_work.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["AMT-1"]
+    );
+    let backlog: Vec<&str> = b.backlog.iter().map(|i| i.id.as_str()).collect();
+    assert!(
+        !backlog.contains(&"AMT-1"),
+        "own work must not repeat: {backlog:?}"
+    );
+    // Bob's dead lease IS claimable work for alice — the section would be lying
+    // if it hid the very row `claim` would serve next.
+    assert_eq!(backlog, vec!["AMT-2"]);
+    assert_eq!(
+        store::peek_next(&conn, "alice", 0, &any())
+            .unwrap()
+            .unwrap()
+            .id,
+        "AMT-1"
+    );
+}
+
+#[test]
+fn brief_caps_rows_and_says_so_without_starving_other_agents() {
+    let (_d, mut conn) = workspace();
+    // 51 issues claimed by alice — one past the section cap — created FIRST, so
+    // a naive SQL limit applied before the self-filter would push bob out.
+    for n in 0..51 {
+        store::create_issue(&mut conn, new_issue(&format!("Alice {n}"), "", "medium")).unwrap();
+        store::claim_issue(&mut conn, &format!("AMT-{}", n + 1), "alice", 900).unwrap();
+    }
+    store::create_issue(&mut conn, new_issue("Bob's work", "", "medium")).unwrap();
+    store::claim_issue(&mut conn, "AMT-52", "bob", 900).unwrap();
+
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    assert_eq!(b.my_work.len(), 50, "my_work is capped");
+    assert!(
+        b.dropped.iter().any(|d| d.starts_with("my_work (1 of 51")),
+        "the cap must be named: {:?}",
+        b.dropped
+    );
+    // Bob's row survives despite alice's 51 claims sitting ahead of it.
+    assert_eq!(
+        b.in_flight
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["AMT-52"]
+    );
+}

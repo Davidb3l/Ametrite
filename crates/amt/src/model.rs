@@ -288,3 +288,44 @@ pub struct ClaimOverlap {
     /// When the overlapping claim happened (ISO-8601).
     pub at: String,
 }
+
+/// Workspace-level orientation bundle (`amt brief`) — the session-start sibling
+/// of [`ContextPack`]: what I hold, what everyone else holds, what just
+/// happened, why it happened, the last narrative handoff, and what to pick up
+/// next. Read-only and composed entirely from existing store reads.
+///
+/// `--budget <chars>` drops whole low-value sections in a fixed order (backlog,
+/// then the activity tail, then decisions, then in-flight); `my_work` and the
+/// handoff note are never dropped, and every cut — including a section merely
+/// capped at its row limit — is named in `dropped`.
+#[derive(Debug, Serialize)]
+pub struct Brief {
+    /// Agent the brief is scoped to (`my_work`, claim-order preview).
+    pub agent: String,
+    /// Resolved ISO-8601 lower bound for `activity` and `decisions`.
+    pub since: String,
+    /// Issues this agent currently holds a claim on (status + lease expiry).
+    pub my_work: Vec<Issue>,
+    /// Every other issue in flight — in_progress or in_review, whether an agent
+    /// still holds it (a live claim) or nobody does (released to review). What
+    /// not to duplicate. This agent's own rows live in `my_work` only.
+    pub in_flight: Vec<Issue>,
+    /// Workspace activity since `since`, most recent first, capped.
+    pub activity: Vec<EventRow>,
+    /// Decisions recorded since `since`, most recent first (titles + the issue
+    /// each resolves; bodies stay one `amt decision show` away).
+    pub decisions: Vec<Decision>,
+    /// The most recent note tagged `handoff`, with its full body — the
+    /// narrative "we stopped mid-X, the gotcha is Y" a bare board can't carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Doc>,
+    /// The next issues `claim` would serve this agent, in claim order.
+    pub backlog: Vec<Issue>,
+    /// Char budget applied, if any (echoed for the agent's benefit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<i64>,
+    /// Human-readable manifest of everything the brief left out — section row
+    /// caps first, then budget-trimming cuts in drop order. Empty when the
+    /// brief is complete.
+    pub dropped: Vec<String>,
+}

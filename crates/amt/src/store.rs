@@ -39,6 +39,8 @@ pub struct IssueFilter {
     pub project: Option<String>,
     pub label: Option<String>,
     pub claimed: Option<bool>,
+    /// Restrict to issues whose live claim is held by this agent.
+    pub claimed_by: Option<String>,
     pub include_closed: bool,
     pub limit: i64,
 }
@@ -341,6 +343,10 @@ pub fn list_issues(conn: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
             sql.push_str(" AND i.claimed_by IS NULL");
         }
     }
+    if let Some(agent) = &f.claimed_by {
+        sql.push_str(" AND i.claimed_by = ?");
+        args.push(Box::new(agent.clone()));
+    }
     sql.push_str(&format!(
         " ORDER BY {}, d.created_at LIMIT ?",
         priority_rank_sql("i.priority")
@@ -570,8 +576,34 @@ fn claimable_predicate(
     }
 }
 
-/// The best claimable issue's key, in `claim_next`'s ordering, without taking a
-/// lease. Shared by `claim_next`, `peek_next`, and the cross-workspace fan-out.
+/// The first `limit` claimable issue keys, in `claim_next`'s ordering, without
+/// taking a lease. Shared by `claim_next`, `peek_next`, the cross-workspace
+/// fan-out (limit 1) and `brief`'s top-of-backlog preview (limit N).
+fn best_claimable_keys(
+    conn: &Connection,
+    now: &str,
+    agent: &str,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    claimable_predicate(&mut sql, &mut args, now, agent, cooldown_secs, f);
+    sql.push_str(&format!(
+        " ORDER BY {}, d.created_at LIMIT ?",
+        priority_rank_sql("i.priority")
+    ));
+    args.push(Box::new(limit));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+        |r| r.get(0),
+    )?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The single best claimable issue's key (the claim/peek head of the queue).
 fn best_claimable_key(
     conn: &Connection,
     now: &str,
@@ -579,20 +611,9 @@ fn best_claimable_key(
     cooldown_secs: i64,
     f: &ClaimFilter<'_>,
 ) -> Result<Option<String>> {
-    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
-    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    claimable_predicate(&mut sql, &mut args, now, agent, cooldown_secs, f);
-    sql.push_str(&format!(
-        " ORDER BY {}, d.created_at LIMIT 1",
-        priority_rank_sql("i.priority")
-    ));
-    Ok(conn
-        .query_row(
-            &sql,
-            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-            |r| r.get(0),
-        )
-        .optional()?)
+    Ok(best_claimable_keys(conn, now, agent, cooldown_secs, f, 1)?
+        .into_iter()
+        .next())
 }
 
 pub fn claim_next(
@@ -626,6 +647,23 @@ pub fn peek_next(
         return Ok(None);
     };
     Ok(Some(load_issue(conn, &key, false)?))
+}
+
+/// Read-only: the first `limit` issues `claim` would serve, in claim order,
+/// without taking a lease or writing activity (`brief`'s top-of-backlog).
+pub fn peek_claimable(
+    conn: &Connection,
+    agent: &str,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
+    limit: i64,
+) -> Result<Vec<Issue>> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let now = db::now(conn)?;
+    let keys = best_claimable_keys(conn, &now, agent, cooldown_secs, f, limit)?;
+    keys.iter().map(|k| load_issue(conn, k, false)).collect()
 }
 
 /// Claim `key` iff it *still* satisfies the claimable predicate. Returns
@@ -2852,4 +2890,273 @@ fn canonical_cycle(ring: &[String]) -> Option<Vec<String>> {
         rot.push(ring[(start + k) % n].clone());
     }
     Some(rot)
+}
+
+// ---------- session-start brief (AMT-29) ----------
+
+/// Default `--since` window for [`brief`]: three days back covers a weekend
+/// gap without burying the reader in a fortnight of log.
+pub const BRIEF_DEFAULT_SINCE: &str = "72h";
+/// Max activity entries a brief carries (the tail is re-readable via `events`).
+pub const BRIEF_ACTIVITY_LIMIT: i64 = 25;
+/// Max rows the `my_work` / `in_flight` sections carry before truncating (and
+/// saying so in `dropped`).
+pub const BRIEF_ISSUE_LIMIT: i64 = 50;
+/// Max top-of-backlog rows a brief carries.
+pub const BRIEF_BACKLOG_LIMIT: i64 = 5;
+/// Requeue cooldown used for the backlog preview. Matches `claim`'s default so
+/// the brief lists what the next `claim` would actually serve, not a queue the
+/// agent is cooled down out of.
+pub const BRIEF_COOLDOWN_SECS: i64 = 3600;
+/// Tag marking a session-handoff note (the narrative half of continuity).
+pub const HANDOFF_TAG: &str = "handoff";
+
+/// Seconds in a simple duration spec (`90s`, `30m`, `24h`, `7d`, `2w`), or
+/// `None` when `spec` isn't one.
+fn duration_secs(spec: &str) -> Option<i64> {
+    let mut chars = spec.chars();
+    let unit = chars.next_back()?;
+    let n: i64 = chars.as_str().parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    let mult = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        'w' => 604_800,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+/// Resolve a `--since` spec — an ISO-8601 instant/date or a simple duration
+/// like `24h` / `7d` — into an ISO-8601 UTC instant in `db::now`'s format, so
+/// it compares lexicographically against stored timestamps.
+pub fn resolve_since(conn: &Connection, spec: &str) -> Result<String> {
+    let spec = spec.trim();
+    let invalid = || {
+        msg(format!(
+            "invalid since '{spec}' (expected an ISO-8601 instant or a duration like 24h / 7d)"
+        ))
+    };
+    if spec.is_empty() {
+        return Err(invalid());
+    }
+    if let Some(secs) = duration_secs(spec) {
+        let now = db::now(conn)?;
+        return iso_plus_secs(conn, &now, -secs);
+    }
+    // A bare number is a missing unit, not a Julian day — SQLite would happily
+    // read `72` as one and hand back a date in 4713 BC.
+    if spec.parse::<f64>().is_ok() {
+        return Err(invalid());
+    }
+    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1)", [spec], |r| {
+        r.get::<_, Option<String>>(0)
+    })?
+    .ok_or_else(invalid)
+}
+
+/// Workspace-wide activity at/after `since`, most recent first, capped.
+fn recent_activity(conn: &Connection, since: &str, limit: i64) -> Result<Vec<EventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.rowid, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body
+         FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+         WHERE a.at >= ?1 ORDER BY a.rowid DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![since, limit], |r| {
+        Ok(EventRow {
+            cursor: r.get(0)?,
+            id: r.get(1)?,
+            doc_type: r.get(2)?,
+            seq: r.get(3)?,
+            at: r.get(4)?,
+            author: r.get(5)?,
+            kind: r.get(6)?,
+            body: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The most recent note tagged [`HANDOFF_TAG`], with its full body. Handoffs
+/// are append-only history, so "most recent" is by creation, not by edit.
+fn latest_handoff(conn: &Connection) -> Result<Option<Doc>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT d.id FROM documents d JOIN tags t ON t.doc_id = d.doc_id
+             WHERE d.type = 'note' AND t.tag = ?1
+             ORDER BY d.created_at DESC, d.doc_id DESC LIMIT 1",
+            [HANDOFF_TAG],
+            |r| r.get(0),
+        )
+        .optional()?;
+    id.map(|id| get_doc(conn, &id)).transpose()
+}
+
+/// Every issue key `agent` currently holds a live claim on, open statuses only
+/// (matching `list_issues`' default exclusion of done/canceled).
+fn claimed_keys(conn: &Connection, agent: &str) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id
+         WHERE i.claimed_by = ?1 AND i.status NOT IN ('done','canceled')",
+    )?;
+    let rows = stmt.query_map([agent], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Serialized-char size of a `Brief` — the metric `--budget` caps.
+fn brief_size(b: &Brief) -> usize {
+    serde_json::to_string(b).map(|s| s.len()).unwrap_or(0)
+}
+
+/// One-bundle workspace orientation for a session start: what `agent` holds,
+/// what everyone else holds, what happened since `since`, the decisions behind
+/// it, the latest handoff note, and the top of the claim queue.
+///
+/// Strictly read-only — no lease is taken, no activity written — so injecting
+/// it at every session start costs the board nothing.
+///
+/// `since` accepts an ISO-8601 instant or a duration (`24h`, `7d`); it defaults
+/// to [`BRIEF_DEFAULT_SINCE`]. `budget` (chars) drops whole low-value sections:
+/// (1) top-of-backlog, (2) the activity tail (oldest first), (3) decisions,
+/// (4) in-flight rows — never `my_work` and never the handoff note, the two
+/// things a returning agent cannot reconstruct. Each cut is named in `dropped`.
+pub fn brief(
+    conn: &Connection,
+    agent: &str,
+    since: Option<&str>,
+    budget: Option<i64>,
+) -> Result<Brief> {
+    let since = resolve_since(conn, since.unwrap_or(BRIEF_DEFAULT_SINCE))?;
+
+    // Caps are recorded like budget cuts: a section silently cut to N rows
+    // reads as "that's all there is", which is exactly the lie a brief exists
+    // to prevent. `cap` truncates and names the cut.
+    let mut dropped: Vec<String> = Vec::new();
+    let mut cap = |rows: &mut Vec<Issue>, limit: i64, section: &str| {
+        let limit = limit.max(0) as usize;
+        if rows.len() > limit {
+            dropped.push(format!(
+                "{section} ({} of {} rows)",
+                rows.len() - limit,
+                rows.len()
+            ));
+            rows.truncate(limit);
+        }
+    };
+
+    // Fetch one past the cap so truncation is detectable rather than assumed.
+    let mut my_work = list_issues(
+        conn,
+        &IssueFilter {
+            claimed_by: Some(agent.to_string()),
+            limit: BRIEF_ISSUE_LIMIT + 1,
+            ..Default::default()
+        },
+    )?;
+    cap(&mut my_work, BRIEF_ISSUE_LIMIT, "my_work");
+    // Every key alice holds — computed independently of the capped list above,
+    // so a truncated `my_work` can't leak her own 51st issue into `in_flight`
+    // or the backlog preview.
+    let mine = claimed_keys(conn, agent)?;
+
+    // Everything in flight EXCEPT this agent's own rows — those are already in
+    // `my_work` with their lease, and a brief that lists them twice reads as if
+    // two agents were on the same issue. The SQL limit is raised by the number
+    // of rows that filter will remove, so the reader's own claims can never eat
+    // into how much of the fleet's work they get to see.
+    let mut in_flight: Vec<Issue> = list_issues(
+        conn,
+        &IssueFilter {
+            status: vec!["in_progress".into(), "in_review".into()],
+            limit: BRIEF_ISSUE_LIMIT + 1 + mine.len() as i64,
+            ..Default::default()
+        },
+    )?
+    .into_iter()
+    .filter(|i| !mine.contains(&i.id))
+    .collect();
+    cap(&mut in_flight, BRIEF_ISSUE_LIMIT, "in_flight");
+
+    let activity = recent_activity(conn, &since, BRIEF_ACTIVITY_LIMIT)?;
+
+    // list_decisions is decision_num ascending; the brief wants newest first.
+    let mut decisions: Vec<Decision> = list_decisions(conn, None, false)?
+        .into_iter()
+        .filter(|d| d.created_at.as_str() >= since.as_str())
+        .collect();
+    decisions.reverse();
+
+    let handoff = latest_handoff(conn)?;
+    // An issue whose lease died is claimable again, so an agent whose OWN lease
+    // expired would otherwise read its issue under both "my work" and "next
+    // up". Drop those; a *stale* row held by someone else deliberately stays —
+    // "bob's lease is dead, this is yours to take" is the whole point of the
+    // section. Over-fetch by the number of rows that filter can remove.
+    let backlog: Vec<Issue> = peek_claimable(
+        conn,
+        agent,
+        BRIEF_COOLDOWN_SECS,
+        &ClaimFilter::any(),
+        BRIEF_BACKLOG_LIMIT + mine.len() as i64,
+    )?
+    .into_iter()
+    .filter(|i| !mine.contains(&i.id))
+    .take(BRIEF_BACKLOG_LIMIT as usize)
+    .collect();
+
+    let mut brief = Brief {
+        agent: agent.to_string(),
+        since,
+        my_work,
+        in_flight,
+        activity,
+        decisions,
+        handoff,
+        backlog,
+        budget,
+        dropped,
+    };
+    if let Some(cap) = budget {
+        trim_brief_to_budget(&mut brief, cap);
+    }
+    Ok(brief)
+}
+
+/// Drop whole low-value sections until the brief serializes under `cap` chars,
+/// recording each cut in `dropped`. Order: top-of-backlog (re-derivable with
+/// `claim --peek`), the activity tail, decisions, then in-flight rows. `my_work`
+/// and the handoff note are never touched.
+fn trim_brief_to_budget(b: &mut Brief, cap: i64) {
+    let cap = cap.max(0) as usize;
+
+    while brief_size(b) > cap {
+        let Some(i) = b.backlog.pop() else { break };
+        b.dropped.push(format!("backlog {}", i.id));
+    }
+
+    // Activity is most-recent-first, so popping the tail sheds the oldest.
+    if brief_size(b) > cap && !b.activity.is_empty() {
+        let before = b.activity.len();
+        while brief_size(b) > cap && b.activity.pop().is_some() {}
+        let cut = before - b.activity.len();
+        if cut > 0 {
+            b.dropped
+                .push(format!("activity ({cut} of {before} entries)"));
+        }
+    }
+
+    while brief_size(b) > cap {
+        let Some(d) = b.decisions.pop() else { break };
+        b.dropped.push(format!("decision {}", d.id));
+    }
+
+    // Lowest-priority in-flight rows first (the list is priority-ordered).
+    while brief_size(b) > cap {
+        let Some(i) = b.in_flight.pop() else { break };
+        b.dropped.push(format!("in_flight {}", i.id));
+    }
 }
