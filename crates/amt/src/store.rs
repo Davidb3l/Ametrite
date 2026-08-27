@@ -41,6 +41,8 @@ pub struct IssueFilter {
     pub claimed: Option<bool>,
     /// Restrict to issues whose live claim is held by this agent.
     pub claimed_by: Option<String>,
+    /// Exclude issues claimed by this agent (unclaimed rows still match).
+    pub not_claimed_by: Option<String>,
     pub include_closed: bool,
     pub limit: i64,
 }
@@ -345,6 +347,10 @@ pub fn list_issues(conn: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
     }
     if let Some(agent) = &f.claimed_by {
         sql.push_str(" AND i.claimed_by = ?");
+        args.push(Box::new(agent.clone()));
+    }
+    if let Some(agent) = &f.not_claimed_by {
+        sql.push_str(" AND (i.claimed_by IS NULL OR i.claimed_by != ?)");
         args.push(Box::new(agent.clone()));
     }
     sql.push_str(&format!(
@@ -1379,26 +1385,43 @@ pub fn get_doc(conn: &Connection, id_or_title: &str) -> Result<Doc> {
     Ok(doc)
 }
 
-pub fn list_docs(conn: &Connection, doc_type: &str) -> Result<Vec<Doc>> {
-    let mut stmt = conn.prepare(
-        "SELECT doc_id, id, type, title, created_at, updated_at
-         FROM documents WHERE type = ?1 ORDER BY updated_at DESC",
+pub fn list_docs(conn: &Connection, doc_type: &str, tag: Option<&str>) -> Result<Vec<Doc>> {
+    // Tag filtering happens in SQL with `lower(?)` on the query side only —
+    // tags are already lowercased at insertion by the same SQLite `lower()`,
+    // so both sides fold identically (ASCII-only), matching every other tag
+    // filter (`search --tag`, `issue list --label`). A Rust `to_lowercase()`
+    // here would fold non-ASCII that storage did not, and never match it.
+    let mut sql = "SELECT doc_id, id, type, title, created_at, updated_at
+         FROM documents WHERE type = ?1"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(doc_type.to_string())];
+    if let Some(tag) = tag {
+        sql.push_str(
+            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = documents.doc_id
+                         AND t.tag = lower(?))",
+        );
+        args.push(Box::new(tag.to_string()));
+    }
+    sql.push_str(" ORDER BY updated_at DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Doc {
+                    id: r.get(1)?,
+                    doc_type: r.get(2)?,
+                    title: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                    body: None,
+                    tags: Vec::new(),
+                    backlinks: Vec::new(),
+                },
+            ))
+        },
     )?;
-    let rows = stmt.query_map([doc_type], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            Doc {
-                id: r.get(1)?,
-                doc_type: r.get(2)?,
-                title: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
-                body: None,
-                tags: Vec::new(),
-                backlinks: Vec::new(),
-            },
-        ))
-    })?;
     let mut docs = Vec::new();
     for row in rows {
         let (doc_id, mut doc) = row?;
@@ -2248,24 +2271,27 @@ pub fn events_cursor(conn: &Connection) -> Result<i64> {
 /// capped at `limit`. `activity.rowid` is a global monotonic insertion order,
 /// so it's a stable cross-document cursor for tailing and catch-up.
 pub fn events(conn: &Connection, since: i64, limit: i64) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT a.rowid, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body
-         FROM activity a JOIN documents d ON d.doc_id = a.doc_id
-         WHERE a.rowid > ?1 ORDER BY a.rowid LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![since, limit], |r| {
-        Ok(EventRow {
-            cursor: r.get(0)?,
-            id: r.get(1)?,
-            doc_type: r.get(2)?,
-            seq: r.get(3)?,
-            at: r.get(4)?,
-            author: r.get(5)?,
-            kind: r.get(6)?,
-            body: r.get(7)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+         WHERE a.rowid > ?1 ORDER BY a.rowid LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![since, limit], event_from_row)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+const EVENT_COLS: &str = "a.rowid, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body";
+
+fn event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        cursor: r.get(0)?,
+        id: r.get(1)?,
+        doc_type: r.get(2)?,
+        seq: r.get(3)?,
+        at: r.get(4)?,
+        author: r.get(5)?,
+        kind: r.get(6)?,
+        body: r.get(7)?,
+    })
 }
 
 // ---------- fleet visibility (R9) ----------
@@ -2906,10 +2932,6 @@ pub const BRIEF_ISSUE_LIMIT: i64 = 50;
 pub const BRIEF_DECISION_LIMIT: i64 = 20;
 /// Max top-of-backlog rows a brief carries.
 pub const BRIEF_BACKLOG_LIMIT: i64 = 5;
-/// Requeue cooldown used for the backlog preview. Matches `claim`'s default so
-/// the brief lists what the next `claim` would actually serve, not a queue the
-/// agent is cooled down out of.
-pub const BRIEF_COOLDOWN_SECS: i64 = 3600;
 /// Tag marking a session-handoff note (the narrative half of continuity).
 pub const HANDOFF_TAG: &str = "handoff";
 
@@ -2965,6 +2987,12 @@ pub fn resolve_since(conn: &Connection, spec: &str) -> Result<String> {
     if spec.parse::<f64>().is_ok() {
         return Err(invalid());
     }
+    // SQLite also reads bare times ("12:30") as anchored to 2000-01-01 — a
+    // silent 26-year window. Every real instant or date carries a date
+    // separator, so require one before handing the spec to strftime.
+    if !spec.contains('-') {
+        return Err(invalid());
+    }
     conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1)", [spec], |r| {
         r.get::<_, Option<String>>(0)
     })?
@@ -2972,34 +3000,42 @@ pub fn resolve_since(conn: &Connection, spec: &str) -> Result<String> {
 }
 
 /// Workspace-wide activity at/after `since`, most recent first, capped.
+/// The windowed sibling of [`events`], sharing its column list and row mapper.
 fn recent_activity(conn: &Connection, since: &str, limit: i64) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT a.rowid, d.id, d.type, a.seq, a.at, a.author, a.kind, a.body
-         FROM activity a JOIN documents d ON d.doc_id = a.doc_id
-         WHERE a.at >= ?1 ORDER BY a.rowid DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![since, limit], |r| {
-        Ok(EventRow {
-            cursor: r.get(0)?,
-            id: r.get(1)?,
-            doc_type: r.get(2)?,
-            seq: r.get(3)?,
-            at: r.get(4)?,
-            author: r.get(5)?,
-            kind: r.get(6)?,
-            body: r.get(7)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM activity a JOIN documents d ON d.doc_id = a.doc_id
+         WHERE a.at >= ?1 ORDER BY a.rowid DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![since, limit], event_from_row)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Decisions recorded at/after `since`, newest first, capped — the windowed
+/// sibling of [`list_decisions`], which reads the whole table. Superseded
+/// decisions are excluded, matching `list_decisions`' default.
+fn recent_decisions(conn: &Connection, since: &str, limit: i64) -> Result<Vec<Decision>> {
+    let sql = format!(
+        "SELECT {DECISION_COLS} FROM documents d JOIN decisions dc ON dc.doc_id = d.doc_id
+         WHERE dc.status != 'superseded' AND d.created_at >= ?1
+         ORDER BY dc.decision_num DESC LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![since, limit], decision_from_row)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// The most recent note tagged [`HANDOFF_TAG`], with its full body. Handoffs
 /// are append-only history, so "most recent" is by creation, not by edit.
+///
+/// Only explicit label tags (`--tag handoff` at creation) count: an ordinary
+/// note whose *body* merely mentions `#handoff` also lands in the tags table
+/// (src = 'body'), and without this filter the newest such mention would
+/// displace the real handoff at every future session start.
 fn latest_handoff(conn: &Connection) -> Result<Option<Doc>> {
     let id: Option<String> = conn
         .query_row(
             "SELECT d.id FROM documents d JOIN tags t ON t.doc_id = d.doc_id
-             WHERE d.type = 'note' AND t.tag = ?1
+             WHERE d.type = 'note' AND t.tag = ?1 AND t.src = 'label'
              ORDER BY d.created_at DESC, d.doc_id DESC LIMIT 1",
             [HANDOFF_TAG],
             |r| r.get(0),
@@ -3021,20 +3057,14 @@ fn cap_rows<T>(rows: &mut Vec<T>, limit: i64, section: &str, dropped: &mut Vec<S
     }
 }
 
-/// Every issue key `agent` currently holds a live claim on, open statuses only
-/// (matching `list_issues`' default exclusion of done/canceled).
-fn claimed_keys(conn: &Connection, agent: &str) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id
-         WHERE i.claimed_by = ?1 AND i.status NOT IN ('done','canceled')",
-    )?;
-    let rows = stmt.query_map([agent], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-/// Serialized-char size of a `Brief` — the metric `--budget` caps.
+/// Serialized size of a `Brief` in bytes — the metric `--budget` targets.
+/// Measured on the pretty-printed form, because that is what both delivery
+/// surfaces actually emit (`print_json` and MCP's `text_result`); measuring
+/// compact JSON would let a "fitting" brief blow the budget by ~2x on the wire.
 fn brief_size(b: &Brief) -> usize {
-    serde_json::to_string(b).map(|s| s.len()).unwrap_or(0)
+    serde_json::to_string_pretty(b)
+        .map(|s| s.len())
+        .unwrap_or(0)
 }
 
 /// One-bundle workspace orientation for a session start: what `agent` holds,
@@ -3045,7 +3075,8 @@ fn brief_size(b: &Brief) -> usize {
 /// it at every session start costs the board nothing.
 ///
 /// `since` accepts an ISO-8601 instant or a duration (`24h`, `7d`); it defaults
-/// to [`BRIEF_DEFAULT_SINCE`]. `budget` is a target, not a guarantee: it drops
+/// to [`BRIEF_DEFAULT_SINCE`]. `budget` (bytes of the JSON actually delivered)
+/// is a target, not a guarantee: it drops
 /// whole low-value sections until the brief fits, but stops when only the
 /// untrimmable core is left, so a budget below that floor is still exceeded.
 /// The drop order is:
@@ -3062,37 +3093,35 @@ pub fn brief(
 
     let mut dropped: Vec<String> = Vec::new();
 
-    // Fetch one past the cap so truncation is detectable rather than assumed.
+    // ALL of the agent's claims (the set is also the dedup filter for the
+    // backlog preview below, so it must not be pre-capped), then cap the
+    // section that ships. One query, one predicate — a second hand-written
+    // "issues this agent holds" query would eventually disagree with this one.
     let mut my_work = list_issues(
         conn,
         &IssueFilter {
             claimed_by: Some(agent.to_string()),
+            limit: i64::MAX,
+            ..Default::default()
+        },
+    )?;
+    let mine: std::collections::HashSet<String> = my_work.iter().map(|i| i.id.clone()).collect();
+    cap_rows(&mut my_work, BRIEF_ISSUE_LIMIT, "my_work", &mut dropped);
+
+    // Everything in flight EXCEPT this agent's own rows — those are already in
+    // `my_work` with their lease, and a brief that lists them twice reads as if
+    // two agents were on the same issue. Excluded in SQL, so the reader's own
+    // claim count can never eat into how much of the fleet's work they see.
+    // Fetch one past the cap so truncation is detectable rather than assumed.
+    let mut in_flight = list_issues(
+        conn,
+        &IssueFilter {
+            status: vec!["in_progress".into(), "in_review".into()],
+            not_claimed_by: Some(agent.to_string()),
             limit: BRIEF_ISSUE_LIMIT + 1,
             ..Default::default()
         },
     )?;
-    cap_rows(&mut my_work, BRIEF_ISSUE_LIMIT, "my_work", &mut dropped);
-    // Every key alice holds — computed independently of the capped list above,
-    // so a truncated `my_work` can't leak her own 51st issue into `in_flight`
-    // or the backlog preview.
-    let mine = claimed_keys(conn, agent)?;
-
-    // Everything in flight EXCEPT this agent's own rows — those are already in
-    // `my_work` with their lease, and a brief that lists them twice reads as if
-    // two agents were on the same issue. The SQL limit is raised by the number
-    // of rows that filter will remove, so the reader's own claims can never eat
-    // into how much of the fleet's work they get to see.
-    let mut in_flight: Vec<Issue> = list_issues(
-        conn,
-        &IssueFilter {
-            status: vec!["in_progress".into(), "in_review".into()],
-            limit: BRIEF_ISSUE_LIMIT + 1 + mine.len() as i64,
-            ..Default::default()
-        },
-    )?
-    .into_iter()
-    .filter(|i| !mine.contains(&i.id))
-    .collect();
     cap_rows(&mut in_flight, BRIEF_ISSUE_LIMIT, "in_flight", &mut dropped);
 
     let mut activity = recent_activity(conn, &since, BRIEF_ACTIVITY_LIMIT + 1)?;
@@ -3103,12 +3132,7 @@ pub fn brief(
         &mut dropped,
     );
 
-    // list_decisions is decision_num ascending; the brief wants newest first.
-    let mut decisions: Vec<Decision> = list_decisions(conn, None, false)?
-        .into_iter()
-        .filter(|d| d.created_at.as_str() >= since.as_str())
-        .collect();
-    decisions.reverse();
+    let mut decisions = recent_decisions(conn, &since, BRIEF_DECISION_LIMIT + 1)?;
     cap_rows(
         &mut decisions,
         BRIEF_DECISION_LIMIT,
@@ -3121,18 +3145,19 @@ pub fn brief(
     // expired would otherwise read its issue under both "my work" and "next
     // up". Drop those; a *stale* row held by someone else deliberately stays —
     // "bob's lease is dead, this is yours to take" is the whole point of the
-    // section. Over-fetch by the number of rows that filter can remove.
-    let backlog: Vec<Issue> = peek_claimable(
+    // section. Over-fetch by one past the cap (plus the rows the self-filter
+    // can remove) so a truncated preview is recorded, not silently assumed.
+    let mut backlog: Vec<Issue> = peek_claimable(
         conn,
         agent,
-        BRIEF_COOLDOWN_SECS,
+        DEFAULT_COOLDOWN_SECS,
         &ClaimFilter::any(),
-        BRIEF_BACKLOG_LIMIT + mine.len() as i64,
+        BRIEF_BACKLOG_LIMIT + 1 + mine.len() as i64,
     )?
     .into_iter()
     .filter(|i| !mine.contains(&i.id))
-    .take(BRIEF_BACKLOG_LIMIT as usize)
     .collect();
+    cap_rows(&mut backlog, BRIEF_BACKLOG_LIMIT, "backlog", &mut dropped);
 
     let mut brief = Brief {
         agent: agent.to_string(),
@@ -3152,7 +3177,7 @@ pub fn brief(
     Ok(brief)
 }
 
-/// Drop whole low-value sections until the brief serializes under `cap` chars,
+/// Drop whole low-value sections until the brief serializes under `cap` bytes,
 /// recording each cut in `dropped`. Order: top-of-backlog (re-derivable with
 /// `claim --peek`), the activity tail, decisions, then in-flight rows. `my_work`
 /// and the handoff note are never touched.
@@ -3165,7 +3190,7 @@ fn trim_brief_to_budget(b: &mut Brief, cap: i64) {
     }
 
     // Activity is most-recent-first, so popping the tail sheds the oldest.
-    if brief_size(b) > cap && !b.activity.is_empty() {
+    {
         let before = b.activity.len();
         while brief_size(b) > cap && b.activity.pop().is_some() {}
         let cut = before - b.activity.len();

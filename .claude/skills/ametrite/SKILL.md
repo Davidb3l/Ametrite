@@ -136,6 +136,8 @@ Next step: flip the call site in auth/session.ts and run the integration suite."
   state; anything decided but NOT yet recorded as a decision; gotchas found the hard way;
   the concrete next step.
 - Wikilink every issue you touched (`[[AMT-29]]`) so the note joins the link graph.
+- The tag must be a real `--tag handoff` (or `tags: ["handoff"]` on MCP) — a `#handoff`
+  hashtag inside some note's body does not make that note a handoff.
 - Read one at session start: `amt brief` puts the latest in front of you (older ones:
   `amt note list --tag handoff`). Honor it, then verify — it is context from a session
   that already ended, not a script to replay.
@@ -144,7 +146,7 @@ Next step: flip the call site in auth/session.ts and run the integration suite."
 
 ## Other surfaces
 
-- MCP server (24 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
+- MCP server (25 tools, same capabilities): `claude mcp add ametrite -- amt mcp`.
 - Web UI for humans: `bun run web` in the Ametrite repo → http://localhost:1776 —
   one board serves every registered workspace (sidebar switcher; `amt ws list`).
 - Obsidian round-trip: `amt export <dir>` / `amt import <dir>`.

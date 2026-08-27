@@ -67,7 +67,7 @@ enum Cmd {
         #[arg(long, default_value_t = 900)]
         ttl: i64,
         /// Seconds before an issue you released can be re-served to you (0 disables)
-        #[arg(long, default_value_t = 3600)]
+        #[arg(long, default_value_t = DEFAULT_COOLDOWN_SECS)]
         cooldown: i64,
         /// Claim (or peek) across every registered workspace, globally priority-first
         #[arg(long)]
@@ -165,10 +165,10 @@ enum Cmd {
         /// duration like 24h / 7d (default: 72h)
         #[arg(long)]
         since: Option<String>,
-        /// Target size in serialized chars; drops whole low-value sections
-        /// until it fits (backlog, then the activity tail, then decisions,
-        /// then in-flight). Your own work and the handoff note always survive,
-        /// so a budget below that floor is still exceeded
+        /// Target size in bytes of the JSON actually delivered; drops whole
+        /// low-value sections until it fits (backlog, then the activity tail,
+        /// then decisions, then in-flight). Your own work and the handoff note
+        /// always survive, so a budget below that floor is still exceeded
         #[arg(long)]
         budget: Option<i64>,
     },
@@ -789,7 +789,11 @@ fn ellipsize(s: &str, max: usize) -> String {
 /// — "nothing is happening" is a state, not an error.
 fn print_brief(b: &Brief) {
     println!("brief for @{} — since {}", b.agent, b.since);
+    // Flipped by every section that renders, so the all-quiet fallback can
+    // never drift out of sync with a section list that grows later.
+    let mut printed = false;
     if !b.my_work.is_empty() {
+        printed = true;
         println!("\n=== my work ===");
         for i in &b.my_work {
             let lease = match &i.claim_expires_at {
@@ -800,12 +804,14 @@ fn print_brief(b: &Brief) {
         }
     }
     if !b.in_flight.is_empty() {
+        printed = true;
         println!("\n=== in flight (elsewhere) ===");
         for i in &b.in_flight {
             println!("{}", issue_line(i));
         }
     }
     if !b.activity.is_empty() {
+        printed = true;
         println!("\n=== recent activity ===");
         for e in &b.activity {
             println!(
@@ -818,6 +824,7 @@ fn print_brief(b: &Brief) {
         }
     }
     if !b.decisions.is_empty() {
+        printed = true;
         println!("\n=== recent decisions ===");
         for d in &b.decisions {
             println!(
@@ -827,6 +834,7 @@ fn print_brief(b: &Brief) {
         }
     }
     if let Some(h) = &b.handoff {
+        printed = true;
         println!("\n=== latest handoff: {} ({}) ===", h.title, h.created_at);
         if let Some(body) = &h.body {
             if !body.trim().is_empty() {
@@ -835,22 +843,17 @@ fn print_brief(b: &Brief) {
         }
     }
     if !b.backlog.is_empty() {
+        printed = true;
         println!("\n=== next up (claim order) ===");
         for i in &b.backlog {
             println!("{}", issue_line(i));
         }
     }
-    if b.my_work.is_empty()
-        && b.in_flight.is_empty()
-        && b.activity.is_empty()
-        && b.decisions.is_empty()
-        && b.handoff.is_none()
-        && b.backlog.is_empty()
-    {
+    if !printed {
         println!("\nnothing claimed, nothing in flight, no recent activity");
     }
     if let Some(budget) = b.budget {
-        println!("\nbudget: {budget} chars (target)");
+        println!("\nbudget: {budget} bytes (target)");
     }
     if !b.dropped.is_empty() {
         println!("\nnot shown: {}", b.dropped.join(", "));
@@ -950,6 +953,7 @@ fn run(cli: Cli) -> Result<()> {
                     label: label.clone(),
                     claimed: None,
                     claimed_by: None,
+                    not_claimed_by: None,
                     include_closed: *all,
                     limit: *limit,
                 };
@@ -1040,6 +1044,7 @@ fn run(cli: Cli) -> Result<()> {
                         label: label.clone(),
                         claimed: None,
                         claimed_by: None,
+                        not_claimed_by: None,
                         include_closed: *all,
                         limit: *limit,
                     };
@@ -1500,12 +1505,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 NoteCmd::List { tag } => {
-                    let mut docs = store::list_docs(&conn, "note")?;
-                    if let Some(tag) = tag {
-                        // Tags are stored lowercased, so match that way.
-                        let tag = tag.to_lowercase();
-                        docs.retain(|d| d.tags.contains(&tag));
-                    }
+                    let docs = store::list_docs(&conn, "note", tag.as_deref())?;
                     if cli.json {
                         print_json(&docs);
                     } else {
@@ -1538,7 +1538,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 ProjectCmd::List => {
-                    let docs = store::list_docs(&conn, "project")?;
+                    let docs = store::list_docs(&conn, "project", None)?;
                     if cli.json {
                         print_json(&docs);
                     } else {

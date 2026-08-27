@@ -111,7 +111,7 @@ mutations shell out to `amt --json`, so business logic lives in exactly one plac
 
 ## Using it with AI agents
 
-**MCP** — `amt mcp` is a stdio MCP server exposing 24 tools (issues, claims, notes,
+**MCP** — `amt mcp` is a stdio MCP server exposing 25 tools (issues, claims, notes,
 decisions, dependencies, search, context bundles, session briefs, stats, events, git
 commits):
 

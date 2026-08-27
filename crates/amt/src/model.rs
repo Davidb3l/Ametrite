@@ -11,6 +11,11 @@ pub const STATUSES: &[&str] = &[
 pub const PRIORITIES: &[&str] = &["urgent", "high", "medium", "low", "none"];
 /// Statuses an agent may claim from.
 pub const CLAIMABLE_STATUSES: &[&str] = &["todo", "backlog"];
+/// Default requeue cooldown: seconds before an issue an agent released can be
+/// re-served to that same agent. One constant consumed by the CLI default, the
+/// MCP default, AND `brief`'s backlog preview — if these ever diverged, the
+/// brief would preview a different queue than the next `claim` actually serves.
+pub const DEFAULT_COOLDOWN_SECS: i64 = 3600;
 
 pub fn valid_status(s: &str) -> bool {
     STATUSES.contains(&s)
@@ -294,7 +299,8 @@ pub struct ClaimOverlap {
 /// happened, why it happened, the last narrative handoff, and what to pick up
 /// next. Read-only and composed entirely from existing store reads.
 ///
-/// `--budget <chars>` is a target, not a guarantee: it drops whole low-value
+/// `--budget <bytes>` (measured on the JSON actually delivered) is a target,
+/// not a guarantee: it drops whole low-value
 /// sections in a fixed order (backlog, then the activity tail, then decisions,
 /// then in-flight) until the brief fits, but `my_work` and the handoff note are
 /// never dropped, so a budget below that floor is still exceeded. Every cut —
@@ -322,7 +328,7 @@ pub struct Brief {
     pub handoff: Option<Doc>,
     /// The next issues `claim` would serve this agent, in claim order.
     pub backlog: Vec<Issue>,
-    /// Char budget applied, if any (echoed for the agent's benefit).
+    /// Byte budget applied, if any (echoed for the agent's benefit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<i64>,
     /// Human-readable manifest of everything the brief left out — section row

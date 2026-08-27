@@ -669,7 +669,7 @@ fn dedupe_soft_warns_but_still_creates_while_strict_refuses() {
     let created = store::create_doc(&mut conn, new_note("Release checklist", "v2")).unwrap();
     // Distinct id is minted (slug collision suffix), so both notes coexist.
     assert_ne!(created.id, dupes[0].id);
-    assert_eq!(store::list_docs(&conn, "note").unwrap().len(), 2);
+    assert_eq!(store::list_docs(&conn, "note", None).unwrap().len(), 2);
 
     // Strict mode is the caller refusing when find_similar_notes is non-empty;
     // verify the signal both handlers key off of is present.
@@ -1763,7 +1763,7 @@ fn seed_zero_is_a_noop() {
     assert!(store::list_issues(&conn, &store::IssueFilter::default())
         .unwrap()
         .is_empty());
-    assert!(store::list_docs(&conn, "project").unwrap().is_empty());
+    assert!(store::list_docs(&conn, "project", None).unwrap().is_empty());
 }
 
 // ---------- AMT-17: amt gc ----------
@@ -3218,4 +3218,99 @@ fn since_rejects_an_out_of_range_duration_without_leaking_a_db_error() {
         .to_string();
     assert!(err.contains("invalid since"), "got: {err}");
     assert!(!err.contains("column type"), "raw DB error leaked: {err}");
+}
+
+#[test]
+fn brief_handoff_ignores_body_hashtag_mentions() {
+    let (_d, mut conn) = workspace();
+    let mut real = new_note("Handoff Monday", "Stopped mid-migration.");
+    real.tags = vec!["handoff".into()];
+    store::create_doc(&mut conn, real).unwrap();
+    // A NEWER ordinary note that merely mentions the hashtag in its body —
+    // without the src filter this would displace the real handoff at every
+    // future session start.
+    store::create_doc(
+        &mut conn,
+        new_note(
+            "Conventions",
+            "Remember to write a #handoff note before stopping.",
+        ),
+    )
+    .unwrap();
+
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    assert_eq!(
+        b.handoff.expect("handoff").title,
+        "Handoff Monday",
+        "a #handoff body mention must not displace the real handoff"
+    );
+}
+
+#[test]
+fn brief_backlog_cap_is_recorded_in_dropped() {
+    let (_d, mut conn) = workspace();
+    for n in 0..7 {
+        store::create_issue(&mut conn, new_issue(&format!("Work {n}"), "", "medium")).unwrap();
+    }
+    let b = store::brief(&conn, "alice", None, None).unwrap();
+    assert_eq!(b.backlog.len(), 5);
+    assert!(
+        b.dropped
+            .iter()
+            .any(|d| d.starts_with("backlog (capped at 5")),
+        "a truncated backlog preview must say so: {:?}",
+        b.dropped
+    );
+}
+
+#[test]
+fn brief_budget_bounds_the_delivered_pretty_json() {
+    let (_d, conn) = brief_fixture();
+    let full = store::brief(&conn, "alice", None, None).unwrap();
+    let full_pretty = serde_json::to_string_pretty(&full).unwrap().len();
+    // A budget between the untrimmable floor and the full brief must bound the
+    // PRETTY serialization — the bytes both the CLI and MCP actually emit —
+    // not the compact form nobody receives.
+    let cap = (full_pretty as i64) - 200;
+    let trimmed = store::brief(&conn, "alice", None, Some(cap)).unwrap();
+    assert!(!trimmed.dropped.is_empty(), "something must have been cut");
+    assert!(
+        serde_json::to_string_pretty(&trimmed).unwrap().len() <= cap as usize,
+        "delivered pretty JSON must fit the budget"
+    );
+}
+
+#[test]
+fn since_rejects_time_only_specs() {
+    let (_d, conn) = workspace();
+    // SQLite would anchor a bare time to 2000-01-01 — a silent 26-year window.
+    for spec in ["12:30", "12:30:45"] {
+        let err = store::resolve_since(&conn, spec).unwrap_err().to_string();
+        assert!(err.contains("invalid since"), "{spec} → {err}");
+    }
+}
+
+#[test]
+fn list_docs_filters_by_tag_including_non_ascii() {
+    let (_d, mut conn) = workspace();
+    let mut tagged = new_note("Übergabe Montag", "Inhalt.");
+    tagged.tags = vec!["Übergabe".into()];
+    store::create_doc(&mut conn, tagged).unwrap();
+    store::create_doc(&mut conn, new_note("Plain", "No tags.")).unwrap();
+
+    // Exact-case non-ASCII round-trips (SQLite lower() folds ASCII only, and
+    // storage + query fold identically, so what you stored you can find).
+    let hits = store::list_docs(&conn, "note", Some("Übergabe")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Übergabe Montag");
+    // ASCII stays case-insensitive on both sides.
+    let mut ascii = new_note("Handoff", "x");
+    ascii.tags = vec!["HandOff".into()];
+    store::create_doc(&mut conn, ascii).unwrap();
+    assert_eq!(
+        store::list_docs(&conn, "note", Some("HANDOFF"))
+            .unwrap()
+            .len(),
+        1
+    );
 }

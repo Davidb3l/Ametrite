@@ -51,7 +51,8 @@ session (and before any long pause):
 amt note create --title "Handoff 2026-08-25" --tag handoff -b "..."
 ```
 
-(`create_note` with `tags: ["handoff"]` on MCP. The author is `$AMT_AGENT`.)
+(`create_note` with `tags: ["handoff"]` on MCP. The author is `$AMT_AGENT`. The tag
+must be a real tag — a `#handoff` hashtag inside a body does not make a note a handoff.)
 
 Cover four things, in two paragraphs at most — this is a handoff, not a diary:
 
@@ -64,7 +65,8 @@ Wikilink every issue you touched (`[[AMT-42]]`) so the note joins the link graph
 shows up in those issues' backlinks.
 
 **Reading one**: `brief` puts the latest handoff in front of you at session start
-(`amt note list --tag handoff` / `search` finds older ones). Honor it — then verify
+(`amt note list --tag handoff`, or `list_notes` with tag `handoff` on MCP, finds
+older ones). Honor it — then verify
 before you act on it. A handoff is context from a session that has already ended, not
 a script to replay.
 

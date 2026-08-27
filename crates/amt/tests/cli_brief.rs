@@ -152,3 +152,27 @@ fn note_list_filters_by_tag() {
     // Unfiltered still lists everything.
     assert!(stdout(&amt(&repo, &reg, &["note", "list"])).contains("Architecture"));
 }
+
+#[test]
+fn note_list_tag_matches_non_ascii_exactly_as_stored() {
+    let (_root, reg, repo) = workspace();
+    assert!(amt(
+        &repo,
+        &reg,
+        &[
+            "note",
+            "create",
+            "--title",
+            "Übergabe Montag",
+            "--tag",
+            "Übergabe"
+        ]
+    )
+    .status
+    .success());
+    // The SQL-side filter folds exactly like storage did; the old Rust
+    // to_lowercase() folded Ü → ü and could never match the stored tag.
+    let out = amt(&repo, &reg, &["note", "list", "--tag", "Übergabe"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("Übergabe Montag"), "{}", stdout(&out));
+}

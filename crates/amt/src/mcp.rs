@@ -174,6 +174,7 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 label: opt_s(&args, "label"),
                 claimed: args.get("claimed").and_then(|v| v.as_bool()),
                 claimed_by: opt_s(&args, "claimed_by"),
+                not_claimed_by: None,
                 include_closed: args
                     .get("include_closed")
                     .and_then(|v| v.as_bool())
@@ -190,7 +191,8 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
         "claim_next_issue" => {
             let agent = agent_of(&args);
             let ttl = opt_i(&args, "ttl_seconds").unwrap_or(900);
-            let cooldown = opt_i(&args, "cooldown_seconds").unwrap_or(3600);
+            let cooldown =
+                opt_i(&args, "cooldown_seconds").unwrap_or(crate::model::DEFAULT_COOLDOWN_SECS);
             let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
             let any_ws = args
                 .get("any_workspace")
@@ -438,6 +440,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             ));
             text_result(id, &decisions)
         }
+        "list_notes" => {
+            let docs = run!(store::list_docs(
+                conn,
+                "note",
+                opt_s(&args, "tag").as_deref()
+            ));
+            text_result(id, &docs)
+        }
         "read_doc" => text_result(
             id.clone(),
             &run!(store::get_doc(conn, &try_arg!(req("id")))),
@@ -616,6 +626,8 @@ fn tool_defs() -> Vec<Value> {
         tool("list_decisions", "List recorded decisions, optionally for one issue. Superseded decisions hidden unless include_superseded.",
             json!({ "issue": s("Filter by issue key"), "include_superseded": b("Include superseded decisions") }),
             &[]),
+        tool("list_notes", "List knowledge-base notes (id, title, tags — no bodies), newest-updated first, optionally only those carrying a tag. Tag 'handoff' browses past session handoffs (the latest one already arrives in full via brief). Read a body with read_doc.",
+            json!({ "tag": s("Only notes carrying this tag, e.g. 'handoff'") }), &[]),
         tool("read_doc", "Read any document (issue, note, project, or decision) by id, key, or title.",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
         tool("search", "Full-text search (FTS5/BM25) across all issues, notes, and projects. No embeddings — exact terms work best; last term is prefix-matched.",
@@ -630,7 +642,7 @@ fn tool_defs() -> Vec<Value> {
         tool("brief", "Session-start orientation bundle for the whole workspace (the sibling of get_context, which is per-issue): the issues you hold with their lease expiry, what other agents have in flight, recent activity, the decisions behind it, the latest handoff note in full, and the next issues claim would serve you. Read-only — takes no lease and writes no activity. Call this FIRST in a fresh session, before claiming.",
             json!({ "agent": s("Agent to scope 'my work' and the claim-order preview to"),
                     "since": s("Window for activity + decisions: ISO-8601 instant or a duration like 24h / 7d (default 72h)"),
-                    "budget": i("Target size in serialized characters; drops whole low-value sections until it fits (backlog, activity tail, decisions, in-flight) and names each cut in 'dropped'. Your claimed work and the handoff note are never dropped, so a budget below that floor is still exceeded.") }),
+                    "budget": i("Target size in bytes of the JSON actually delivered; drops whole low-value sections until it fits (backlog, activity tail, decisions, in-flight) and names each cut in 'dropped'. Your claimed work and the handoff note are never dropped, so a budget below that floor is still exceeded.") }),
             &[]),
         tool("get_backlinks", "List all documents whose bodies link to the given document ([[wikilink]] graph).",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
