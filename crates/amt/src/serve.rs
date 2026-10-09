@@ -90,9 +90,16 @@ pub fn resolve(
 /// `$AMT_PORT` or the default. Kept in one place so the unit, the running
 /// server, and `doctor`'s advertised `ui` URL can never disagree.
 pub fn port_from_env() -> u16 {
-    std::env::var("AMT_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
+    parse_port(std::env::var("AMT_PORT").ok().as_deref())
+}
+
+/// The `AMT_PORT` parse, which must agree with `apps/web/server.ts`: anything
+/// unparseable, empty, out of u16 range, or 0 falls back to the default, and
+/// surrounding whitespace is ignored. A disagreement made AMT-40's stop step
+/// look for the board on a port it never bound.
+pub fn parse_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
         .unwrap_or(DEFAULT_PORT)
 }
 
@@ -933,6 +940,16 @@ mod tests {
             !s.required,
             "uninstall must succeed when nothing is installed"
         );
+    }
+
+    #[test]
+    fn port_parse_agrees_with_the_board() {
+        assert_eq!(parse_port(None), DEFAULT_PORT);
+        assert_eq!(parse_port(Some("4242")), 4242);
+        assert_eq!(parse_port(Some(" 5000\n")), 5000);
+        for bad in ["", "0", "70000", "-1", "abc"] {
+            assert_eq!(parse_port(Some(bad)), DEFAULT_PORT, "{bad:?}");
+        }
     }
 
     #[test]
