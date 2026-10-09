@@ -551,11 +551,7 @@ fn print_json(value: &impl serde::Serialize) {
 /// address the board never bound: anything unparseable, empty, out of u16
 /// range, or port 0 falls back to the default.
 fn ui_port() -> u16 {
-    std::env::var("AMT_PORT")
-        .ok()
-        .and_then(|p| p.trim().parse::<u16>().ok())
-        .filter(|p| *p != 0)
-        .unwrap_or(1776)
+    amt::serve::port_from_env()
 }
 
 /// The suite doctor handshake envelope (SUITE_CONTRACTS §3, schemaVersion 1).
