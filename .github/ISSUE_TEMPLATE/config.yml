@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Davidb3l/Ametrite/blob/main/SECURITY.md
+    about: Please do not file security problems as public issues. Report them privately as SECURITY.md describes.
+  - name: Documentation and quickstart
+    url: https://github.com/Davidb3l/Ametrite#quickstart
+    about: Install, first workspace, and the agent claim loop.
+  - name: The Sothis suite
+    url: https://github.com/Davidb3l/Sothis
+    about: Sirius Forester, Hayvenhurst, Catryna Wikinelli and PingMyBell, the tools Ametrite works with.
