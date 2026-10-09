@@ -11,7 +11,7 @@ const req = (method: string, headers: Record<string, string>) =>
 
 describe("rejectReason (AMT-34)", () => {
   test("the board's own page may read and write", () => {
-    for (const host of [`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]) {
+    for (const host of [`localhost:${PORT}`, `127.0.0.1:${PORT}`]) {
       expect(rejectReason(req("GET", { host }), PORT)).toBeNull();
       const own = { host, origin: `http://${host}`, "sec-fetch-site": "same-origin" };
       expect(rejectReason(req("POST", own), PORT)).toBeNull();
@@ -27,6 +27,8 @@ describe("rejectReason (AMT-34)", () => {
     expect(rejectReason(req("GET", { host: `attacker.example:${PORT}` }), PORT)).toContain("host");
     // Right name, wrong port: some other local service's page, not the board.
     expect(rejectReason(req("GET", { host: "localhost:3000" }), PORT)).toContain("host");
+    // The board binds IPv4 only, so the IPv6 name never legitimately reaches it.
+    expect(rejectReason(req("GET", { host: `[::1]:${PORT}` }), PORT)).toContain("host");
     expect(rejectReason(req("GET", {}), PORT)).toContain("host");
   });
 
@@ -65,7 +67,7 @@ describe("server.ts (AMT-34)", () => {
     db.run("CREATE TABLE issues (id TEXT, status TEXT)");
     db.close();
     writeFileSync(join(dir, "registry.json"), JSON.stringify({ workspaces: { guard: dir } }));
-    proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
+    proc = Bun.spawn([process.execPath, "run", join(import.meta.dir, "server.ts")], {
       cwd: dir,
       env: {
         ...process.env,
@@ -111,9 +113,12 @@ describe("server.ts (AMT-34)", () => {
     expect(res.status).toBe(403);
   });
 
-  test("a rebinding Host is refused", async () => {
-    const res = await fetch(`${base}/api/workspaces`, { headers: { host: `attacker.example:${port}` } });
-    expect(res.status).toBe(403);
+  test("a rebinding Host is refused, including on the live event stream", async () => {
+    for (const path of ["/api/workspaces", "/api/issues?ws=guard", "/api/events"]) {
+      const res = await fetch(`${base}${path}`, { headers: { host: `attacker.example:${port}` } });
+      expect(res.status).toBe(403);
+      await res.body?.cancel();
+    }
   });
 
   test("the board is not reachable on a non-loopback address", async () => {
