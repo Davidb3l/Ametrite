@@ -50,7 +50,7 @@ amt issue create --title "..." [-b "markdown body"] [--priority urgent|high|medi
 amt issue list [--status todo] [--project X] [--label Y] [--all] --json
 amt issue show AMT-7 --json          # body + activity + backlinks
 amt issue update AMT-7 [--status in_review] [--priority high] [-b "new body"] [--add-label X] --json
-amt issue comment AMT-7 -m "finding or progress note" --author $AMT_AGENT
+amt comment AMT-7 -m "finding or progress note" --author $AMT_AGENT   # alias of `amt issue comment`
 amt note create --title "..." -b "markdown" [--tag X]... --json
 amt note append <note-id> -b "## New section\n..."
 amt note list [--tag handoff] --json
