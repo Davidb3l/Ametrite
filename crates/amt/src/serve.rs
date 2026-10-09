@@ -561,17 +561,20 @@ pub fn windows_uninstall_step() -> Step {
 /// Everything is best effort: nothing running is not an error.
 fn windows_stop_board(port: u16) {
     let _ = step(false, &["/End", "/TN", WINDOWS_TASK]).run("schtasks");
-    let Some(pid) =
-        tool_stdout("netstat", &["-ano", "-p", "TCP"]).and_then(|o| netstat_listener(&o, port))
-    else {
-        return;
-    };
-    let filter = format!("PID eq {pid}");
-    let image = tool_stdout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
-        .and_then(|o| tasklist_image(&o));
-    if image.is_some_and(|i| i.eq_ignore_ascii_case("bun.exe")) {
-        let pid = pid.to_string();
-        let _ = run_tool("taskkill", &["/F".into(), "/T".into(), "/PID".into(), pid]);
+    // Every protocol, not `-p TCP`: that lists IPv4 only, and a pre-0.3.0
+    // board listens dual-stack on `[::]` — the one most worth stopping
+    // (AMT-42). Several boards can share the port across families.
+    let pids = tool_stdout("netstat", &["-ano"])
+        .map(|o| netstat_listeners(&o, port))
+        .unwrap_or_default();
+    for pid in pids {
+        let filter = format!("PID eq {pid}");
+        let image = tool_stdout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
+            .and_then(|o| tasklist_image(&o));
+        if image.is_some_and(|i| i.eq_ignore_ascii_case("bun.exe")) {
+            let pid = pid.to_string();
+            let _ = run_tool("taskkill", &["/F".into(), "/T".into(), "/PID".into(), pid]);
+        }
     }
 }
 
@@ -583,26 +586,33 @@ fn tool_stdout(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The PID listening on IPv4 `port` (loopback or any) in `netstat -ano -p TCP`
-/// output. Rows are `Proto Local Foreign State PID`; the State column is
-/// localized, so a listener is recognized by its `0.0.0.0:0` foreign address.
-pub fn netstat_listener(out: &str, port: u16) -> Option<u32> {
-    out.lines().find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let [proto, local, foreign, _state, pid] = f.as_slice() else {
-            return None;
-        };
-        let (host, p) = local.rsplit_once(':')?;
-        let listening = proto.eq_ignore_ascii_case("TCP")
-            && *foreign == "0.0.0.0:0"
-            && (host == "127.0.0.1" || host == "0.0.0.0")
-            && p.parse::<u16>().ok() == Some(port);
-        if listening {
-            pid.parse().ok()
-        } else {
-            None
-        }
-    })
+/// Every PID listening on `port` — IPv4 or IPv6, loopback or any address —
+/// in `netstat -ano` output. TCP rows are `Proto Local Foreign State PID`
+/// (UDP rows have no State, so they never match); the State column is
+/// localized, so a listener is recognized by its unspecified foreign address.
+pub fn netstat_listeners(out: &str, port: u16) -> Vec<u32> {
+    let mut pids: Vec<u32> = out
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [proto, local, foreign, _state, pid] = f.as_slice() else {
+                return None;
+            };
+            let (host, p) = local.rsplit_once(':')?;
+            let listening = proto.eq_ignore_ascii_case("TCP")
+                && (*foreign == "0.0.0.0:0" || *foreign == "[::]:0")
+                && matches!(host, "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]")
+                && p.parse::<u16>().ok() == Some(port);
+            if listening {
+                pid.parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 /// The image name from `tasklist /FO CSV /NH` output (`"bun.exe","1234",…`),
@@ -953,17 +963,23 @@ mod tests {
     }
 
     #[test]
-    fn netstat_finds_only_the_ipv4_listener_on_the_port() {
+    fn netstat_finds_every_listener_on_the_port_in_both_families() {
         let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n\
   TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1000\r\n\
   TCP    127.0.0.1:1776         127.0.0.1:50000        ESTABLISHED     2000\r\n\
   TCP    127.0.0.1:17760        0.0.0.0:0              LISTENING       3000\r\n\
-  TCP    127.0.0.1:1776         0.0.0.0:0              ABHÖREN         4242\r\n";
-        // Localized state, the established connection, and :17760 don't fool it.
-        assert_eq!(netstat_listener(out, 1776), Some(4242));
-        assert_eq!(netstat_listener(out, 135), Some(1000));
-        assert_eq!(netstat_listener(out, 9999), None);
-        assert_eq!(netstat_listener("", 1776), None);
+  TCP    127.0.0.1:1776         0.0.0.0:0              ABHÖREN         4242\r\n\
+  TCP    [::]:1776              [::]:0                 LISTENING       5151\r\n\
+  TCP    [::1]:1776             [::]:0                 LISTENING       4242\r\n\
+  TCP    [fe80::1%5]:1776       [::]:0                 LISTENING       6000\r\n\
+  UDP    0.0.0.0:1776           *:*                                    7000\r\n";
+        // The new board on 127.0.0.1 and an old dual-stack one on [::] are
+        // both found (AMT-42); localized state, established connections,
+        // :17760, a link-local bind, and UDP are not; PIDs are deduplicated.
+        assert_eq!(netstat_listeners(out, 1776), vec![4242, 5151]);
+        assert_eq!(netstat_listeners(out, 135), vec![1000]);
+        assert!(netstat_listeners(out, 9999).is_empty());
+        assert!(netstat_listeners("", 1776).is_empty());
     }
 
     #[test]
@@ -984,10 +1000,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_tools_find_a_real_listener() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let out = tool_stdout("netstat", &["-ano", "-p", "TCP"]).expect("netstat runs");
-        assert_eq!(netstat_listener(&out, port), Some(std::process::id()));
+        let me = std::process::id();
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let out = tool_stdout("netstat", &["-ano"]).expect("netstat runs");
+        assert_eq!(netstat_listeners(&out, port), vec![me]);
+        // An IPv6 listener, like a pre-0.3.0 board's [::] bind (AMT-42).
+        if let Ok(v6) = std::net::TcpListener::bind("[::]:0") {
+            let port6 = v6.local_addr().unwrap().port();
+            let out = tool_stdout("netstat", &["-ano"]).expect("netstat runs");
+            assert_eq!(netstat_listeners(&out, port6), vec![me]);
+        }
         let filter = format!("PID eq {}", std::process::id());
         let image = tool_stdout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
             .and_then(|o| tasklist_image(&o))

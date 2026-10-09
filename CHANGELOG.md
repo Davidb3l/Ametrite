@@ -52,7 +52,7 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
   (`amt upgrade`, then `amt serve --install`) actually serves the new version.
   On Windows, install and `amt serve --uninstall` also stop the board's
   `bun.exe`, which ending the scheduled task alone could leave running on the
-  port. (AMT-40)
+  port, including an older board listening on IPv6. (AMT-40, AMT-42)
 - Web board: a live update no longer destroys a comment or new-issue draft you
   are typing. Drafts are kept in localStorage until they post, and focus and
   caret survive the re-render. (AMT-28; f1ef40b)
