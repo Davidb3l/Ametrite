@@ -5,6 +5,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, dirname, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import index from "./index.html";
+import { BOARD_HOSTNAME, guarded } from "./guard";
 
 // 1776 — a local-first declaration of independence from cloud SaaS.
 // This parse must agree with `ui_port()` in crates/amt/src/main.rs, which
@@ -675,7 +676,30 @@ for (const [path, entry] of Object.entries(routes)) {
   }
 }
 
+// AMT-34: every API handler checks Host and Origin before it runs (guard.ts).
+// "/" is the static page bundle and carries no workspace data.
+for (const [path, entry] of Object.entries(routes)) {
+  if (path === "/") continue;
+  let wrapped = 0;
+  if (typeof entry === "function") {
+    routes[path] = guarded(entry, PORT);
+    wrapped++;
+  } else if (entry && typeof entry === "object") {
+    for (const [method, h] of Object.entries(entry)) {
+      if (typeof h === "function") {
+        entry[method] = guarded(h as any, PORT);
+        wrapped++;
+      }
+    }
+  }
+  // A route that serves data without a handler (a static Response, say) would
+  // bypass the guard; refuse to start rather than serve it unchecked.
+  if (wrapped === 0) throw new Error(`route ${path} has no handler to guard`);
+}
+
 Bun.serve({
+  // Loopback only: the board has no authentication (AMT-34).
+  hostname: BOARD_HOSTNAME,
   port: PORT,
   idleTimeout: 0,
   routes,

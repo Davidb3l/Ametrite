@@ -35,6 +35,14 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
   same flags and the same `--json` output. (AMT-31; #1, 1efd864)
 - This changelog. (AMT-37)
 
+### Security
+
+- Web board: `amt serve` now listens on 127.0.0.1 only, refuses API requests
+  whose `Host` isn't the board itself (DNS rebinding), and refuses writes from
+  another origin. Before this, any machine on your network, and any web page
+  open in your browser, could read and change every registered workspace.
+  (AMT-34)
+
 ### Fixed
 
 - Web board: a live update no longer destroys a comment or new-issue draft you
