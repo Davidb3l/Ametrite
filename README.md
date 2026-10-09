@@ -1,7 +1,20 @@
+<div align="center">
+
 # Ametrite
 
-**A local-first issue tracker and wikilinked knowledge base for AI agent workflows** —
-think Linear + Obsidian in one SQLite file, driven by a single Rust binary (`amt`) that is
+**A local-first issue board and knowledge base for AI coding agents: race-free claims, linked notes, and recorded decisions in one SQLite file.**
+
+[![CI](https://github.com/Davidb3l/Ametrite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Davidb3l/Ametrite/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/Davidb3l/Ametrite?sort=semver)](https://github.com/Davidb3l/Ametrite/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[Site](https://ametrite.com) · [Install](#install) · [Quickstart](#quickstart) · [Agents](AGENTS.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+Part of **[Sothis](https://getsothis.com)**, the local-first suite for running a fleet of AI coding agents on one repo ([suite repo](https://github.com/Davidb3l/Sothis)).
+
+</div>
+
+Think Linear + Obsidian in one SQLite file, driven by a single Rust binary (`amt`) that is
 both a CLI and an MCP server. No cloud, no accounts, no embeddings.
 
 ## Why
@@ -193,5 +206,6 @@ branch's commits to the closing comment.
 
 ## Status & license
 
-v0.1.0, early but functional — the engine is exercised by a Rust test suite and CI on
-Linux/macOS/Windows. MIT licensed ([LICENSE](LICENSE)).
+Pre-1.0, early but functional — the engine is exercised by a Rust test suite and CI on
+Linux/macOS/Windows. MIT licensed ([LICENSE](LICENSE)). Contributions welcome: see
+[CONTRIBUTING.md](CONTRIBUTING.md), and [SUPPORT.md](SUPPORT.md) for where questions go.
