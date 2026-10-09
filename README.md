@@ -8,7 +8,7 @@
 [![release](https://img.shields.io/github/v/release/Davidb3l/Ametrite?sort=semver)](https://github.com/Davidb3l/Ametrite/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Site](https://ametrite.com) · [Install](#install) · [Quickstart](#quickstart) · [Agents](AGENTS.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Site](https://ametrite.com) · [Install](#install) · [Quickstart](#quickstart) · [Agents](AGENTS.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
 Part of **[Sothis](https://getsothis.com)**, the local-first suite for running a fleet of AI coding agents on one repo ([suite repo](https://github.com/Davidb3l/Sothis)).
 
