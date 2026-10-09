@@ -1,7 +1,7 @@
 use amt::error::Result;
 use amt::model::*;
 use amt::{db, export, git, mcp, registry, store};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,6 +40,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IssueCmd,
     },
+    /// Add a comment to an issue (alias of `amt issue comment`)
+    Comment(CommentArgs),
     /// Manage issue dependencies (blocks / blocked-by)
     Dep {
         #[command(subcommand)]
@@ -366,14 +368,19 @@ enum IssueCmd {
         #[arg(long = "blocks")]
         blocks: Vec<String>,
     },
-    /// Add a comment to an issue
-    Comment {
-        id: String,
-        #[arg(long, short = 'm')]
-        body: String,
-        #[arg(long)]
-        author: Option<String>,
-    },
+    /// Add a comment to an issue (also available as `amt comment`)
+    Comment(CommentArgs),
+}
+
+/// Shared by `amt issue comment` and its top-level alias `amt comment`, so the
+/// two can never drift apart in flags or output.
+#[derive(Args)]
+struct CommentArgs {
+    id: String,
+    #[arg(long, short = 'm')]
+    body: String,
+    #[arg(long)]
+    author: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -519,6 +526,16 @@ fn open_workspace(cli_workspace: &Option<PathBuf>) -> Result<Connection> {
         }
     };
     db::open(&db_path)
+}
+
+fn comment(conn: &mut Connection, json: bool, args: &CommentArgs) -> Result<()> {
+    store::add_comment(conn, &args.id, &identity(args.author.clone()), &args.body)?;
+    if json {
+        print_json(&serde_json::json!({ "ok": true }));
+    } else {
+        println!("commented on {}", args.id);
+    }
+    Ok(())
 }
 
 fn print_json(value: &impl serde::Serialize) {
@@ -1133,16 +1150,13 @@ fn run(cli: Cli) -> Result<()> {
                         println!("updated {}", issue_line(&issue));
                     }
                 }
-                IssueCmd::Comment { id, body, author } => {
-                    store::add_comment(&mut conn, id, &identity(author.clone()), body)?;
-                    if cli.json {
-                        print_json(&serde_json::json!({ "ok": true }));
-                    } else {
-                        println!("commented on {id}");
-                    }
-                }
+                IssueCmd::Comment(args) => comment(&mut conn, cli.json, args)?,
             }
             Ok(())
+        }
+        Cmd::Comment(ref args) => {
+            let mut conn = open_workspace(&cli.workspace)?;
+            comment(&mut conn, cli.json, args)
         }
         Cmd::Dep { ref cmd } => {
             let mut conn = open_workspace(&cli.workspace)?;
