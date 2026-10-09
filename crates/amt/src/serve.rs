@@ -515,21 +515,22 @@ fn step(required: bool, args: &[&str]) -> Step {
 /// systemd: `enable --now` leaves an already-active unit running the OLD
 /// code, so an upgrade followed by `serve --install` kept serving the
 /// previous server.ts (AMT-40). `restart` starts it if stopped and restarts
-/// it if running. Pure so the sequence is testable.
+/// it if running; `reset-failed` first, so a unit that tripped its start
+/// limit in a crash loop accepts the restart. Pure so the sequence is testable.
 pub fn systemd_install_steps() -> Vec<Step> {
     vec![
         step(true, &["--user", "daemon-reload"]),
         step(true, &["--user", "enable", LINUX_UNIT]),
+        step(false, &["--user", "reset-failed", LINUX_UNIT]),
         step(true, &["--user", "restart", LINUX_UNIT]),
     ]
 }
 
-/// Task Scheduler: `/Create /F` replaces the task definition but not the
-/// instance already running, and `/Run` is a no-op while it runs, so stop
-/// it first (AMT-40). `/End` fails harmlessly when nothing is running.
-pub fn windows_install_steps(create: Vec<String>) -> Vec<Step> {
-    vec![
-        step(false, &["/End", "/TN", WINDOWS_TASK]),
+/// Task Scheduler: `/Create /F` replaces the task definition, then `/Run`
+/// starts it. Stopping the running instance happens before these, in
+/// [`windows_stop_board`] (AMT-40).
+pub fn windows_install_steps(create: Vec<String>) -> [Step; 2] {
+    [
         Step {
             args: create,
             required: true,
@@ -538,13 +539,71 @@ pub fn windows_install_steps(create: Vec<String>) -> Vec<Step> {
     ]
 }
 
-/// `/Delete` removes the task but leaves its running instance serving, so
-/// stop it first (AMT-40).
-pub fn windows_uninstall_steps() -> Vec<Step> {
-    vec![
-        step(false, &["/End", "/TN", WINDOWS_TASK]),
-        step(false, &["/Delete", "/F", "/TN", WINDOWS_TASK]),
-    ]
+/// Removing the task; best effort, so uninstall succeeds when nothing was
+/// installed. Stopping the running board happens first, in
+/// [`windows_stop_board`].
+pub fn windows_uninstall_step() -> Step {
+    step(false, &["/Delete", "/F", "/TN", WINDOWS_TASK])
+}
+
+/// Stop a running Windows board so it can be replaced or removed (AMT-40).
+/// `schtasks /End` terminates the task's action process, which is the
+/// `cmd /c` wrapper; Task Scheduler does not reliably take its child with
+/// it, so `bun.exe` can survive holding the port. So also find whoever
+/// listens on the board's port and, only if it is bun, kill its tree.
+/// Everything is best effort: nothing running is not an error.
+fn windows_stop_board(port: u16) {
+    let _ = step(false, &["/End", "/TN", WINDOWS_TASK]).run("schtasks");
+    let Some(pid) =
+        tool_stdout("netstat", &["-ano", "-p", "TCP"]).and_then(|o| netstat_listener(&o, port))
+    else {
+        return;
+    };
+    let filter = format!("PID eq {pid}");
+    let image = tool_stdout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
+        .and_then(|o| tasklist_image(&o));
+    if image.is_some_and(|i| i.eq_ignore_ascii_case("bun.exe")) {
+        let pid = pid.to_string();
+        let _ = run_tool("taskkill", &["/F".into(), "/T".into(), "/PID".into(), pid]);
+    }
+}
+
+/// A tool's stdout, or None if it could not run or failed.
+fn tool_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The PID listening on IPv4 `port` (loopback or any) in `netstat -ano -p TCP`
+/// output. Rows are `Proto Local Foreign State PID`; the State column is
+/// localized, so a listener is recognized by its `0.0.0.0:0` foreign address.
+pub fn netstat_listener(out: &str, port: u16) -> Option<u32> {
+    out.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [proto, local, foreign, _state, pid] = f.as_slice() else {
+            return None;
+        };
+        let (host, p) = local.rsplit_once(':')?;
+        let listening = proto.eq_ignore_ascii_case("TCP")
+            && *foreign == "0.0.0.0:0"
+            && (host == "127.0.0.1" || host == "0.0.0.0")
+            && p.parse::<u16>().ok() == Some(port);
+        if listening {
+            pid.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// The image name from `tasklist /FO CSV /NH` output (`"bun.exe","1234",…`),
+/// or None when no task matched (tasklist then prints a localized notice).
+pub fn tasklist_image(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.starts_with('"'))?;
+    let rest = &line[1..];
+    Some(rest[..rest.find('"')?].to_string())
 }
 
 /// Install (or refresh) the login service and start it — restarting it if it
@@ -564,9 +623,19 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(d)?;
     }
     if cfg!(target_os = "windows") {
-        for step in windows_install_steps(schtasks_create_args(&cfg.bun, &cfg.app, &cwd, &log)) {
-            step.run("schtasks")?;
-        }
+        // Stop the old board before re-registering: `/End` alone may leave
+        // bun running (see windows_stop_board), and the new task's bun could
+        // not bind the port it still holds. If `/Create` then fails, the board
+        // stays stopped — the error says so.
+        windows_stop_board(cfg.port);
+        let [create, run] =
+            windows_install_steps(schtasks_create_args(&cfg.bun, &cfg.app, &cwd, &log));
+        create.run("schtasks").map_err(|e| {
+            msg(format!(
+                "{e} (the previous board was stopped; rerun `amt serve --install`)"
+            ))
+        })?;
+        run.run("schtasks")?;
         return Ok(PathBuf::from(WINDOWS_TASK));
     }
     let unit = unit_path()?;
@@ -617,9 +686,8 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
 /// Remove the service, leaving no trace. Succeeds even if nothing was installed.
 pub fn uninstall() -> Result<()> {
     if cfg!(target_os = "windows") {
-        for step in windows_uninstall_steps() {
-            step.run("schtasks")?;
-        }
+        windows_stop_board(port_from_env());
+        windows_uninstall_step().run("schtasks")?;
         return Ok(());
     }
     if cfg!(target_os = "macos") {
@@ -833,6 +901,7 @@ mod tests {
             vec![
                 "--user daemon-reload".to_string(),
                 format!("--user enable {LINUX_UNIT}"),
+                format!("--user reset-failed {LINUX_UNIT}"),
                 format!("--user restart {LINUX_UNIT}"),
             ]
         );
@@ -840,25 +909,74 @@ mod tests {
             !cmds.iter().any(|c| c.contains("--now")),
             "enable --now never restarts"
         );
-        assert!(steps.iter().all(|s| s.required));
+        // Only reset-failed is best effort (nothing to reset is fine).
+        let required: Vec<bool> = steps.iter().map(|s| s.required).collect();
+        assert_eq!(required, vec![true, true, false, true]);
     }
 
     #[test]
-    fn windows_install_ends_the_running_task_before_recreating_it() {
+    fn windows_install_recreates_then_runs_the_task() {
         let steps = windows_install_steps(vec!["/Create".into(), "/F".into()]);
-        let cmds = argv(&steps);
-        assert_eq!(cmds[0], format!("/End /TN {WINDOWS_TASK}"));
-        assert_eq!(cmds[1], "/Create /F");
-        assert_eq!(cmds[2], format!("/Run /TN {WINDOWS_TASK}"));
-        // Nothing running is not an error; failing to create the task is.
-        assert!(!steps[0].required && steps[1].required && !steps[2].required);
+        assert_eq!(
+            argv(&steps),
+            vec!["/Create /F".to_string(), format!("/Run /TN {WINDOWS_TASK}")]
+        );
+        // Failing to create the task is an error; /Run racing a logon start isn't.
+        assert!(steps[0].required && !steps[1].required);
     }
 
     #[test]
-    fn windows_uninstall_stops_the_running_task_too() {
-        let cmds = argv(&windows_uninstall_steps());
-        assert_eq!(cmds[0], format!("/End /TN {WINDOWS_TASK}"));
-        assert_eq!(cmds[1], format!("/Delete /F /TN {WINDOWS_TASK}"));
+    fn windows_uninstall_is_best_effort() {
+        let s = windows_uninstall_step();
+        assert_eq!(s.args.join(" "), format!("/Delete /F /TN {WINDOWS_TASK}"));
+        assert!(
+            !s.required,
+            "uninstall must succeed when nothing is installed"
+        );
+    }
+
+    #[test]
+    fn netstat_finds_only_the_ipv4_listener_on_the_port() {
+        let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n\
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1000\r\n\
+  TCP    127.0.0.1:1776         127.0.0.1:50000        ESTABLISHED     2000\r\n\
+  TCP    127.0.0.1:17760        0.0.0.0:0              LISTENING       3000\r\n\
+  TCP    127.0.0.1:1776         0.0.0.0:0              ABHÖREN         4242\r\n";
+        // Localized state, the established connection, and :17760 don't fool it.
+        assert_eq!(netstat_listener(out, 1776), Some(4242));
+        assert_eq!(netstat_listener(out, 135), Some(1000));
+        assert_eq!(netstat_listener(out, 9999), None);
+        assert_eq!(netstat_listener("", 1776), None);
+    }
+
+    #[test]
+    fn tasklist_image_reads_the_first_csv_field() {
+        assert_eq!(
+            tasklist_image("\r\n\"bun.exe\",\"4242\",\"Console\",\"1\",\"50,000 K\"\r\n")
+                .as_deref(),
+            Some("bun.exe")
+        );
+        assert_eq!(
+            tasklist_image("INFO: No tasks are running which match the specified criteria.\r\n"),
+            None
+        );
+    }
+
+    /// The parsers against the real tools, on CI's Windows runner: this test
+    /// process listens on a port, and netstat + tasklist must name it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_tools_find_a_real_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let out = tool_stdout("netstat", &["-ano", "-p", "TCP"]).expect("netstat runs");
+        assert_eq!(netstat_listener(&out, port), Some(std::process::id()));
+        let filter = format!("PID eq {}", std::process::id());
+        let image = tool_stdout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
+            .and_then(|o| tasklist_image(&o))
+            .expect("tasklist names this process");
+        let me = std::env::current_exe().unwrap();
+        assert!(image.eq_ignore_ascii_case(me.file_name().unwrap().to_str().unwrap()));
     }
 
     #[test]

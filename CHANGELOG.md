@@ -50,8 +50,9 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
 - `amt serve --install` restarts a board that is already running on Linux and
   Windows too (it already did on macOS), so the documented upgrade step
   (`amt upgrade`, then `amt serve --install`) actually serves the new version.
-  `amt serve --uninstall` on Windows now stops the running board as well as
-  removing its task. (AMT-40)
+  On Windows, install and `amt serve --uninstall` also stop the board's
+  `bun.exe`, which ending the scheduled task alone could leave running on the
+  port. (AMT-40)
 - Web board: a live update no longer destroys a comment or new-issue draft you
   are typing. Drafts are kept in localStorage until they post, and focus and
   caret survive the re-render. (AMT-28; f1ef40b)
