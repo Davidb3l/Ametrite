@@ -40,7 +40,7 @@ export AMT_REGISTRY="$(mktemp -d)/registry.json"
 
 ## Tests
 
-CI (`.github/workflows/ci.yml`) runs these on every push and pull request; run them locally before opening a PR:
+CI (`.github/workflows/ci.yml`) runs these on every pull request and on pushes to `main`; run them locally before opening a PR:
 
 ```sh
 cargo fmt --check
@@ -57,8 +57,8 @@ CI also runs a release-build performance gate (`cargo run --release --example be
 2. Branch from `main`. Keep branches focused; one logical change per PR.
 3. Add tests for behavior changes. CLI contracts (such as `--json` printing exactly one JSON object) are tested by driving the real binary; see `crates/amt/tests/cli_*.rs`.
 4. Run the checks above.
-5. Update the docs where behavior changed: `README.md`, CLI help text, `AGENTS.md`, and the skill at `.claude/skills/ametrite/SKILL.md`.
-6. Sign off every commit (`git commit -s`).
+5. Update the docs where behavior changed: `README.md`, CLI help text, `AGENTS.md`, and the skill at `.claude/skills/ametrite/SKILL.md`. Add user-visible changes to `CHANGELOG.md` under "Unreleased".
+6. Sign off every commit (`git commit -s`). A CI check rejects pull requests with unsigned commits.
 7. Open the PR with the template.
 
 The maintainer aims to respond within a few days. If the PR is not the right fit, you will hear why and what would change that.
