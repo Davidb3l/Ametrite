@@ -489,7 +489,66 @@ fn run_tool(program: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Install (or refresh) the login service and start it. Idempotent.
+/// One service-manager invocation. `required` steps abort on failure;
+/// best-effort ones (stopping something that may not be running) don't.
+pub struct Step {
+    pub args: Vec<String>,
+    pub required: bool,
+}
+
+impl Step {
+    fn run(&self, program: &str) -> Result<()> {
+        match run_tool(program, &self.args) {
+            Err(e) if self.required => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn step(required: bool, args: &[&str]) -> Step {
+    Step {
+        args: args.iter().map(|a| a.to_string()).collect(),
+        required,
+    }
+}
+
+/// systemd: `enable --now` leaves an already-active unit running the OLD
+/// code, so an upgrade followed by `serve --install` kept serving the
+/// previous server.ts (AMT-40). `restart` starts it if stopped and restarts
+/// it if running. Pure so the sequence is testable.
+pub fn systemd_install_steps() -> Vec<Step> {
+    vec![
+        step(true, &["--user", "daemon-reload"]),
+        step(true, &["--user", "enable", LINUX_UNIT]),
+        step(true, &["--user", "restart", LINUX_UNIT]),
+    ]
+}
+
+/// Task Scheduler: `/Create /F` replaces the task definition but not the
+/// instance already running, and `/Run` is a no-op while it runs, so stop
+/// it first (AMT-40). `/End` fails harmlessly when nothing is running.
+pub fn windows_install_steps(create: Vec<String>) -> Vec<Step> {
+    vec![
+        step(false, &["/End", "/TN", WINDOWS_TASK]),
+        Step {
+            args: create,
+            required: true,
+        },
+        step(false, &["/Run", "/TN", WINDOWS_TASK]),
+    ]
+}
+
+/// `/Delete` removes the task but leaves its running instance serving, so
+/// stop it first (AMT-40).
+pub fn windows_uninstall_steps() -> Vec<Step> {
+    vec![
+        step(false, &["/End", "/TN", WINDOWS_TASK]),
+        step(false, &["/Delete", "/F", "/TN", WINDOWS_TASK]),
+    ]
+}
+
+/// Install (or refresh) the login service and start it — restarting it if it
+/// was already running, so it serves the current code. Idempotent.
 pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let log = log_path()?;
@@ -505,14 +564,9 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(d)?;
     }
     if cfg!(target_os = "windows") {
-        run_tool(
-            "schtasks",
-            &schtasks_create_args(&cfg.bun, &cfg.app, &cwd, &log),
-        )?;
-        let _ = run_tool(
-            "schtasks",
-            &["/Run".into(), "/TN".into(), WINDOWS_TASK.into()],
-        );
+        for step in windows_install_steps(schtasks_create_args(&cfg.bun, &cfg.app, &cwd, &log)) {
+            step.run("schtasks")?;
+        }
         return Ok(PathBuf::from(WINDOWS_TASK));
     }
     let unit = unit_path()?;
@@ -553,16 +607,9 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
             &unit,
             render_systemd_unit(&cfg.bun, &cfg.app, &cwd, &path_env, cfg.port),
         )?;
-        run_tool("systemctl", &["--user".into(), "daemon-reload".into()])?;
-        run_tool(
-            "systemctl",
-            &[
-                "--user".into(),
-                "enable".into(),
-                "--now".into(),
-                LINUX_UNIT.into(),
-            ],
-        )?;
+        for step in systemd_install_steps() {
+            step.run("systemctl")?;
+        }
     }
     Ok(unit)
 }
@@ -570,15 +617,9 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
 /// Remove the service, leaving no trace. Succeeds even if nothing was installed.
 pub fn uninstall() -> Result<()> {
     if cfg!(target_os = "windows") {
-        let _ = run_tool(
-            "schtasks",
-            &[
-                "/Delete".into(),
-                "/F".into(),
-                "/TN".into(),
-                WINDOWS_TASK.into(),
-            ],
-        );
+        for step in windows_uninstall_steps() {
+            step.run("schtasks")?;
+        }
         return Ok(());
     }
     if cfg!(target_os = "macos") {
@@ -775,6 +816,49 @@ mod tests {
             4242
         )
         .contains("AMT_PORT=4242"));
+    }
+
+    fn argv(steps: &[Step]) -> Vec<String> {
+        steps.iter().map(|s| s.args.join(" ")).collect()
+    }
+
+    /// AMT-40: re-installing must restart a running board, or an upgrade
+    /// keeps serving the old server.ts.
+    #[test]
+    fn systemd_install_restarts_a_running_unit() {
+        let steps = systemd_install_steps();
+        let cmds = argv(&steps);
+        assert_eq!(
+            cmds,
+            vec![
+                "--user daemon-reload".to_string(),
+                format!("--user enable {LINUX_UNIT}"),
+                format!("--user restart {LINUX_UNIT}"),
+            ]
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("--now")),
+            "enable --now never restarts"
+        );
+        assert!(steps.iter().all(|s| s.required));
+    }
+
+    #[test]
+    fn windows_install_ends_the_running_task_before_recreating_it() {
+        let steps = windows_install_steps(vec!["/Create".into(), "/F".into()]);
+        let cmds = argv(&steps);
+        assert_eq!(cmds[0], format!("/End /TN {WINDOWS_TASK}"));
+        assert_eq!(cmds[1], "/Create /F");
+        assert_eq!(cmds[2], format!("/Run /TN {WINDOWS_TASK}"));
+        // Nothing running is not an error; failing to create the task is.
+        assert!(!steps[0].required && steps[1].required && !steps[2].required);
+    }
+
+    #[test]
+    fn windows_uninstall_stops_the_running_task_too() {
+        let cmds = argv(&windows_uninstall_steps());
+        assert_eq!(cmds[0], format!("/End /TN {WINDOWS_TASK}"));
+        assert_eq!(cmds[1], format!("/Delete /F /TN {WINDOWS_TASK}"));
     }
 
     #[test]
