@@ -41,7 +41,9 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
   whose `Host` isn't the board itself (DNS rebinding), and refuses writes from
   another origin. Before this, any machine on your network, and any web page
   open in your browser, could read and change every registered workspace.
-  (AMT-34)
+  If you reach the board through an SSH port forward or a proxy, keep its port
+  number (for example `ssh -L 1776:127.0.0.1:1776`); a different port no longer
+  matches the board's `Host`. (AMT-34)
 
 ### Fixed
 

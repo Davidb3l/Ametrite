@@ -19,9 +19,11 @@ export const BOARD_HOSTNAME = "127.0.0.1";
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-/** The Host header values that name this board. */
+/** The Host header values that name this board. No `[::1]`: the board binds
+ * IPv4 loopback only, so nothing can reach it under that name. A port
+ * forward or proxy must keep the board's port number, or Host won't match. */
 export function boardHosts(port: number): Set<string> {
-  return new Set([`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`]);
+  return new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
 }
 
 /** The origins the board's own page can have. */
