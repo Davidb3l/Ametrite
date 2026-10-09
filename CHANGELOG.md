@@ -10,7 +10,28 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
-Everything below is on `main` but not yet in a release; v0.2.0 predates all of it.
+## [0.3.0] - 2026-10-09
+
+**Security release.** If you run the web board (`amt serve`), upgrade. In v0.2.0
+and earlier, other machines on your network, and web pages open in your browser,
+could read and change your workspaces through it (see Security below).
+
+Upgrading the binary does not restart a board that is already running. After
+`amt upgrade`, run `amt serve --install` (if you installed the board service) or
+restart `amt serve`. Then check the running board (on Windows PowerShell, type
+`curl.exe`, not `curl`; use your port instead of 1776 if you set `AMT_PORT`):
+
+```sh
+curl -s -o /dev/null -w "%{http_code}\n" -H "Host: example.com" http://127.0.0.1:1776/api/workspaces
+curl -s -o /dev/null -w "%{http_code}\n" "http://[::1]:1776/api/workspaces"
+```
+
+You are protected when the first prints `403` and the second prints `000`
+(nothing answers over IPv6). A `200` from either means an older board is still
+running: stop every `amt serve` / board process and start it again (on Windows,
+signing out and back in also works once you have run `amt serve --install`).
+If the first also prints `000`, no board answered on that port: it isn't
+running, or it uses another port.
 
 ### Added
 
@@ -43,7 +64,7 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
   open in your browser, could read and change every registered workspace.
   If you reach the board through an SSH port forward or a proxy, keep its port
   number (for example `ssh -L 1776:127.0.0.1:1776`); a different port no longer
-  matches the board's `Host`. (AMT-34)
+  matches the board's `Host`. (AMT-34; #4, 5c39a17, 3b7f15e)
 
 ### Fixed
 
@@ -52,7 +73,7 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
   (`amt upgrade`, then `amt serve --install`) actually serves the new version.
   On Windows, install and `amt serve --uninstall` also stop the board's
   `bun.exe`, which ending the scheduled task alone could leave running on the
-  port, including an older board listening on IPv6. (AMT-40, AMT-42)
+  port, including an older board listening on IPv6. (AMT-40, AMT-42; #5, #7)
 - Web board: a live update no longer destroys a comment or new-issue draft you
   are typing. Drafts are kept in localStorage until they post, and focus and
   caret survive the re-render. (AMT-28; f1ef40b)
@@ -63,3 +84,6 @@ Everything below is on `main` but not yet in a release; v0.2.0 predates all of i
 - Web board: a workspace re-created while the board is running no longer fails
   every request until a restart. The stale connection is reopened and the read
   retried once. (AMT-27; f1ef40b)
+
+[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Davidb3l/Ametrite/compare/v0.2.0...v0.3.0
