@@ -10,6 +10,12 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+### Added
+
+- Community health files: CONTRIBUTING (with a DCO sign-off requirement, checked
+  in CI), CODE_OF_CONDUCT, SECURITY, SUPPORT, and issue and pull request
+  templates. The README gains a header with badges and links. (AMT-32)
+
 ## [0.3.0] - 2026-10-09
 
 **Security release.** If you run the web board (`amt serve`), upgrade. In v0.2.0
@@ -55,9 +61,6 @@ running, or it uses another port.
 - `amt comment <KEY> -m …`: a top-level alias of `amt issue comment`, with the
   same flags and the same `--json` output. (AMT-31; #1, 1efd864)
 - This changelog. (AMT-37)
-- Community health files: CONTRIBUTING (with a DCO sign-off requirement, checked
-  in CI), CODE_OF_CONDUCT, SECURITY, SUPPORT, and issue and pull request
-  templates. The README gains a header with badges and links. (AMT-32)
 
 ### Security
 
