@@ -4,7 +4,7 @@ Thank you for considering a contribution. Ametrite is a small project with a sin
 
 ## Code of conduct
 
-This project adopts the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). See that file for how to report a violation.
+This project adopts the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Report violations to `dev@ametrite.com`.
 
 ## Developer Certificate of Origin (DCO)
 
