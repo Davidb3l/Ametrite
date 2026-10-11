@@ -127,3 +127,64 @@ fn doctor_fix_splits_legacy_labels_and_keeps_one_json_object() {
         stdout(&again)
     );
 }
+
+/// AMT-48: `--label` is repeatable or comma-separated (ALL must match) and
+/// `--not-label` excludes, on both `issue list` and `claim`.
+#[test]
+fn label_filters_take_several_labels_and_exclusions() {
+    let (_root, reg, repo) = workspace();
+    for (title, prio, labels) in [
+        ("UI bug", "high", "bug,ui"),
+        ("API bug", "medium", "bug,api"),
+        ("Owner question", "urgent", "question,ui"),
+    ] {
+        json(&amt(
+            &repo,
+            &reg,
+            &[
+                "issue",
+                "create",
+                "--title",
+                title,
+                "--priority",
+                prio,
+                "--label",
+                labels,
+                "--json",
+            ],
+        ));
+    }
+    let titles = |args: &[&str]| -> Vec<String> {
+        let mut full = vec!["issue", "list", "--json"];
+        full.extend_from_slice(args);
+        let v = json(&amt(&repo, &reg, &full));
+        let mut t: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap().to_string())
+            .collect();
+        t.sort();
+        t
+    };
+    assert_eq!(titles(&["--label", "bug", "--label", "ui"]), vec!["UI bug"]);
+    assert_eq!(titles(&["--label", "bug,ui"]), vec!["UI bug"]);
+    assert_eq!(
+        titles(&["--label", "ui", "--not-label", "question"]),
+        vec!["UI bug"]
+    );
+
+    // The urgent owner question would win on priority; --not-label skips it.
+    let peek = json(&amt(
+        &repo,
+        &reg,
+        &["claim", "--peek", "--not-label", "question", "--json"],
+    ));
+    assert_eq!(peek["title"], "UI bug");
+    let claimed = json(&amt(
+        &repo,
+        &reg,
+        &["claim", "--label", "bug", "--label", "api", "--json"],
+    ));
+    assert_eq!(claimed["title"], "API bug");
+}

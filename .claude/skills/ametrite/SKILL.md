@@ -75,7 +75,7 @@ lease and writes nothing. `--since 24h` narrows the window; `--budget <chars>` c
 size. Then claim:
 
 ```sh
-amt claim --agent $AMT_AGENT [--project X] [--label Y] [--ttl 900] --json
+amt claim --agent $AMT_AGENT [--project X] [--label Y]... [--not-label question,owner] [--ttl 900] --json
 ```
 
 Atomically claims the best available issue (priority, then age), sets it

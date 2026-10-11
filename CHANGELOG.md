@@ -19,6 +19,11 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   first and each chip showing its count; click again to clear. Bug labels on
   cards are tinted so bugs stand out even unfiltered. The label filter is kept
   when you pick a project. (AMT-44)
+- `amt claim` and `amt issue list` take `--label` more than once (or
+  comma-separated); an issue must carry all of them. `--not-label` excludes,
+  e.g. `amt claim --not-label question,owner` skips owner questions. The MCP
+  `list_issues` and `claim_next_issue` tools take the same as comma-separated
+  `label` and `not_label`. (AMT-48)
 
 ### Changed
 
