@@ -1347,7 +1347,7 @@ fn run(cli: Cli) -> Result<()> {
             let issue = store::release_issue(
                 &mut conn,
                 &id,
-                &actor.clone(),
+                &actor,
                 &status,
                 final_comment.as_deref(),
                 store::ReleaseOpts { force, no_cooldown },
@@ -1880,7 +1880,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Mcp => {
             let conn = open_workspace(&cli.workspace)?;
-            mcp::serve(conn)
+            // Only an explicit --agent: the server's own fallback chain
+            // ($AMT_AGENT, then "agent") applies per call otherwise.
+            mcp::serve(conn, cli.agent.clone())
         }
         Cmd::Ws { ref cmd } => match cmd {
             WsCmd::Add { path, alias } => {
@@ -2019,6 +2021,14 @@ fn run(cli: Cli) -> Result<()> {
             app,
             bun,
         } => {
+            // The board records the author each request sends; a process-wide
+            // --agent would be silently ignored, so refuse it (AMT-47 review).
+            if cli.agent.is_some() {
+                return Err(amt::error::msg(
+                    "--agent doesn't apply to `amt serve`: the board records the author each \
+                     request sends (set AMT_AGENT in its environment to change the default)",
+                ));
+            }
             // `serve` manages the binary and the web app, never a workspace —
             // it must work from anywhere, including outside a repo.
             if uninstall {

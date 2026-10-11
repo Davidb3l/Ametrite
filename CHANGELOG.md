@@ -25,9 +25,11 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 - `--agent` is accepted by every command, before or after it, with
   `--author` as an alias, so every write records who did it. `issue
   create/update`, `note create/append` and `dep add/rm` used to accept
-  neither and silently recorded `$USER`. An empty `--agent` or `AMT_AGENT`
-  now falls through to `$USER` instead of recording an empty author, and a
-  blank comment is refused. (AMT-47, AMT-36)
+  neither and silently recorded `$USER`. `amt mcp --agent X` makes `X` the
+  author of tool calls that don't pass their own `agent`. An empty
+  `--agent`, `AMT_AGENT` or MCP `agent` is treated as unset instead of being
+  recorded as an empty author, and a blank comment is refused. (AMT-47,
+  AMT-36)
 
 ### Fixed
 

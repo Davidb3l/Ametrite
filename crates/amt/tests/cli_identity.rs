@@ -207,3 +207,77 @@ fn a_blank_comment_is_refused() {
         .iter()
         .any(|(_, b)| b.trim().is_empty()));
 }
+
+/// Drive `amt mcp` over stdio: initialize, then one tools/call per item.
+fn mcp_calls(repo: &Path, reg: &Path, flags: &[&str], calls: &[serde_json::Value]) {
+    use std::io::Write;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_amt"));
+    cmd.current_dir(repo)
+        .env("AMT_REGISTRY", reg)
+        .env("USER", "human")
+        .env_remove("AMT_AGENT")
+        .args(flags)
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn amt mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    ];
+    for (n, c) in calls.iter().enumerate() {
+        lines.push(
+            serde_json::json!({"jsonrpc":"2.0","id": n + 1,"method":"tools/call","params": c}),
+        );
+    }
+    for l in lines {
+        writeln!(stdin, "{l}").unwrap();
+    }
+    drop(stdin);
+    assert!(child.wait_with_output().unwrap().status.success());
+}
+
+/// `amt mcp --agent X` is the author for calls without their own `agent`;
+/// a call's `agent` wins; an empty `agent` falls through (AMT-47 review).
+#[test]
+fn mcp_honors_agent_flag_and_ignores_empty_agents() {
+    let (_root, reg, repo) = workspace();
+    ok(amt(&repo, &reg, &["issue", "create", "--title", "One"]));
+    let comment = |body: &str, agent: Option<&str>| {
+        let mut args = serde_json::json!({ "id": "ID-1", "body": body });
+        if let Some(a) = agent {
+            args["agent"] = a.into();
+        }
+        serde_json::json!({ "name": "add_comment", "arguments": args })
+    };
+    mcp_calls(
+        &repo,
+        &reg,
+        &["--agent", "claude-mcp"],
+        &[
+            comment("default", None),
+            comment("explicit", Some("other")),
+            comment("blank", Some("  ")),
+        ],
+    );
+    mcp_calls(&repo, &reg, &[], &[comment("no flag", Some(""))]);
+    let log = activity(&repo, &reg, "ID-1");
+    let by = |body: &str| log.iter().find(|(_, b)| b == body).map(|(a, _)| a.clone());
+    assert_eq!(by("default").as_deref(), Some("claude-mcp"));
+    assert_eq!(by("explicit").as_deref(), Some("other"));
+    assert_eq!(by("blank").as_deref(), Some("claude-mcp"));
+    assert_eq!(
+        by("no flag").as_deref(),
+        Some("agent"),
+        "MCP's own fallback"
+    );
+}
+
+#[test]
+fn serve_refuses_an_agent_it_would_ignore() {
+    let (_root, reg, repo) = workspace();
+    let out = amt(&repo, &reg, &["serve", "--status", "--agent", "x"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("doesn't apply to `amt serve`"));
+}
