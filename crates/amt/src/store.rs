@@ -122,6 +122,28 @@ fn resolve_dangling(conn: &Connection, doc_id: i64, id: &str, title: &str) -> Re
     Ok(())
 }
 
+/// Normalize labels before they are written: split comma-joined entries,
+/// trim, drop empties, and dedupe (first occurrence wins). Without this,
+/// `--label "bug,ui"` stored the single label `bug,ui`, which no `--label bug`
+/// filter or board chip could find (AMT-45). Case is left to SQLite's
+/// `lower()` at insert, the same fold every tag filter uses — Rust's Unicode
+/// lowercasing would store `übergabe` where filters look for `Übergabe`.
+pub fn split_labels<S: AsRef<str>>(raw: &[S]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in raw.iter().flat_map(|r| r.as_ref().split(',')) {
+        let l = l.trim();
+        if !l.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(l)) {
+            out.push(l.to_string());
+        }
+    }
+    out
+}
+
+/// A label that `split_labels` would change (comma-joined or padded).
+fn is_malformed_label(l: &str) -> bool {
+    l.contains(',') || l.trim() != l
+}
+
 fn append_activity(
     conn: &Connection,
     doc_id: i64,
@@ -293,7 +315,7 @@ pub fn create_issue(conn: &mut Connection, ni: NewIssue) -> Result<Issue> {
             ni.due
         ],
     )?;
-    for label in &ni.labels {
+    for label in split_labels(&ni.labels) {
         tx.execute(
             "INSERT OR IGNORE INTO tags(doc_id, tag, src) VALUES (?1, lower(?2), 'label')",
             params![doc_id, label],
@@ -478,13 +500,13 @@ pub fn update_issue(
         )?;
         refresh_body_derived(&tx, doc_id, body)?;
     }
-    for label in &patch.add_labels {
+    for label in split_labels(&patch.add_labels) {
         tx.execute(
             "INSERT OR IGNORE INTO tags(doc_id, tag, src) VALUES (?1, lower(?2), 'label')",
             params![doc_id, label],
         )?;
     }
-    for label in &patch.remove_labels {
+    for label in split_labels(&patch.remove_labels) {
         // Only remove the explicit label, not an identically-named body-derived
         // #tag (which the body still contains and refresh_body_derived owns).
         tx.execute(
@@ -1315,7 +1337,7 @@ pub fn create_doc(conn: &mut Connection, nn: NewNote) -> Result<Doc> {
         params![id, nn.doc_type, nn.title, nn.body, at],
     )?;
     let doc_id = tx.last_insert_rowid();
-    for tag in &nn.tags {
+    for tag in split_labels(&nn.tags) {
         tx.execute(
             "INSERT OR IGNORE INTO tags(doc_id, tag, src) VALUES (?1, lower(?2), 'label')",
             params![doc_id, tag],
@@ -2295,13 +2317,15 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
         .collect::<std::result::Result<_, _>>()?;
 
     let dependency_cycles = find_dependency_cycles(conn)?;
+    let malformed_labels = malformed_labels(conn)?;
 
     let ok = unresolved_links.is_empty()
         && stale_claims.is_empty()
         && missing_parents.is_empty()
         && missing_projects.is_empty()
         && dangling_decisions.is_empty()
-        && dependency_cycles.is_empty();
+        && dependency_cycles.is_empty()
+        && malformed_labels.is_empty();
     Ok(DoctorReport {
         unresolved_links,
         stale_claims,
@@ -2309,8 +2333,62 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
         missing_projects,
         dangling_decisions,
         dependency_cycles,
+        malformed_labels,
         ok,
     })
+}
+
+/// Explicit labels/tags that `split_labels` would have rewritten, e.g. the
+/// single label `bug,ui` written before AMT-45. Body-derived #tags can't
+/// contain commas, so only `src = 'label'` rows are checked.
+fn malformed_labels(conn: &Connection) -> Result<Vec<MalformedLabel>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id, t.tag FROM tags t JOIN documents d ON d.doc_id = t.doc_id
+         WHERE t.src = 'label' ORDER BY d.id, t.tag",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, tag)| is_malformed_label(tag))
+        .map(|(id, label)| MalformedLabel {
+            fixed: split_labels(&[&label]),
+            id,
+            label,
+        })
+        .collect())
+}
+
+/// `amt doctor --fix`: rewrite every malformed label into the labels it
+/// should have been, logging the change on the document. Idempotent; returns
+/// what was repaired.
+pub fn fix_malformed_labels(conn: &mut Connection, author: &str) -> Result<Vec<MalformedLabel>> {
+    let tx = immediate(conn)?;
+    let found = malformed_labels(&tx)?;
+    for m in &found {
+        let doc_id = doc_id_of(&tx, &m.id)?;
+        tx.execute(
+            "DELETE FROM tags WHERE doc_id = ?1 AND tag = ?2 AND src = 'label'",
+            params![doc_id, m.label],
+        )?;
+        for l in &m.fixed {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags(doc_id, tag, src) VALUES (?1, lower(?2), 'label')",
+                params![doc_id, l],
+            )?;
+        }
+        append_activity(
+            &tx,
+            doc_id,
+            author,
+            "event",
+            &format!("label repaired: '{}' → {}", m.label, m.fixed.join(", ")),
+        )?;
+        touch(&tx, doc_id)?;
+    }
+    tx.commit()?;
+    Ok(found)
 }
 
 // ---------- event stream (R4) ----------

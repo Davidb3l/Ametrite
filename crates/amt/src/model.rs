@@ -188,7 +188,18 @@ pub struct DoctorReport {
     /// Cycles in the `blocks` dependency graph (each is an issue-key ring that
     /// can never drain, since every member waits on another). R3.
     pub dependency_cycles: Vec<DependencyCycle>,
+    /// Labels written comma-joined or padded before AMT-45 (e.g. `bug,ui`),
+    /// invisible to `--label bug`; `amt doctor --fix` splits them.
+    pub malformed_labels: Vec<MalformedLabel>,
     pub ok: bool,
+}
+
+/// One malformed label and what `doctor --fix` rewrites it to.
+#[derive(Debug, Serialize)]
+pub struct MalformedLabel {
+    pub id: String,
+    pub label: String,
+    pub fixed: Vec<String>,
 }
 
 /// One cycle in the dependency graph: the issue keys forming the ring, in

@@ -179,7 +179,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt hook install` | git commit-msg hook that appends `Refs: <KEY>` from the branch name |
 | `amt export <dir>` / `amt import <dir>` | Round-trip the workspace as an Obsidian-compatible markdown vault |
 | `amt ws add/list/remove` | Global workspace registry (`~/.ametrite/registry.json`) |
-| `amt doctor` | Workspace health: unresolved links, stale claims, missing refs |
+| `amt doctor [--fix]` | Workspace health: unresolved links, stale claims, missing refs, malformed labels; `--fix` splits comma-joined labels |
 | `amt serve [--install]` | Run the web board; `--install` registers a login service so it outlives your session (`--status`, `--uninstall`) |
 | `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
 | `amt gc [--archive-older-than N]` | Compact the database; optionally archive activity of issues closed >N days to `archive.db` (stats stay exact) |
