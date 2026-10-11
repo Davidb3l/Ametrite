@@ -38,7 +38,7 @@ What each install path checks:
 **Releases are not signed.** There are no GPG or Sigstore signatures and no build-provenance attestations. The checksums are published in the same release as the archives, so they catch a corrupted or truncated download, not a tampered release. To verify an archive by hand:
 
 ```sh
-TAG=v0.3.0; T=amt-aarch64-apple-darwin.tar.xz
+TAG=v0.4.1; T=amt-aarch64-apple-darwin.tar.xz
 curl -fLO "https://github.com/Davidb3l/Ametrite/releases/download/$TAG/$T"
 curl -fLO "https://github.com/Davidb3l/Ametrite/releases/download/$TAG/$T.sha256"
 shasum -a 256 -c "$T.sha256"     # or: sha256sum -c "$T.sha256"
