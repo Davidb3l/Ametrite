@@ -165,7 +165,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt init` | Create `.ametrite/ametrite.db` workspace in the current directory |
 | `amt issue create/list/show/update/comment` | Issue CRUD (labels, projects, parents, due dates) |
 | `amt comment <key> -m …` | Comment on an issue — top-level alias of `amt issue comment` (same flags, same `--json`) |
-| `amt claim` / `amt release` | Atomic claim-loop primitives (`--peek`, `--project`, `--label`, `--all-workspaces`). Operator resets: `release --force --no-cooldown` |
+| `amt claim` / `amt release` | Atomic claim-loop primitives (`--peek`, `--project`, `--label`, `--all-workspaces`). Operator resets: `release --force --no-cooldown`. Only a lease's holder can change its issue's status (`issue update --force` overrides); leaving in_progress ends the lease |
 | `amt dep add/rm/list` | Blocker → blocked dependencies (cycle-checked; blocked issues aren't claimable) |
 | `amt decide` / `amt decision list/show` | Record ADR-style decisions against issues; supersede old ones |
 | `amt note create/show/append/list` | Knowledge base (`--dedupe` warns on near-duplicate titles; `list --tag`) |
@@ -179,7 +179,7 @@ throughput, cycle time, and a claim-integrity audit.
 | `amt hook install` | git commit-msg hook that appends `Refs: <KEY>` from the branch name |
 | `amt export <dir>` / `amt import <dir>` | Round-trip the workspace as an Obsidian-compatible markdown vault |
 | `amt ws add/list/remove` | Global workspace registry (`~/.ametrite/registry.json`) |
-| `amt doctor [--fix]` | Workspace health: unresolved links, stale claims, missing refs, malformed labels; `--fix` splits comma-joined labels |
+| `amt doctor [--fix]` | Workspace health: unresolved links, stale claims, missing refs, malformed labels, closed issues still leased; `--fix` splits comma-joined labels and ends those leases |
 | `amt serve [--install]` | Run the web board; `--install` registers a login service so it outlives your session (`--status`, `--uninstall`) |
 | `amt seed --count N` | Bulk-insert N synthetic issues (benchmarking / demos) |
 | `amt gc [--archive-older-than N]` | Compact the database; optionally archive activity of issues closed >N days to `archive.db` (stats stay exact) |

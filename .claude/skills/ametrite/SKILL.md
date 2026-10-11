@@ -57,7 +57,7 @@ amt note list [--tag handoff] --json
 amt brief [--agent $AMT_AGENT] [--since 24h] [--budget 4000] --json   # session-start orientation
 amt search <terms> [--type issue|note|decision|project] [--tag X] --json   # FTS5; last term prefix-matches
 amt backlinks <id> --json            # who links here
-amt doctor [--fix]                   # unresolved links, stale claims, dangling decisions, malformed labels (--fix splits `bug,ui`)
+amt doctor [--fix]                   # unresolved links, stale claims, dangling decisions, malformed labels, closed-but-leased issues (--fix repairs the last two)
 ```
 
 ## The agent work loop
