@@ -45,17 +45,30 @@ impl Install {
 /// Classify how this binary was installed. Pure — every filesystem fact is
 /// passed in, so the precedence rules are unit-testable.
 ///
-/// A cargo-dist install receipt outranks a `CARGO_HOME` location because dist's
-/// *default* install path IS `$CARGO_HOME/bin`; the two are indistinguishable by
-/// path alone, and re-running `cargo install` on a dist install would silently
-/// switch the user to a source build.
-pub fn detect(exe: &Path, cargo_home: Option<&Path>, has_receipt: bool) -> Install {
-    detect_on(exe, cargo_home, has_receipt, cfg!(windows))
+/// dist's *default* install path IS `$CARGO_HOME/bin`, so a location there
+/// proves nothing: it is `cargo install` only when cargo's own install record
+/// lists amt (`cargo_lists_amt`), and a dist receipt outranks even that.
+/// Re-running `cargo install` on a dist install would silently switch the
+/// user to a source build, so every doubt falls back to the installer, which
+/// can only reinstall the same kind of binary.
+pub fn detect(
+    exe: &Path,
+    cargo_home: Option<&Path>,
+    has_receipt: bool,
+    cargo_lists_amt: bool,
+) -> Install {
+    detect_on(exe, cargo_home, has_receipt, cargo_lists_amt, cfg!(windows))
 }
 
 /// [`detect`] with the platform explicit, so Windows path rules are testable
 /// on any host.
-fn detect_on(exe: &Path, cargo_home: Option<&Path>, has_receipt: bool, windows: bool) -> Install {
+fn detect_on(
+    exe: &Path,
+    cargo_home: Option<&Path>,
+    has_receipt: bool,
+    cargo_lists_amt: bool,
+    windows: bool,
+) -> Install {
     let s = exe.to_string_lossy();
     if s.contains("/Cellar/") || s.contains("/homebrew/") || s.contains("/linuxbrew/") {
         return Install::Homebrew;
@@ -64,22 +77,44 @@ fn detect_on(exe: &Path, cargo_home: Option<&Path>, has_receipt: bool, windows: 
         return Install::Installer;
     }
     if let Some(home) = cargo_home {
-        if is_under(exe, home, windows) {
+        if cargo_lists_amt && is_under(exe, home, windows) {
             return Install::Cargo;
         }
     }
     Install::Installer
 }
 
+/// Whether cargo's install record (`$CARGO_HOME/.crates2.json`, or the older
+/// `.crates.toml`) lists the `amt` package. `cargo install` writes both; a dist
+/// installer writes neither. Keys look like `amt 0.4.1 (git+https://…)`. Pure.
+fn cargo_lists_amt(crates2_json: Option<&str>, crates_toml: Option<&str>) -> bool {
+    let is_amt = |key: &str| key.starts_with("amt ");
+    if let Some(v) = crates2_json.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()) {
+        if let Some(installs) = v.get("installs").and_then(|i| i.as_object()) {
+            return installs.keys().any(|k| is_amt(k));
+        }
+    }
+    crates_toml.is_some_and(|t| {
+        t.lines()
+            .any(|l| l.trim_start().strip_prefix('"').is_some_and(is_amt))
+    })
+}
+
 /// Whether `path` lies inside `dir`. Windows paths compare case-insensitively,
-/// with either slash, and ignoring a `\\?\` verbatim prefix.
+/// with either slash, ignoring a `\\?\` verbatim prefix (`\\?\UNC\` is the
+/// verbatim form of `\\`). Anything else that differs (8.3 short names, `..`)
+/// reads as "not inside", which [`detect`] treats as the installer.
 fn is_under(path: &Path, dir: &Path, windows: bool) -> bool {
     if !windows {
         return path.starts_with(dir);
     }
     let norm = |p: &Path| {
         let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
-        s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+        if let Some(unc) = s.strip_prefix(r"\\?\unc\") {
+            format!(r"\\{unc}")
+        } else {
+            s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+        }
     };
     let dir = norm(dir);
     let dir = dir.trim_end_matches('\\');
@@ -132,26 +167,32 @@ fn env_dir(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Where the cargo-dist installer records that it owns this binary. Pure;
-/// mirrors the installers: the PowerShell one uses `$XDG_CONFIG_HOME\amt`
-/// when that is set and `%LOCALAPPDATA%\amt` otherwise (AMT-54); the shell
-/// one uses `${XDG_CONFIG_HOME:-$HOME/.config}/amt`.
-fn receipt_path_from(
+/// Every place a cargo-dist installer may have recorded that it owns this
+/// binary. Pure. The PowerShell installer writes `$XDG_CONFIG_HOME\amt` when
+/// that is set and `%LOCALAPPDATA%\amt` otherwise (AMT-54); the shell
+/// installer writes `${XDG_CONFIG_HOME:-$HOME/.config}/amt`, except under
+/// Git Bash/MSYS on Windows, where it uses `$LOCALAPPDATA/amt`. XDG may also
+/// have been set or unset since the install, so every candidate counts.
+fn receipt_candidates(
     windows: bool,
     xdg_config_home: Option<PathBuf>,
     local_app_data: Option<PathBuf>,
     home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    let base = match xdg_config_home {
-        Some(xdg) => xdg,
-        None if windows => local_app_data?,
-        None => home?.join(".config"),
+) -> Vec<PathBuf> {
+    let fallback = if windows {
+        local_app_data
+    } else {
+        home.map(|h| h.join(".config"))
     };
-    Some(base.join("amt").join("amt-receipt.json"))
+    [xdg_config_home, fallback]
+        .into_iter()
+        .flatten()
+        .map(|base| base.join("amt").join("amt-receipt.json"))
+        .collect()
 }
 
-fn receipt_path() -> Option<PathBuf> {
-    receipt_path_from(
+fn receipt_candidates_here() -> Vec<PathBuf> {
+    receipt_candidates(
         cfg!(windows),
         env_dir("XDG_CONFIG_HOME"),
         env_dir("LOCALAPPDATA"),
@@ -193,8 +234,25 @@ pub fn current_install() -> Result<Install> {
     } else {
         exe.canonicalize().unwrap_or(exe)
     };
-    let has_receipt = receipt_path().is_some_and(|p| p.is_file());
-    Ok(detect(&exe, cargo_home().as_deref(), has_receipt))
+    let has_receipt = receipt_candidates_here().iter().any(|p| p.is_file());
+    let cargo_home = cargo_home();
+    let read = |name: &str| {
+        cargo_home
+            .as_ref()
+            .and_then(|h| std::fs::read_to_string(h.join(name)).ok())
+    };
+    let listed = cargo_lists_amt(
+        read(".crates2.json").as_deref(),
+        read(".crates.toml").as_deref(),
+    );
+    // Compare like with like: the exe was canonicalized above, so resolve
+    // CARGO_HOME the same way (a symlinked home, or macOS's /var → /private/var).
+    let cargo_home = if cfg!(windows) {
+        cargo_home
+    } else {
+        cargo_home.map(|h| h.canonicalize().unwrap_or(h))
+    };
+    Ok(detect(&exe, cargo_home.as_deref(), has_receipt, listed))
 }
 
 /// Resolve which install owns this binary and the command that upgrades it.
@@ -252,7 +310,7 @@ mod tests {
             "/home/linuxbrew/.linuxbrew/bin/amt",
         ] {
             assert_eq!(
-                detect(Path::new(p), Some(&cargo), false),
+                detect(Path::new(p), Some(&cargo), false, true),
                 Install::Homebrew,
                 "{p}"
             );
@@ -260,13 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn receipt_outranks_cargo_home_because_dist_installs_there_too() {
-        // dist's default install path is $CARGO_HOME/bin, so the receipt is the
-        // only thing distinguishing a dist install from `cargo install`.
+    fn cargo_needs_both_the_location_and_cargos_own_record() {
+        // dist's default install path is $CARGO_HOME/bin, so the location
+        // alone can't tell a dist install from `cargo install`.
         let cargo = PathBuf::from("/home/u/.cargo");
         let exe = PathBuf::from("/home/u/.cargo/bin/amt");
-        assert_eq!(detect(&exe, Some(&cargo), true), Install::Installer);
-        assert_eq!(detect(&exe, Some(&cargo), false), Install::Cargo);
+        assert_eq!(detect(&exe, Some(&cargo), false, true), Install::Cargo);
+        // A dist install with no receipt (AMT_DISABLE_UPDATE/unmanaged) is
+        // not in cargo's record: the installer, not a source build.
+        assert_eq!(detect(&exe, Some(&cargo), false, false), Install::Installer);
+        // A receipt outranks even cargo's record.
+        assert_eq!(detect(&exe, Some(&cargo), true, true), Install::Installer);
+        // Listed in cargo's record but running from elsewhere: not this binary.
+        let elsewhere = PathBuf::from("/usr/local/bin/amt");
+        assert_eq!(
+            detect(&elsewhere, Some(&cargo), false, true),
+            Install::Installer
+        );
     }
 
     #[test]
@@ -279,7 +347,7 @@ mod tests {
             "C:/Users/Ana/.cargo/bin/amt.exe",
         ] {
             assert_eq!(
-                detect_on(Path::new(exe), Some(&cargo), false, true),
+                detect_on(Path::new(exe), Some(&cargo), false, true, true),
                 Install::Cargo,
                 "{exe}"
             );
@@ -287,44 +355,88 @@ mod tests {
         let with_slash = PathBuf::from(r"C:\Users\Ana\.cargo\");
         let exe = Path::new(r"C:\Users\Ana\.cargo\bin\amt.exe");
         assert_eq!(
-            detect_on(exe, Some(&with_slash), false, true),
+            detect_on(exe, Some(&with_slash), false, true, true),
             Install::Cargo
         );
         // A sibling that merely shares the prefix is not inside it.
         let exe = Path::new(r"C:\Users\Ana\.cargo-old\bin\amt.exe");
         assert_eq!(
-            detect_on(exe, Some(&cargo), false, true),
+            detect_on(exe, Some(&cargo), false, true, true),
             Install::Installer
         );
-        // The receipt still wins, as on Unix.
+        // The receipt still wins, and cargo's record is still required.
         let exe = Path::new(r"C:\Users\Ana\.cargo\bin\amt.exe");
-        assert_eq!(detect_on(exe, Some(&cargo), true, true), Install::Installer);
+        assert_eq!(
+            detect_on(exe, Some(&cargo), true, true, true),
+            Install::Installer
+        );
+        assert_eq!(
+            detect_on(exe, Some(&cargo), false, false, true),
+            Install::Installer
+        );
     }
 
     #[test]
-    fn receipt_path_matches_where_each_installer_writes_it() {
+    fn windows_unc_paths_match_their_verbatim_form() {
+        let share = PathBuf::from(r"\\srv\home\ana\.cargo");
+        for exe in [
+            r"\\srv\home\ana\.cargo\bin\amt.exe",
+            r"\\?\UNC\srv\home\ana\.cargo\bin\amt.exe",
+        ] {
+            assert!(is_under(Path::new(exe), &share, true), "{exe}");
+        }
+        let verbatim = PathBuf::from(r"\\?\UNC\srv\home\ana\.cargo");
+        let exe = Path::new(r"\\srv\home\ana\.cargo\bin\amt.exe");
+        assert!(is_under(exe, &verbatim, true));
+        assert!(!is_under(exe, Path::new(r"\\srv\home\bob"), true));
+    }
+
+    #[test]
+    fn cargo_record_lists_amt_by_package_name() {
+        // The real formats, captured from `cargo install --root`.
+        let json = r#"{"installs":{"amt 0.4.1 (git+https://github.com/Davidb3l/Ametrite#043db39)":{"bins":["amt"]}}}"#;
+        let toml = "[v1]\n\"amt 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"amt\"]\n";
+        assert!(cargo_lists_amt(Some(json), None));
+        assert!(cargo_lists_amt(None, Some(toml)));
+        // Other packages, including ones whose name starts with "amt", don't count.
+        let other = r#"{"installs":{"amtool 1.0.0 (registry+x)":{"bins":["amt"]},"ripgrep 14.0.0 (registry+x)":{}}}"#;
+        assert!(!cargo_lists_amt(Some(other), None));
+        assert!(!cargo_lists_amt(
+            None,
+            Some("[v1]\n\"amtool 1.0.0 (x)\" = [\"amt\"]\n")
+        ));
+        // .crates2.json is authoritative when it parses; .crates.toml is the fallback.
+        assert!(!cargo_lists_amt(Some(r#"{"installs":{}}"#), Some(toml)));
+        assert!(cargo_lists_amt(Some("not json"), Some(toml)));
+        assert!(!cargo_lists_amt(None, None));
+    }
+
+    #[test]
+    fn receipt_candidates_cover_every_place_an_installer_writes_one() {
         let p = |s: &str| Some(PathBuf::from(s));
-        let receipt = |base: &str| Some(Path::new(base).join("amt").join("amt-receipt.json"));
-        // PowerShell installer: XDG_CONFIG_HOME when set, else LOCALAPPDATA (AMT-54).
+        let receipt = |base: &str| Path::new(base).join("amt").join("amt-receipt.json");
+        // PowerShell installer: XDG_CONFIG_HOME when set, else LOCALAPPDATA
+        // (AMT-54); the shell installer under Git Bash uses LOCALAPPDATA even
+        // with XDG set, and XDG may have changed since: check both.
         assert_eq!(
-            receipt_path_from(true, p(r"D:\xdg"), p(r"C:\L"), p(r"C:\H")),
-            receipt(r"D:\xdg")
+            receipt_candidates(true, p(r"D:\xdg"), p(r"C:\L"), p(r"C:\H")),
+            vec![receipt(r"D:\xdg"), receipt(r"C:\L")]
         );
         assert_eq!(
-            receipt_path_from(true, None, p(r"C:\L"), p(r"C:\H")),
-            receipt(r"C:\L")
+            receipt_candidates(true, None, p(r"C:\L"), p(r"C:\H")),
+            vec![receipt(r"C:\L")]
         );
-        assert_eq!(receipt_path_from(true, None, None, p(r"C:\H")), None);
+        assert!(receipt_candidates(true, None, None, p(r"C:\H")).is_empty());
         // Shell installer: ${XDG_CONFIG_HOME:-$HOME/.config}.
         assert_eq!(
-            receipt_path_from(false, p("/xdg"), p("/L"), p("/home/u")),
-            receipt("/xdg")
+            receipt_candidates(false, p("/xdg"), p("/L"), p("/home/u")),
+            vec![receipt("/xdg"), receipt("/home/u/.config")]
         );
         assert_eq!(
-            receipt_path_from(false, None, p("/L"), p("/home/u")),
-            receipt("/home/u/.config")
+            receipt_candidates(false, None, p("/L"), p("/home/u")),
+            vec![receipt("/home/u/.config")]
         );
-        assert_eq!(receipt_path_from(false, None, None, None), None);
+        assert!(receipt_candidates(false, None, None, None).is_empty());
     }
 
     #[test]
@@ -345,6 +457,12 @@ mod tests {
             "the profile wins: it's where rustup and the installer put .cargo"
         );
         assert_eq!(
+            cargo_home_from(true, None, p(r"C:\h"), None),
+            dot_cargo(r"C:\h"),
+            "HOME (Git Bash) when there is no profile"
+        );
+        assert_eq!(cargo_home_from(true, None, None, None), None);
+        assert_eq!(
             cargo_home_from(false, None, p("/home/u"), p("/ignored")),
             dot_cargo("/home/u")
         );
@@ -355,9 +473,9 @@ mod tests {
     fn unknown_location_falls_back_to_installer() {
         let cargo = PathBuf::from("/home/u/.cargo");
         let exe = PathBuf::from("/usr/local/bin/amt");
-        assert_eq!(detect(&exe, Some(&cargo), false), Install::Installer);
+        assert_eq!(detect(&exe, Some(&cargo), false, false), Install::Installer);
         // No CARGO_HOME at all is still safe.
-        assert_eq!(detect(&exe, None, false), Install::Installer);
+        assert_eq!(detect(&exe, None, false, true), Install::Installer);
     }
 
     #[test]
