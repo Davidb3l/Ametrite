@@ -150,6 +150,7 @@ fn find_web_app(start: &Path) -> Option<PathBuf> {
 const EMBEDDED_WEB_APP: &[(&str, &str)] = &[
     ("server.ts", include_str!("../../../apps/web/server.ts")),
     ("guard.ts", include_str!("../../../apps/web/guard.ts")),
+    ("search.ts", include_str!("../../../apps/web/search.ts")),
     ("index.html", include_str!("../../../apps/web/index.html")),
     (
         "package.json",

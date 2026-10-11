@@ -109,6 +109,76 @@ fn search_finds_by_content() {
     assert_eq!(hits.len(), 1);
 }
 
+/// AMT-43: ids aren't in the FTS index, so searching an issue key used to
+/// return only the documents that mention it — never the issue itself.
+#[test]
+fn searching_a_document_id_puts_that_document_first() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(
+        &mut conn,
+        new_issue("Live credentials", "Railway   and\nStripe keys.", "high"),
+    )
+    .unwrap(); // AMT-1
+    store::create_issue(
+        &mut conn,
+        new_issue("Dry run", "Blocked on AMT-1 credentials.", "low"),
+    )
+    .unwrap(); // AMT-2
+    let note = store::create_doc(
+        &mut conn,
+        store::NewNote {
+            title: "Handoff".into(),
+            body: "Live work needs AMT-1.".into(),
+            tags: vec![],
+            doc_type: "note".into(),
+            author: "test".into(),
+        },
+    )
+    .unwrap();
+    let all = store::SearchFilter::default();
+    let ids = |q: &str, f: &store::SearchFilter| -> Vec<String> {
+        store::search(&conn, q, f)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    };
+
+    let hits = store::search(&conn, "amt-1", &all).unwrap();
+    assert_eq!(hits[0].id, "AMT-1", "the issue itself comes first");
+    assert_eq!(hits[0].snippet, "Railway and Stripe keys.");
+    assert!(
+        hits[0].score < hits[1].score,
+        "ranked ahead of every FTS hit"
+    );
+    assert_eq!(hits.iter().filter(|h| h.id == "AMT-1").count(), 1);
+    assert!(
+        hits.iter().any(|h| h.id == note.id),
+        "mentions still follow"
+    );
+
+    // Case-insensitive, and notes match by slug too.
+    assert_eq!(ids("AMT-1", &all)[0], "AMT-1");
+    assert_eq!(ids(&note.id.to_uppercase(), &all)[0], note.id);
+
+    // Filters apply to the exact match.
+    let notes_only = store::SearchFilter {
+        doc_type: Some("note".into()),
+        ..Default::default()
+    };
+    assert_eq!(ids("amt-1", &notes_only), vec![note.id.clone()]);
+
+    // The limit still holds with the pinned hit added.
+    let one = store::SearchFilter {
+        limit: 1,
+        ..Default::default()
+    };
+    assert_eq!(ids("amt-1", &one), vec!["AMT-1".to_string()]);
+
+    // A multi-word query is plain full-text search.
+    assert!(!ids("amt-1 credentials", &all).contains(&"AMT-1".to_string()));
+}
+
 #[test]
 fn claim_orders_by_priority_and_is_exclusive() {
     let (_d, mut conn) = workspace();

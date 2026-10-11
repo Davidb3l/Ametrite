@@ -6,6 +6,7 @@ import { join, dirname, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import index from "./index.html";
 import { BOARD_HOSTNAME, guarded } from "./guard";
+import { search } from "./search";
 
 // 1776 — a local-first declaration of independence from cloud SaaS.
 // This parse must agree with `ui_port()` in crates/amt/src/main.rs, which
@@ -271,36 +272,6 @@ function getDoc(db: Database, id: string): any | null {
   return row;
 }
 
-function ftsQuery(q: string): string {
-  const terms = q.split(/\s+/).filter(Boolean).map((t) => `"${t.replaceAll('"', '""')}"`);
-  if (terms.length === 0) return "";
-  terms[terms.length - 1] += "*";
-  return terms.join(" ");
-}
-
-function search(db: Database, params: URLSearchParams): any[] {
-  const match = ftsQuery(params.get("q") ?? "");
-  if (!match) return [];
-  let sql = `
-    SELECT d.id, d.type, d.title, snippet(documents_fts, 1, '', '', '…', 18) AS snippet
-    FROM documents_fts JOIN documents d ON d.doc_id = documents_fts.rowid
-    WHERE documents_fts MATCH ?`;
-  const args: any[] = [match];
-  if (params.get("type")) {
-    sql += " AND d.type = ?";
-    args.push(params.get("type"));
-  }
-  if (params.get("tag")) {
-    sql += " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))";
-    args.push(params.get("tag"));
-  }
-  sql += " ORDER BY bm25(documents_fts) LIMIT 50";
-  try {
-    return db.query(sql).all(...args) as any[];
-  } catch {
-    return [];
-  }
-}
 
 // ---------- SSE: poll the registry + every workspace's data_version ----------
 const sseClients = new Set<ReadableStreamDefaultController>();
