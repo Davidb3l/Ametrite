@@ -11,5 +11,5 @@
 # .github/workflows/ci.yml, run `cargo fmt`, and commit any reflow in the same
 # change.
 [toolchain]
-channel = "1.97.0"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
