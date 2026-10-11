@@ -29,6 +29,14 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   does. The foreground board's PATH is no longer split on `:`, which broke
   `C:\` entries apart, and the installed board finds `amt` through `AMT_BIN`.
   (AMT-55)
+- Windows: `amt upgrade` now recognizes how `amt` was installed. It looked
+  for the PowerShell installer's receipt only under `%LOCALAPPDATA%`, but the
+  installer writes it under `%XDG_CONFIG_HOME%` when that is set. It also
+  missed `cargo install` builds: it needed `CARGO_HOME` to be set, and even
+  then compared the two paths in incompatible forms. Either way, `amt
+  upgrade` could pick the wrong installer. An empty
+  `XDG_CONFIG_HOME` or `CARGO_HOME` now counts as unset, as it does for the
+  installers. (AMT-54)
 
 ## [0.4.1] - 2026-10-11
 
