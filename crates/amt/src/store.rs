@@ -2617,7 +2617,7 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
         let completed: i64 = conn.query_row(
             "SELECT COUNT(*) FROM (
                SELECT d.id FROM activity a JOIN documents d ON d.doc_id = a.doc_id
-                WHERE a.author = ?1 AND a.kind = 'event' AND a.body LIKE '%→ done'
+                WHERE a.author = ?1 AND a.kind = 'event' AND (a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %')
                UNION
                SELECT issue_key FROM agent_completions WHERE agent = ?1
              )",
@@ -2656,6 +2656,9 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
 /// `--since` window (ISO-8601 lower bound on the completion time).
 pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
     // Per issue: its done-time (latest '→ done' event) and first-claim time.
+    // A forced release/status change appends "(forced by …)" after "→ done";
+    // every completion reader matches both forms, or forced completions would
+    // never count (found while adding forced status changes, AMT-46).
     // The '→ done' match must require kind='event' — a comment whose body ends
     // in '→ done' is not a real completion (agents() guards this the same way).
     //
@@ -2669,7 +2672,7 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
         FROM (
           SELECT key, MAX(done_at) AS done_at, MIN(claim_at) AS first_claim FROM (
             SELECT d.id AS key,
-                   MAX(CASE WHEN a.kind='event' AND a.body LIKE '%→ done' THEN a.at END) AS done_at,
+                   MAX(CASE WHEN a.kind='event' AND (a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %') THEN a.at END) AS done_at,
                    MIN(CASE WHEN a.kind='event'
                         AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
                         THEN a.at END) AS claim_at
@@ -2980,7 +2983,7 @@ pub fn archive_activity(
         // earlier archive pass, so stats can span a history split across
         // archive runs exactly as if it were never archived.
         let (done_at, first_claim): (Option<String>, Option<String>) = tx.query_row(
-            "SELECT MAX(CASE WHEN kind='event' AND body LIKE '%→ done' THEN at END),
+            "SELECT MAX(CASE WHEN kind='event' AND (body LIKE '%→ done' OR body LIKE '%→ done (forced by %') THEN at END),
                     MIN(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
                          OR body LIKE 'claim taken over from%') THEN at END)
              FROM activity WHERE doc_id = ?1",
@@ -3012,7 +3015,7 @@ pub fn archive_activity(
             "SELECT author,
                     SUM(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
                          OR body LIKE 'claim taken over from%') THEN 1 ELSE 0 END),
-                    MAX(CASE WHEN kind='event' AND body LIKE '%→ done' THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN kind='event' AND (body LIKE '%→ done' OR body LIKE '%→ done (forced by %') THEN 1 ELSE 0 END),
                     MAX(at)
              FROM activity WHERE doc_id = ?1 GROUP BY author",
         )?;

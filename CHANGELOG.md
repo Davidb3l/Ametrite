@@ -34,6 +34,10 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   operator can override with `amt issue update --force`, which is logged.
   `amt doctor` reports closed issues still holding a lease, and `--fix` ends
   those leases. (AMT-46)
+- `amt stats` and `amt agents` count forced completions (`release --force`
+  to done, and the new forced status change). They used to miss any
+  completion logged as forced, including ones already in your history,
+  which now count. (AMT-46)
 - Searching for a document's key (`MSX-269`, `D-142`, a note slug) finds that
   document, listed first. Keys weren't in the full-text index, so search only
   found other documents that mention the key. Applies to `amt search`, the MCP
