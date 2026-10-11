@@ -514,6 +514,66 @@ fn done_to_done_is_never_a_completion() {
     );
 }
 
+/// The done → done exclusion holds in every reader: a re-close must not move
+/// stats' done_at, nor the archive's per-issue done_at or per-author credit.
+#[test]
+fn done_to_done_moves_nothing_live_or_archived() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "test", "AMT").unwrap();
+    let mut conn = db::open(&path).unwrap();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    store::update_issue(&mut conn, "AMT-1", set_status("done", false), "alice").unwrap();
+    // The real completion happened in January.
+    conn.execute("UPDATE activity SET at = '2026-01-01T00:00:00.000Z'", [])
+        .unwrap();
+    // A left-over lease, cleared in March by re-closing it.
+    conn.execute(
+        "UPDATE issues SET claimed_by = 'zed', claim_expires_at = '2999-01-01T00:00:00.000Z'",
+        [],
+    )
+    .unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "op",
+        "done",
+        None,
+        store::ReleaseOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE activity SET at = '2026-03-01T00:00:00.000Z' WHERE author = 'op'",
+        [],
+    )
+    .unwrap();
+    let since_feb = |c: &rusqlite::Connection| {
+        store::stats(c, Some("2026-02-01T00:00:00.000Z"))
+            .unwrap()
+            .throughput
+    };
+    let op_credit = |c: &rusqlite::Connection| {
+        store::agents(c)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "op")
+            .map_or(0, |a| a.completed)
+    };
+    assert_eq!(since_feb(&conn), 0, "done_at stays in January (live)");
+    assert_eq!(op_credit(&conn), 0);
+
+    let report = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert_eq!(report.issues_archived, 1);
+    assert_eq!(since_feb(&conn), 0, "done_at stays in January (archived)");
+    assert_eq!(store::stats(&conn, None).unwrap().throughput, 1);
+    assert_eq!(op_credit(&conn), 0, "no archived credit for re-closing");
+}
+
 /// Ending a lease by a status change sets the same cooldown as release: the
 /// releaser isn't re-served the issue, other agents are.
 #[test]
@@ -571,6 +631,10 @@ fn forced_completions_survive_archiving() {
     store::update_issue(&mut conn, "AMT-1", set_status("done", true), "op").unwrap();
     let before = store::stats(&conn, None).unwrap().throughput;
     assert_eq!(before, 1);
+    // Archiving takes issues whose newest activity is strictly older than the
+    // cutoff; with 0 days that is "now", so backdate or it races the clock.
+    conn.execute("UPDATE activity SET at = '2026-01-01T00:00:00.000Z'", [])
+        .unwrap();
     let report = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
     assert!(report.issues_archived >= 1, "the done issue was archived");
     assert_eq!(store::stats(&conn, None).unwrap().throughput, 1);
