@@ -473,6 +473,115 @@ fn forced_completions_count_in_stats_and_agents() {
     assert_eq!(op.completed, 2);
 }
 
+/// Re-closing a done issue (e.g. `release --status done --force` to clear an
+/// old lease) is not a completion: no credit, and done_at doesn't move.
+#[test]
+fn done_to_done_is_never_a_completion() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    store::update_issue(&mut conn, "AMT-1", set_status("done", false), "alice").unwrap();
+    // A lease left behind on the done issue, then cleared the operator way.
+    conn.execute(
+        "UPDATE issues SET claimed_by = 'zed', claim_expires_at = '2999-01-01T00:00:00.000Z'",
+        [],
+    )
+    .unwrap();
+    let before = store::stats(&conn, None).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "op",
+        "done",
+        None,
+        store::ReleaseOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let after = store::stats(&conn, None).unwrap();
+    assert_eq!(after.throughput, before.throughput);
+    let op = store::agents(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "op");
+    assert!(
+        op.is_none_or(|a| a.completed == 0),
+        "no credit for re-closing"
+    );
+}
+
+/// Ending a lease by a status change sets the same cooldown as release: the
+/// releaser isn't re-served the issue, other agents are.
+#[test]
+fn status_change_release_sets_the_cooldown() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 3600, &any())
+        .unwrap()
+        .unwrap();
+    store::update_issue(&mut conn, "AMT-1", set_status("todo", false), "alice").unwrap();
+    assert!(store::claim_next(&mut conn, "alice", 900, 3600, &any())
+        .unwrap()
+        .is_none());
+    let bob = store::claim_next(&mut conn, "bob", 900, 3600, &any())
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob.id, "AMT-1");
+}
+
+/// A forced move INTO in_progress leaves the holder's lease in place, and
+/// says so in the log.
+#[test]
+fn forced_move_to_in_progress_keeps_the_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    // A live lease on an in_review issue (left by an older build).
+    conn.execute("UPDATE issues SET status = 'in_review'", [])
+        .unwrap();
+    let i =
+        store::update_issue(&mut conn, "AMT-1", set_status("in_progress", true), "bob").unwrap();
+    assert_eq!(
+        (i.status.as_str(), i.claimed_by.as_deref()),
+        ("in_progress", Some("alice"))
+    );
+    let log = store::activity(&conn, "AMT-1").unwrap();
+    assert!(log.iter().any(
+        |a| a.body == "status: in_review → in_progress (forced by bob; alice keeps the lease)"
+    ));
+}
+
+/// Forced completions still count after their activity is archived: the
+/// archive's per-issue and per-author metrics use the same matcher.
+#[test]
+fn forced_completions_survive_archiving() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "test", "AMT").unwrap();
+    let mut conn = db::open(&path).unwrap();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    store::update_issue(&mut conn, "AMT-1", set_status("done", true), "op").unwrap();
+    let before = store::stats(&conn, None).unwrap().throughput;
+    assert_eq!(before, 1);
+    let report = store::archive_activity(&mut conn, &archive_path(&dir), 0, "gc-bot").unwrap();
+    assert!(report.issues_archived >= 1, "the done issue was archived");
+    assert_eq!(store::stats(&conn, None).unwrap().throughput, 1);
+    let op = store::agents(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "op")
+        .unwrap();
+    assert_eq!(op.completed, 1);
+}
+
 /// An expired lease protects nothing: anyone may move the issue, ending it.
 #[test]
 fn status_change_over_a_stale_lease_needs_no_force() {
@@ -503,8 +612,15 @@ fn doctor_reports_and_fixes_leases_on_closed_issues() {
     assert_eq!(report.closed_leases.len(), 1);
     assert_eq!(report.closed_leases[0].claimed_by, "claude-main");
 
+    let before = store::stats(&conn, None).unwrap().throughput;
     let fixed = store::fix_closed_leases(&mut conn, "doctor").unwrap();
     assert_eq!(fixed.len(), 1);
+    // Clearing a lease is not a completion (it must not credit "doctor").
+    assert_eq!(store::stats(&conn, None).unwrap().throughput, before);
+    assert!(store::agents(&conn)
+        .unwrap()
+        .iter()
+        .all(|a| a.name != "doctor" || a.completed == 0));
     let i = store::get_issue(&conn, "AMT-1").unwrap();
     assert!(i.claimed_by.is_none());
     assert_eq!(i.status, "done", "status untouched");

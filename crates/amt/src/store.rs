@@ -147,6 +147,38 @@ fn is_malformed_label(l: &str) -> bool {
     l.contains(',') || l.trim() != l
 }
 
+/// The refusal for changing the status of an issue someone else holds a live
+/// lease on. Worded for every surface: MCP and the board have no override.
+fn lease_refusal(id: &str, holder: &str, expires: &str) -> crate::error::Error {
+    msg(format!(
+        "'{id}' is claimed by {holder} until {expires}; only {holder} can change its status \
+         until then (an operator can override with `amt issue update --force`)"
+    ))
+}
+
+/// Would `update_issue` refuse this status change by `author`? Lets a caller
+/// that does other writes first (the CLI's dependency edges) check before any
+/// of them commit, so a refused update leaves nothing behind (AMT-46).
+pub fn check_status_change(
+    conn: &Connection,
+    key: &str,
+    status: &str,
+    author: &str,
+    force: bool,
+) -> Result<()> {
+    let issue = load_issue(conn, key, false)?;
+    if force || issue.status == status {
+        return Ok(());
+    }
+    let now = db::now(conn)?;
+    if let (Some(holder), Some(expires)) = (&issue.claimed_by, &issue.claim_expires_at) {
+        if holder != author && *expires >= now {
+            return Err(lease_refusal(&issue.id, holder, expires));
+        }
+    }
+    Ok(())
+}
+
 fn append_activity(
     conn: &Connection,
     doc_id: i64,
@@ -424,11 +456,7 @@ pub fn update_issue(
             if let (Some(holder), Some(expires)) = (&before.claimed_by, &before.claim_expires_at) {
                 if holder != author && *expires >= now {
                     if !patch.force {
-                        return Err(msg(format!(
-                            "'{}' is claimed by {holder} until {expires}; only the holder can \
-                             change its status (use --force to override)",
-                            before.id
-                        )));
+                        return Err(lease_refusal(&before.id, holder, expires));
                     }
                     displaced = Some(holder);
                 }
@@ -2617,7 +2645,7 @@ pub fn agents(conn: &Connection) -> Result<Vec<AgentRow>> {
         let completed: i64 = conn.query_row(
             "SELECT COUNT(*) FROM (
                SELECT d.id FROM activity a JOIN documents d ON d.doc_id = a.doc_id
-                WHERE a.author = ?1 AND a.kind = 'event' AND (a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %')
+                WHERE a.author = ?1 AND a.kind = 'event' AND ((a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %') AND a.body NOT LIKE '%done → done%')
                UNION
                SELECT issue_key FROM agent_completions WHERE agent = ?1
              )",
@@ -2658,7 +2686,9 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
     // Per issue: its done-time (latest '→ done' event) and first-claim time.
     // A forced release/status change appends "(forced by …)" after "→ done";
     // every completion reader matches both forms, or forced completions would
-    // never count (found while adding forced status changes, AMT-46).
+    // never count (found while adding forced status changes, AMT-46). A
+    // "done → done" event (re-closing to clear a lease) is never a completion:
+    // it would credit the closer and move done_at to the clearing time.
     // The '→ done' match must require kind='event' — a comment whose body ends
     // in '→ done' is not a real completion (agents() guards this the same way).
     //
@@ -2672,7 +2702,7 @@ pub fn stats(conn: &Connection, since: Option<&str>) -> Result<Stats> {
         FROM (
           SELECT key, MAX(done_at) AS done_at, MIN(claim_at) AS first_claim FROM (
             SELECT d.id AS key,
-                   MAX(CASE WHEN a.kind='event' AND (a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %') THEN a.at END) AS done_at,
+                   MAX(CASE WHEN a.kind='event' AND ((a.body LIKE '%→ done' OR a.body LIKE '%→ done (forced by %') AND a.body NOT LIKE '%done → done%') THEN a.at END) AS done_at,
                    MIN(CASE WHEN a.kind='event'
                         AND (a.body LIKE 'claimed (%' OR a.body LIKE 'claim taken over from%')
                         THEN a.at END) AS claim_at
@@ -2983,7 +3013,7 @@ pub fn archive_activity(
         // earlier archive pass, so stats can span a history split across
         // archive runs exactly as if it were never archived.
         let (done_at, first_claim): (Option<String>, Option<String>) = tx.query_row(
-            "SELECT MAX(CASE WHEN kind='event' AND (body LIKE '%→ done' OR body LIKE '%→ done (forced by %') THEN at END),
+            "SELECT MAX(CASE WHEN kind='event' AND ((body LIKE '%→ done' OR body LIKE '%→ done (forced by %') AND body NOT LIKE '%done → done%') THEN at END),
                     MIN(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
                          OR body LIKE 'claim taken over from%') THEN at END)
              FROM activity WHERE doc_id = ?1",
@@ -3015,7 +3045,7 @@ pub fn archive_activity(
             "SELECT author,
                     SUM(CASE WHEN kind='event' AND (body LIKE 'claimed (%'
                          OR body LIKE 'claim taken over from%') THEN 1 ELSE 0 END),
-                    MAX(CASE WHEN kind='event' AND (body LIKE '%→ done' OR body LIKE '%→ done (forced by %') THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN kind='event' AND ((body LIKE '%→ done' OR body LIKE '%→ done (forced by %') AND body NOT LIKE '%done → done%') THEN 1 ELSE 0 END),
                     MAX(at)
              FROM activity WHERE doc_id = ?1 GROUP BY author",
         )?;

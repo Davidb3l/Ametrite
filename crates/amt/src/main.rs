@@ -1127,6 +1127,11 @@ fn run(cli: Cli) -> Result<()> {
                             .map(|s| if s.is_empty() { None } else { Some(s.clone()) })
                     };
                     let me = identity(None);
+                    // A status change another agent's live lease forbids must
+                    // fail before the edges below commit (AMT-46).
+                    if let Some(s) = status {
+                        store::check_status_change(&conn, id, s, &me, *force)?;
+                    }
                     // Apply dependency edges first: add_block validates target
                     // existence, self-blocks, and cycles, so a bad --blocks /
                     // --blocked-by aborts before any field change is committed.
