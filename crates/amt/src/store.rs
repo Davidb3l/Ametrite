@@ -1474,8 +1474,87 @@ fn fts_query_any(q: &str) -> String {
 
 /// Explicit full-text search: ANDs the query terms (a hit must contain them
 /// all), prefix-matching the last term for incremental typing.
+///
+/// A query that is exactly a document's id (`MSX-269`, `D-142`, a note slug;
+/// case-insensitive) puts that document first. Ids aren't in the FTS index,
+/// so without this, searching a key found only the documents that *mention*
+/// it, never the document itself (AMT-43).
 pub fn search(conn: &Connection, query: &str, f: &SearchFilter) -> Result<Vec<SearchHit>> {
-    search_with_expr(conn, &fts_query(query), f)
+    let mut hits = search_with_expr(conn, &fts_query(query), f)?;
+    if let Some(mut exact) = exact_id_hit(conn, query.trim(), f)? {
+        hits.retain(|h| !h.id.eq_ignore_ascii_case(&exact.id));
+        // bm25 scores are negative and lower is better: rank it one point
+        // ahead of the best full-text hit, keeping `score` readable in JSON.
+        exact.score = hits.iter().map(|h| h.score).fold(0.0, f64::min) - 1.0;
+        hits.insert(0, exact);
+        hits.truncate(search_limit(f) as usize);
+    }
+    Ok(hits)
+}
+
+/// The document whose id is exactly `q`, if it passes the filters. Its
+/// score is set by the caller, relative to the full-text hits.
+fn exact_id_hit(conn: &Connection, q: &str, f: &SearchFilter) -> Result<Option<SearchHit>> {
+    if q.is_empty() || q.contains(char::is_whitespace) {
+        return Ok(None);
+    }
+    // documents.id is COLLATE NOCASE, so `=` is already case-insensitive.
+    let mut sql = String::from(
+        "SELECT d.id, d.type, d.title, substr(d.body, 1, 160) FROM documents d WHERE d.id = ?",
+    );
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(q.to_string())];
+    push_search_filters(f, &mut sql, &mut args);
+    let hit = conn
+        .query_row(
+            &sql,
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            |r| {
+                let body: String = r.get(3)?;
+                Ok(SearchHit {
+                    id: r.get(0)?,
+                    doc_type: r.get(1)?,
+                    title: r.get(2)?,
+                    snippet: body.split_whitespace().collect::<Vec<_>>().join(" "),
+                    score: 0.0,
+                })
+            },
+        )
+        .optional()?;
+    Ok(hit)
+}
+
+fn search_limit(f: &SearchFilter) -> i64 {
+    if f.limit > 0 {
+        f.limit
+    } else {
+        25
+    }
+}
+
+/// The type / status / tag / project filters shared by every search query.
+fn push_search_filters(f: &SearchFilter, sql: &mut String, args: &mut Vec<Box<dyn ToSql>>) {
+    if let Some(t) = &f.doc_type {
+        sql.push_str(" AND d.type = ?");
+        args.push(Box::new(t.clone()));
+    }
+    if let Some(s) = &f.status {
+        sql.push_str(
+            " AND EXISTS(SELECT 1 FROM issues i WHERE i.doc_id = d.doc_id AND i.status = ?)",
+        );
+        args.push(Box::new(s.clone()));
+    }
+    if let Some(t) = &f.tag {
+        sql.push_str(
+            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
+        );
+        args.push(Box::new(t.clone()));
+    }
+    if let Some(p) = &f.project {
+        sql.push_str(
+            " AND EXISTS(SELECT 1 FROM issues i WHERE i.doc_id = d.doc_id AND i.project = ?)",
+        );
+        args.push(Box::new(p.clone()));
+    }
 }
 
 /// Recall-oriented related-doc search: ORs the query terms so a doc sharing
@@ -1505,30 +1584,9 @@ fn search_with_expr(
          WHERE documents_fts MATCH ?",
     );
     let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(match_expr)];
-    if let Some(t) = &f.doc_type {
-        sql.push_str(" AND d.type = ?");
-        args.push(Box::new(t.clone()));
-    }
-    if let Some(s) = &f.status {
-        sql.push_str(
-            " AND EXISTS(SELECT 1 FROM issues i WHERE i.doc_id = d.doc_id AND i.status = ?)",
-        );
-        args.push(Box::new(s.clone()));
-    }
-    if let Some(t) = &f.tag {
-        sql.push_str(
-            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
-        );
-        args.push(Box::new(t.clone()));
-    }
-    if let Some(p) = &f.project {
-        sql.push_str(
-            " AND EXISTS(SELECT 1 FROM issues i WHERE i.doc_id = d.doc_id AND i.project = ?)",
-        );
-        args.push(Box::new(p.clone()));
-    }
+    push_search_filters(f, &mut sql, &mut args);
     sql.push_str(" ORDER BY bm25(documents_fts) LIMIT ?");
-    args.push(Box::new(if f.limit > 0 { f.limit } else { 25 }));
+    args.push(Box::new(search_limit(f)));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),

@@ -16,6 +16,13 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   in CI), CODE_OF_CONDUCT, SECURITY, SUPPORT, and issue and pull request
   templates. The README gains a header with badges and links. (AMT-32)
 
+### Fixed
+
+- Searching for a document's key (`MSX-269`, `D-142`, a note slug) finds that
+  document, listed first. Keys weren't in the full-text index, so search only
+  found other documents that mention the key. Applies to `amt search`, the MCP
+  `search` tool, and the web board's search and ⌘K palette. (AMT-43)
+
 ## [0.3.0] - 2026-10-09
 
 **Security release.** If you run the web board (`amt serve`), upgrade. In v0.2.0
