@@ -212,7 +212,7 @@ fn comma_joined_labels_are_split_on_every_write() {
     let bugs = store::list_issues(
         &conn,
         &store::IssueFilter {
-            label: Some("bug".into()),
+            labels: vec!["bug".into()],
             ..Default::default()
         },
     )
@@ -313,6 +313,68 @@ fn doctor_reports_and_fixes_legacy_comma_joined_labels() {
     assert!(store::fix_malformed_labels(&mut conn, "doctor")
         .unwrap()
         .is_empty());
+}
+
+/// AMT-48: label filters are AND across --label and NONE across --not-label,
+/// identically for list, claim, and peek.
+#[test]
+fn label_filters_and_include_and_exclude_on_list_and_claim() {
+    let (_d, mut conn) = workspace();
+    for (title, prio, labels) in [
+        ("UI bug", "urgent", vec!["bug", "ui"]),
+        ("API bug", "high", vec!["bug", "api"]),
+        ("Owner question", "urgent", vec!["question", "ui"]),
+        ("Plain", "low", vec![]),
+    ] {
+        let mut ni = new_issue(title, "", prio);
+        ni.labels = labels.into_iter().map(String::from).collect();
+        store::create_issue(&mut conn, ni).unwrap();
+    }
+    let titles = |labels: &[&str], not: &[&str]| -> Vec<String> {
+        store::list_issues(
+            &conn,
+            &store::IssueFilter {
+                labels: labels.iter().map(|s| s.to_string()).collect(),
+                not_labels: not.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|i| i.title)
+        .collect()
+    };
+    assert_eq!(titles(&["bug", "ui"], &[]), vec!["UI bug"]);
+    let mut bugs = titles(&["bug"], &[]);
+    bugs.sort();
+    assert_eq!(bugs, vec!["API bug", "UI bug"]);
+    assert_eq!(titles(&["ui"], &["question"]), vec!["UI bug"]);
+    assert!(!titles(&[], &["question"]).contains(&"Owner question".to_string()));
+    assert!(titles(&["bug", "nope"], &[]).is_empty());
+
+    // Claim: the urgent owner question would win on priority; --not-label
+    // skips it, and peek agrees with claim.
+    let not = vec!["question".to_string()];
+    let f = store::ClaimFilter {
+        not_labels: &not,
+        ..Default::default()
+    };
+    let peeked = store::peek_next(&conn, "worker", 0, &f).unwrap().unwrap();
+    assert_eq!(peeked.title, "UI bug");
+    let claimed = store::claim_next(&mut conn, "worker", 900, 0, &f)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.title, "UI bug");
+
+    let both = vec!["bug".to_string(), "api".to_string()];
+    let f = store::ClaimFilter {
+        labels: &both,
+        ..Default::default()
+    };
+    let claimed = store::claim_next(&mut conn, "worker", 900, 0, &f)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.title, "API bug");
 }
 
 #[test]
@@ -2163,7 +2225,7 @@ fn remove_label_keeps_body_derived_tag() {
     let hits = store::list_issues(
         &conn,
         &store::IssueFilter {
-            label: Some("mytag".into()),
+            labels: vec!["mytag".into()],
             limit: 10,
             ..Default::default()
         },

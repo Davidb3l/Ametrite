@@ -57,10 +57,15 @@ enum Cmd {
         /// Claim a specific issue instead of the best available
         #[arg(long)]
         issue: Option<String>,
+        /// Only issues in this project
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        label: Option<String>,
+        /// Only issues with ALL of these labels (repeatable or comma-separated)
+        #[arg(long = "label", value_delimiter = ',')]
+        label: Vec<String>,
+        /// Exclude issues with ANY of these labels (repeatable or comma-separated)
+        #[arg(long = "not-label", value_delimiter = ',')]
+        not_label: Vec<String>,
         /// Report the best claimable issue without taking a lease or writing activity
         #[arg(long)]
         peek: bool,
@@ -320,8 +325,12 @@ enum IssueCmd {
         assignee: Option<String>,
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        label: Option<String>,
+        /// Only issues with ALL of these labels (repeatable or comma-separated)
+        #[arg(long = "label", value_delimiter = ',')]
+        label: Vec<String>,
+        /// Exclude issues with ANY of these labels (repeatable or comma-separated)
+        #[arg(long = "not-label", value_delimiter = ',')]
+        not_label: Vec<String>,
         /// Include done/canceled issues
         #[arg(long)]
         all: bool,
@@ -961,6 +970,7 @@ fn run(cli: Cli) -> Result<()> {
                 assignee,
                 project,
                 label,
+                not_label,
                 all,
                 all_workspaces: true,
                 limit,
@@ -970,7 +980,8 @@ fn run(cli: Cli) -> Result<()> {
                     status: status.clone(),
                     assignee: assignee.clone(),
                     project: project.clone(),
-                    label: label.clone(),
+                    labels: store::split_labels(label),
+                    not_labels: store::split_labels(not_label),
                     claimed: None,
                     claimed_by: None,
                     not_claimed_by: None,
@@ -1053,6 +1064,7 @@ fn run(cli: Cli) -> Result<()> {
                     assignee,
                     project,
                     label,
+                    not_label,
                     all,
                     all_workspaces: _, // handled above (needs no local workspace)
                     limit,
@@ -1061,7 +1073,8 @@ fn run(cli: Cli) -> Result<()> {
                         status: status.clone(),
                         assignee: assignee.clone(),
                         project: project.clone(),
-                        label: label.clone(),
+                        labels: store::split_labels(label),
+                        not_labels: store::split_labels(not_label),
                         claimed: None,
                         claimed_by: None,
                         not_claimed_by: None,
@@ -1232,6 +1245,7 @@ fn run(cli: Cli) -> Result<()> {
             issue,
             project,
             label,
+            not_label,
             peek,
             from,
             ttl,
@@ -1261,10 +1275,13 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             let stages: Option<&[String]> = if from.is_empty() { None } else { Some(&from) };
+            let labels = store::split_labels(&label);
+            let not_labels = store::split_labels(&not_label);
             let filter = store::ClaimFilter {
                 stages,
                 project: project.as_deref(),
-                label: label.as_deref(),
+                labels: &labels,
+                not_labels: &not_labels,
             };
 
             // --peek: read-only, never claims, never writes activity.

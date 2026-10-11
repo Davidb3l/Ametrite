@@ -126,6 +126,12 @@ fn strings(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A label filter argument: a comma-separated string, all of which must match
+/// (AMT-48), normalized like label writes. Absent or empty = no filter.
+fn labels_arg(args: &Value, key: &str) -> Vec<String> {
+    store::split_labels(&[opt_s(args, key).unwrap_or_default()])
+}
+
 fn agent_of(args: &Value) -> String {
     // Empty is unset, as in the CLI's identity() (AMT-36): an `"agent": ""`
     // argument or `AMT_AGENT=` must not record an empty author.
@@ -186,7 +192,8 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 status: opt_s(&args, "status").map(|s| vec![s]).unwrap_or_default(),
                 assignee: opt_s(&args, "assignee"),
                 project: opt_s(&args, "project"),
-                label: opt_s(&args, "label"),
+                labels: labels_arg(&args, "label"),
+                not_labels: labels_arg(&args, "not_label"),
                 claimed: args.get("claimed").and_then(|v| v.as_bool()),
                 claimed_by: opt_s(&args, "claimed_by"),
                 not_claimed_by: None,
@@ -236,7 +243,8 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 }
             }
             let project = opt_s(&args, "project");
-            let label = opt_s(&args, "label");
+            let labels = labels_arg(&args, "label");
+            let not_labels = labels_arg(&args, "not_label");
             let filter = store::ClaimFilter {
                 stages: if stages.is_empty() {
                     None
@@ -244,7 +252,8 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                     Some(&stages)
                 },
                 project: project.as_deref(),
-                label: label.as_deref(),
+                labels: &labels,
+                not_labels: &not_labels,
             };
 
             if peek {
@@ -593,7 +602,9 @@ fn tool_defs() -> Vec<Value> {
             &["title"]),
         tool("list_issues", "List issues with filters. Excludes done/canceled unless include_closed.",
             json!({ "status": status, "assignee": s("Filter by assignee"), "project": s("Filter by project slug"),
-                    "label": s("Filter by label"), "claimed": b("Filter by claimed state"),
+                    "label": s("Only issues with ALL of these labels (comma-separated, e.g. 'bug,ui')"),
+                    "not_label": s("Exclude issues with ANY of these labels (comma-separated)"),
+                    "claimed": b("Filter by claimed state"),
                     "claimed_by": s("Only issues currently claimed by this agent"),
                     "include_closed": b("Include done/canceled"), "limit": i("Max results (default 50)") }),
             &[]),
@@ -601,7 +612,9 @@ fn tool_defs() -> Vec<Value> {
             json!({ "id": s("Issue key, e.g. AMT-7") }), &["id"]),
         tool("claim_next_issue", "Atomically claim the highest-priority claimable issue (todo/backlog, unclaimed or expired lease). Sets status to in_progress with a lease. Race-free across agents. When nothing is claimable, returns {claimed:false} with a reason, counts, and retry_after.",
             json!({ "agent": s("Your agent name (required for meaningful attribution)"),
-                    "project": s("Only from this project"), "label": s("Only with this label"),
+                    "project": s("Only from this project"),
+                    "label": s("Only issues with ALL of these labels (comma-separated)"),
+                    "not_label": s("Never issues with ANY of these labels (comma-separated), e.g. 'question,owner'"),
                     "peek": b("Report the best claimable issue WITHOUT taking a lease or writing activity; result has 'peek': true"),
                     "stages": arr("Restrict claimable stages (subset of ['backlog','todo']); default both"),
                     "from": s("Comma-list alternative to stages, e.g. 'todo,backlog'"),

@@ -40,7 +40,10 @@ pub struct IssueFilter {
     pub status: Vec<String>,
     pub assignee: Option<String>,
     pub project: Option<String>,
-    pub label: Option<String>,
+    /// Issues carrying ALL of these labels (AMT-48).
+    pub labels: Vec<String>,
+    /// Issues carrying NONE of these labels.
+    pub not_labels: Vec<String>,
     pub claimed: Option<bool>,
     /// Restrict to issues whose live claim is held by this agent.
     pub claimed_by: Option<String>,
@@ -389,12 +392,7 @@ pub fn list_issues(conn: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
         sql.push_str(" AND i.project = ?");
         args.push(Box::new(p.clone()));
     }
-    if let Some(l) = &f.label {
-        sql.push_str(
-            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
-        );
-        args.push(Box::new(l.clone()));
-    }
+    push_label_filters(&mut sql, &mut args, &f.labels, &f.not_labels);
     if let Some(claimed) = f.claimed {
         if claimed {
             sql.push_str(" AND i.claimed_by IS NOT NULL");
@@ -612,7 +610,10 @@ pub struct ClaimFilter<'a> {
     /// Values are validated by the caller against `CLAIMABLE_STATUSES`.
     pub stages: Option<&'a [String]>,
     pub project: Option<&'a str>,
-    pub label: Option<&'a str>,
+    /// Only issues carrying ALL of these labels (AMT-48).
+    pub labels: &'a [String],
+    /// Never issues carrying any of these labels.
+    pub not_labels: &'a [String],
 }
 
 impl ClaimFilter<'_> {
@@ -671,11 +672,29 @@ fn claimable_predicate(
         sql.push_str(" AND i.project = ?");
         args.push(Box::new(p.to_string()));
     }
-    if let Some(l) = f.label {
+    push_label_filters(sql, args, f.labels, f.not_labels);
+}
+
+/// AND-of-labels and NONE-of-labels, shared by list, claim, and the no-work
+/// explanation so "matches the label filter" means one thing (AMT-48). Folds
+/// with SQLite `lower()` like every other tag comparison.
+fn push_label_filters(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn ToSql>>,
+    labels: &[String],
+    not_labels: &[String],
+) {
+    for l in labels {
         sql.push_str(
             " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
         );
-        args.push(Box::new(l.to_string()));
+        args.push(Box::new(l.clone()));
+    }
+    for l in not_labels {
+        sql.push_str(
+            " AND NOT EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
+        );
+        args.push(Box::new(l.clone()));
     }
 }
 
@@ -863,12 +882,7 @@ pub fn no_work_reason(
         scope.push_str(" AND i.project = ?");
         scope_args.push(Box::new(p.to_string()));
     }
-    if let Some(l) = f.label {
-        scope.push_str(
-            " AND EXISTS(SELECT 1 FROM tags t WHERE t.doc_id = d.doc_id AND t.tag = lower(?))",
-        );
-        scope_args.push(Box::new(l.to_string()));
-    }
+    push_label_filters(&mut scope, &mut scope_args, f.labels, f.not_labels);
 
     let count = |extra: &str, extra_args: &[Box<dyn ToSql>]| -> Result<i64> {
         let sql = format!("SELECT COUNT(*) {scope}{extra}");
