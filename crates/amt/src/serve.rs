@@ -187,9 +187,7 @@ pub fn web_data_dir() -> Result<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support")
     } else if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData").join("Local"))
+        local_app_data(&home)
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -339,6 +337,9 @@ pub fn unit_path() -> Result<PathBuf> {
         home.join("Library")
             .join("LaunchAgents")
             .join(format!("{MACOS_LABEL}.plist"))
+    } else if cfg!(target_os = "windows") {
+        // The launcher the Scheduled Task runs (AMT-41); see schtasks_create_args.
+        local_app_data(&home).join("ametrite").join("board.cmd")
     } else {
         home.join(".config")
             .join("systemd")
@@ -361,6 +362,13 @@ pub fn log_path() -> Result<PathBuf> {
             .join("ametrite")
             .join("web.log")
     })
+}
+
+/// `%LOCALAPPDATA%`, or its default location under the profile.
+fn local_app_data(home: &Path) -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Local"))
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -460,18 +468,73 @@ pub fn render_systemd_unit(
     )
 }
 
+/// `schtasks /Create` refuses a `/TR` longer than this many characters.
+const SCHTASKS_TR_MAX: usize = 261;
+
+/// The batch file the Windows logon task runs. Pure so the exact file is
+/// testable. Like the plist and the systemd unit, it carries everything
+/// resolved at install time, including the port (AMT-41: the task used to
+/// take `AMT_PORT` from the logon environment, not the one `--install` saw).
+/// The task runs this file instead of an inline `cmd /c` line because
+/// `schtasks` caps `/TR` at 261 characters, which the four paths plus the
+/// port setting can exceed for a long user name.
+///
+/// `chcp 65001` comes first so cmd reads the remaining lines (written as
+/// UTF-8) correctly when a path has non-ASCII characters. `%` is doubled
+/// because cmd expands `%…%` even inside quotes; nothing else in a path is
+/// special within quotes.
+pub fn render_windows_launcher(
+    bun: &Path,
+    app: &Path,
+    cwd: &Path,
+    log: &Path,
+    port: u16,
+) -> String {
+    let q = |p: &Path| p.display().to_string().replace('%', "%%");
+    [
+        "@echo off".to_string(),
+        "rem Ametrite web board, started at logon by the \"Ametrite Web\" task.".to_string(),
+        "rem Written by `amt serve --install`; re-run that instead of editing.".to_string(),
+        "chcp 65001 >nul".to_string(),
+        format!("cd /d \"{}\"", q(cwd)),
+        format!("set \"AMT_PORT={port}\""),
+        format!("\"{}\" run \"{}\" >> \"{}\" 2>&1", q(bun), q(app), q(log)),
+        String::new(),
+    ]
+    .join("\r\n")
+}
+
+/// The port a launcher written by [`render_windows_launcher`] serves on, so
+/// reinstall and uninstall stop the board that is actually running rather
+/// than whatever `AMT_PORT` the current shell has.
+pub fn launcher_port(launcher: &str) -> Option<u16> {
+    launcher.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("set \"AMT_PORT=")?
+            .strip_suffix('"')?
+            .parse()
+            .ok()
+    })
+}
+
+/// The port of the installed Windows launcher, if there is one.
+fn installed_launcher_port() -> Option<u16> {
+    launcher_port(&std::fs::read_to_string(unit_path().ok()?).ok()?)
+}
+
 /// The `schtasks` argv that registers the Windows logon task. Pure/testable.
 /// A user-level Scheduled Task, deliberately not a Windows Service: a service
 /// needs administrator rights, which is far too much for a local dashboard.
-pub fn schtasks_create_args(bun: &Path, app: &Path, cwd: &Path, log: &Path) -> Vec<String> {
-    let cmd = format!(
-        "cmd /c \"cd /d \"{}\" && \"{}\" run \"{}\" >> \"{}\" 2>&1\"",
-        cwd.display(),
-        bun.display(),
-        app.display(),
-        log.display()
-    );
-    vec![
+pub fn schtasks_create_args(launcher: &Path) -> Result<Vec<String>> {
+    let tr = format!("\"{}\"", launcher.display());
+    if tr.chars().count() > SCHTASKS_TR_MAX {
+        return Err(msg(format!(
+            "the board launcher path is too long for a Scheduled Task \
+             ({} characters; schtasks allows {SCHTASKS_TR_MAX}): {tr}",
+            tr.chars().count()
+        )));
+    }
+    Ok(vec![
         "/Create".into(),
         "/F".into(), // replace an existing task — makes install idempotent
         "/SC".into(),
@@ -479,8 +542,8 @@ pub fn schtasks_create_args(bun: &Path, app: &Path, cwd: &Path, log: &Path) -> V
         "/TN".into(),
         WINDOWS_TASK.into(),
         "/TR".into(),
-        cmd,
-    ]
+        tr,
+    ])
 }
 
 // ------------------------------------------------------------- install/status
@@ -645,20 +708,33 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(d)?;
     }
     if cfg!(target_os = "windows") {
+        let launcher = unit_path()?;
+        let create = schtasks_create_args(&launcher)?;
         // Stop the old board before re-registering: `/End` alone may leave
         // bun running (see windows_stop_board), and the new task's bun could
-        // not bind the port it still holds. If `/Create` then fails, the board
-        // stays stopped — the error says so.
-        windows_stop_board(cfg.port);
-        let [create, run] =
-            windows_install_steps(schtasks_create_args(&cfg.bun, &cfg.app, &cwd, &log));
+        // not bind the port it still holds. The old board listens on the port
+        // its launcher baked in, which may not be the one installing now. If
+        // `/Create` then fails, the board stays stopped — the error says so.
+        let old_port = installed_launcher_port();
+        windows_stop_board(old_port.unwrap_or(cfg.port));
+        if old_port.is_some_and(|p| p != cfg.port) {
+            windows_stop_board(cfg.port);
+        }
+        if let Some(d) = launcher.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(
+            &launcher,
+            render_windows_launcher(&cfg.bun, &cfg.app, &cwd, &log, cfg.port),
+        )?;
+        let [create, run] = windows_install_steps(create);
         create.run("schtasks").map_err(|e| {
             msg(format!(
                 "{e} (the previous board was stopped; rerun `amt serve --install`)"
             ))
         })?;
         run.run("schtasks")?;
-        return Ok(PathBuf::from(WINDOWS_TASK));
+        return Ok(launcher);
     }
     let unit = unit_path()?;
     if let Some(d) = unit.parent() {
@@ -708,8 +784,13 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
 /// Remove the service, leaving no trace. Succeeds even if nothing was installed.
 pub fn uninstall() -> Result<()> {
     if cfg!(target_os = "windows") {
-        windows_stop_board(port_from_env());
+        windows_stop_board(installed_launcher_port().unwrap_or_else(port_from_env));
         windows_uninstall_step().run("schtasks")?;
+        if let Ok(launcher) = unit_path() {
+            if launcher.exists() {
+                std::fs::remove_file(&launcher)?;
+            }
+        }
         return Ok(());
     }
     if cfg!(target_os = "macos") {
@@ -762,7 +843,12 @@ pub struct ServeStatus {
 }
 
 pub fn status() -> Result<ServeStatus> {
-    let port = port_from_env();
+    // On Windows the launcher records the port the board was installed with.
+    let port = if cfg!(target_os = "windows") {
+        installed_launcher_port().unwrap_or_else(port_from_env)
+    } else {
+        port_from_env()
+    };
     let unit = unit_path().ok();
     let installed = if cfg!(target_os = "windows") {
         Command::new("schtasks")
@@ -906,6 +992,15 @@ mod tests {
             4242
         )
         .contains("AMT_PORT=4242"));
+        // AMT-41: Windows used to drop it and take the logon environment's.
+        assert!(render_windows_launcher(
+            Path::new("C:\\bun.exe"),
+            Path::new("C:\\app.ts"),
+            Path::new("C:\\r"),
+            Path::new("C:\\b"),
+            4242
+        )
+        .contains("set \"AMT_PORT=4242\""));
     }
 
     fn argv(steps: &[Step]) -> Vec<String> {
@@ -1025,26 +1120,89 @@ mod tests {
     }
 
     #[test]
-    fn schtasks_args_are_idempotent_and_logged() {
-        let a = schtasks_create_args(
-            Path::new("C:\\bun.exe"),
-            Path::new("C:\\repo\\apps\\web\\server.ts"),
-            Path::new("C:\\repo"),
-            Path::new("C:\\log.txt"),
-        );
+    fn schtasks_args_are_idempotent_and_run_the_launcher() {
+        let a = schtasks_create_args(Path::new(
+            "C:\\Users\\a b\\AppData\\Local\\ametrite\\board.cmd",
+        ))
+        .unwrap();
         assert!(
             a.contains(&"/F".to_string()),
             "/F makes re-install idempotent"
         );
         assert!(a.contains(&"ONLOGON".to_string()));
         assert!(a.contains(&WINDOWS_TASK.to_string()));
-        assert!(a.last().unwrap().contains("server.ts"), "app path baked in");
-        assert!(a.last().unwrap().contains("bun.exe"), "bun path baked in");
-        assert!(
-            a.last().unwrap().contains("cd /d"),
-            "runs from the project root"
+        assert_eq!(
+            a.last().unwrap(),
+            "\"C:\\Users\\a b\\AppData\\Local\\ametrite\\board.cmd\"",
+            "/TR is just the quoted launcher path"
         );
-        assert!(a.last().unwrap().contains("log.txt"));
+    }
+
+    #[test]
+    fn schtasks_args_refuse_a_tr_longer_than_schtasks_allows() {
+        // 259 chars of path + 2 quotes = 261: the longest /TR schtasks takes.
+        let fits = format!("C:\\{}.cmd", "x".repeat(259 - 7));
+        assert!(schtasks_create_args(Path::new(&fits)).is_ok());
+        let long = format!("C:\\{}.cmd", "x".repeat(260 - 7));
+        let err = schtasks_create_args(Path::new(&long))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn windows_launcher_bakes_in_the_port_and_every_path() {
+        let l = render_windows_launcher(
+            Path::new("C:\\Users\\a\\.bun\\bin\\bun.exe"),
+            Path::new("C:\\Users\\a\\AppData\\Local\\ametrite\\web\\current\\server.ts"),
+            Path::new("C:\\Users\\a\\AppData\\Local\\ametrite"),
+            Path::new("C:\\Users\\a\\.local\\state\\ametrite\\web.log"),
+            1777,
+        );
+        assert!(l.starts_with("@echo off\r\n"));
+        assert!(l.ends_with("\r\n"), "cmd wants a terminated last line");
+        assert!(
+            !l.replace("\r\n", "").contains('\n'),
+            "CRLF line endings only"
+        );
+        let lines: Vec<&str> = l.lines().collect();
+        let at = |needle: &str| lines.iter().position(|x| x.starts_with(needle)).unwrap();
+        // chcp before any path line, the port before bun starts.
+        assert!(at("chcp 65001") < at("cd /d"));
+        assert!(at("set \"AMT_PORT=1777\"") < at("\"C:\\Users\\a\\.bun"));
+        assert!(l.contains("cd /d \"C:\\Users\\a\\AppData\\Local\\ametrite\"\r\n"));
+        assert!(l.contains(
+            "\"C:\\Users\\a\\.bun\\bin\\bun.exe\" run \"C:\\Users\\a\\AppData\\Local\\ametrite\\web\\current\\server.ts\" \
+             >> \"C:\\Users\\a\\.local\\state\\ametrite\\web.log\" 2>&1\r\n"
+        ));
+        assert_eq!(launcher_port(&l), Some(1777));
+    }
+
+    #[test]
+    fn windows_launcher_escapes_percent_and_keeps_other_characters() {
+        let l = render_windows_launcher(
+            Path::new("C:\\b&n %PATH%\\bun.exe"),
+            Path::new("C:\\R&D (é)\\server.ts"),
+            Path::new("C:\\R&D (é)"),
+            Path::new("C:\\100%\\web.log"),
+            1776,
+        );
+        // cmd expands %…% even inside quotes, so a literal % is doubled.
+        assert!(l.contains("\"C:\\b&n %%PATH%%\\bun.exe\""), "{l}");
+        assert!(l.contains("\"C:\\100%%\\web.log\""), "{l}");
+        // & ( ) and non-ASCII are literal inside quotes; chcp 65001 covers é.
+        assert!(l.contains("cd /d \"C:\\R&D (é)\""), "{l}");
+        assert_eq!(launcher_port(&l), Some(1776));
+    }
+
+    #[test]
+    fn launcher_port_reads_only_a_well_formed_setting() {
+        assert_eq!(launcher_port("set \"AMT_PORT=8080\"\r\n"), Some(8080));
+        assert_eq!(launcher_port("  set \"AMT_PORT=8080\"  "), Some(8080));
+        assert_eq!(launcher_port("set \"AMT_PORT=99999\""), None, "not a u16");
+        assert_eq!(launcher_port("set \"AMT_PORT=\""), None);
+        assert_eq!(launcher_port("rem set \"AMT_PORT=1\""), None);
+        assert_eq!(launcher_port("@echo off\r\n"), None);
     }
 
     #[test]
