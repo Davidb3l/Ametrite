@@ -1684,12 +1684,12 @@ fn run(cli: Cli) -> Result<()> {
                 let leases = store::fix_closed_leases(&mut conn, &me)?;
                 if !cli.json {
                     for m in &labels {
-                        println!(
-                            "fixed label: {} '{}' → {}",
-                            m.id,
-                            m.label,
+                        let into = if m.fixed.is_empty() {
+                            "(removed)".to_string()
+                        } else {
                             m.fixed.join(", ")
-                        );
+                        };
+                        println!("fixed label: {} '{}' → {into}", m.id, m.label);
                     }
                     for c in &leases {
                         println!(
