@@ -16,10 +16,13 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   task, as it already did on macOS and Linux. The task used to take
   `AMT_PORT` from the logon environment instead, so a port set only in the
   installing shell was ignored. The task now runs a small launcher,
-  `%LOCALAPPDATA%\ametrite\board.cmd`, which also keeps it under the
-  261-character command limit of Scheduled Tasks for long user names.
-  Reinstalling, `--uninstall`, and `--status` use the installed board's
-  port. Re-run `amt serve --install` to pick this up. (AMT-41)
+  `%LOCALAPPDATA%\ametrite\board.cmd`, which also keeps the task command
+  under the 261-character limit of `schtasks /TR` for long user names.
+  `--install` prints the launcher's path (the `unit` field in `--json`), and
+  `--status` no longer shows a Linux unit path on Windows. Once a launcher
+  exists, reinstalling, `--uninstall`, and `--status` use the port it
+  records; the first reinstall over an older task also stops a board left on
+  the default port. Re-run `amt serve --install` to pick this up. (AMT-41)
 
 ## [0.4.1] - 2026-10-11
 
