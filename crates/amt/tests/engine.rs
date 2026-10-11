@@ -198,6 +198,95 @@ fn searching_a_document_id_puts_that_document_first() {
     assert!(!ids("amt-1 credentials", &all).contains(&"AMT-1".to_string()));
 }
 
+/// AMT-45: `--label "bug,ui"` used to store one label `bug,ui`, invisible to
+/// `--label bug`. Every label write now splits, trims and dedupes.
+#[test]
+fn comma_joined_labels_are_split_on_every_write() {
+    let (_d, mut conn) = workspace();
+    let mut ni = new_issue("Crash on save", "", "high");
+    ni.labels = vec!["bug,ui".into(), " web ".into(), "BUG".into(), ",".into()];
+    let issue = store::create_issue(&mut conn, ni).unwrap();
+    let mut labels = issue.labels.clone();
+    labels.sort();
+    assert_eq!(labels, vec!["bug", "ui", "web"]);
+    let bugs = store::list_issues(
+        &conn,
+        &store::IssueFilter {
+            label: Some("bug".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bugs.len(), 1, "findable by one of the split labels");
+
+    let patch = |add: &[&str], remove: &[&str]| store::IssuePatch {
+        add_labels: add.iter().map(|s| s.to_string()).collect(),
+        remove_labels: remove.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let issue = store::update_issue(&mut conn, &issue.id, patch(&["perf, db"], &[]), "t").unwrap();
+    assert!(issue.labels.contains(&"perf".to_string()) && issue.labels.contains(&"db".to_string()));
+    let issue = store::update_issue(&mut conn, &issue.id, patch(&[], &["ui,perf"]), "t").unwrap();
+    let mut labels = issue.labels.clone();
+    labels.sort();
+    assert_eq!(labels, vec!["bug", "db", "web"]);
+
+    let note = store::create_doc(
+        &mut conn,
+        store::NewNote {
+            title: "Runbook".into(),
+            body: String::new(),
+            tags: vec!["ops,handoff".into()],
+            doc_type: "note".into(),
+            author: "t".into(),
+        },
+    )
+    .unwrap();
+    let handoffs = store::list_docs(&conn, "note", Some("handoff")).unwrap();
+    assert!(
+        handoffs.iter().any(|d| d.id == note.id),
+        "a split tag is a real tag"
+    );
+}
+
+/// AMT-45: labels written before the fix are reported by doctor and split by
+/// `doctor --fix`, which logs each repair and is idempotent.
+#[test]
+fn doctor_reports_and_fixes_legacy_comma_joined_labels() {
+    let (_d, mut conn) = workspace();
+    let mut ni = new_issue("Legacy", "", "low");
+    ni.labels = vec!["bug".into()];
+    let issue = store::create_issue(&mut conn, ni).unwrap();
+    // Plant what pre-AMT-45 writes stored (the store no longer can).
+    conn.execute(
+        "INSERT INTO tags(doc_id, tag, src)
+         SELECT doc_id, 'bug,ui', 'label' FROM documents WHERE id = ?1",
+        [&issue.id],
+    )
+    .unwrap();
+
+    let report = store::doctor(&conn).unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.malformed_labels.len(), 1);
+    assert_eq!(report.malformed_labels[0].label, "bug,ui");
+    assert_eq!(report.malformed_labels[0].fixed, vec!["bug", "ui"]);
+
+    let fixed = store::fix_malformed_labels(&mut conn, "doctor").unwrap();
+    assert_eq!(fixed.len(), 1);
+    let after = store::get_issue(&conn, &issue.id).unwrap();
+    let mut labels = after.labels.clone();
+    labels.sort();
+    assert_eq!(labels, vec!["bug", "ui"], "split, and no duplicate bug");
+    let log = store::activity(&conn, &issue.id).unwrap();
+    assert!(log
+        .iter()
+        .any(|a| a.author == "doctor" && a.body.contains("label repaired: 'bug,ui' → bug, ui")));
+    assert!(store::doctor(&conn).unwrap().ok);
+    assert!(store::fix_malformed_labels(&mut conn, "doctor")
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn claim_orders_by_priority_and_is_exclusive() {
     let (_d, mut conn) = workspace();

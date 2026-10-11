@@ -176,8 +176,14 @@ enum Cmd {
     },
     /// Show documents that link to the given document
     Backlinks { id: String },
-    /// Check workspace health (unresolved links, stale claims, missing refs)
-    Doctor,
+    /// Check workspace health (unresolved links, stale claims, missing refs,
+    /// malformed labels)
+    Doctor {
+        /// Repair what is safe to repair: split comma-joined labels such as
+        /// `bug,ui` into `bug` and `ui` (logged on each issue)
+        #[arg(long)]
+        fix: bool,
+    },
     /// Show the agent roster: live leases, expiry, last activity, per-agent counts
     Agents,
     /// Throughput, cycle time, and a claim-integrity audit over an optional window
@@ -588,6 +594,7 @@ fn doctor_envelope(report: &DoctorReport, ui_port: u16) -> serde_json::Value {
             check("missing_projects", report.missing_projects.len()),
             check("dangling_decisions", report.dangling_decisions.len()),
             check("dependency_cycles", report.dependency_cycles.len()),
+            check("malformed_labels", report.malformed_labels.len()),
         ],
         "report": report,
     })
@@ -1660,11 +1667,31 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Doctor => {
-            let conn = open_workspace(&cli.workspace)?;
+        Cmd::Doctor { fix } => {
+            let mut conn = open_workspace(&cli.workspace)?;
+            let mut fixed = Vec::new();
+            if fix {
+                fixed = store::fix_malformed_labels(&mut conn, &identity(None))?;
+                if !cli.json {
+                    for m in &fixed {
+                        println!(
+                            "fixed label: {} '{}' → {}",
+                            m.id,
+                            m.label,
+                            m.fixed.join(", ")
+                        );
+                    }
+                }
+            }
             let report = store::doctor(&conn)?;
             if cli.json {
-                print_json(&doctor_envelope(&report, ui_port()));
+                // Still one object: the envelope reflects the repaired state,
+                // and `fixed` (additive, --fix only) lists what changed.
+                let mut env = doctor_envelope(&report, ui_port());
+                if fix {
+                    env["fixed"] = serde_json::json!(fixed);
+                }
+                print_json(&env);
             } else if report.ok {
                 println!("workspace healthy ✓");
             } else {
@@ -1691,6 +1718,14 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 for c in &report.dependency_cycles {
                     println!("dependency cycle: {}", c.cycle.join(" → "));
+                }
+                for m in &report.malformed_labels {
+                    println!(
+                        "malformed label: {} '{}' (amt doctor --fix splits it into {})",
+                        m.id,
+                        m.label,
+                        m.fixed.join(", ")
+                    );
                 }
             }
             Ok(())
@@ -2168,6 +2203,7 @@ mod tests {
             missing_projects: vec![],
             dangling_decisions: vec![],
             dependency_cycles: vec![],
+            malformed_labels: vec![],
             ok: true,
         }
     }
@@ -2187,7 +2223,7 @@ mod tests {
         assert_eq!(v["ui"], "http://localhost:1776");
         // §3: checks are {name, ok, detail} rows with stable snake_case names.
         let checks = v["checks"].as_array().expect("checks array");
-        assert_eq!(checks.len(), 6);
+        assert_eq!(checks.len(), 7);
         for c in checks {
             assert!(c["name"].is_string());
             assert!(c["ok"].is_boolean());
