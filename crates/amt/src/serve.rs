@@ -481,8 +481,8 @@ const SCHTASKS_TR_MAX: usize = 261;
 ///
 /// `chcp 65001` comes first so cmd reads the remaining lines (written as
 /// UTF-8) correctly when a path has non-ASCII characters. `%` is doubled
-/// because cmd expands `%…%` even inside quotes; nothing else in a path is
-/// special within quotes.
+/// because cmd expands `%…%` even inside quotes; with delayed expansion off,
+/// nothing else in a path is special within quotes.
 pub fn render_windows_launcher(
     bun: &Path,
     app: &Path,
@@ -495,8 +495,11 @@ pub fn render_windows_launcher(
         "@echo off".to_string(),
         "rem Ametrite web board, started at logon by the \"Ametrite Web\" task.".to_string(),
         "rem Written by `amt serve --install`; re-run that instead of editing.".to_string(),
+        // A registry default can turn delayed expansion on, which would eat
+        // `!` in a path; this file never wants it.
+        "setlocal DisableDelayedExpansion".to_string(),
         "chcp 65001 >nul".to_string(),
-        format!("cd /d \"{}\"", q(cwd)),
+        format!("cd /d \"{}\" || exit /b 1", q(cwd)),
         format!("set \"AMT_PORT={port}\""),
         format!("\"{}\" run \"{}\" >> \"{}\" 2>&1", q(bun), q(app), q(log)),
         String::new(),
@@ -514,7 +517,17 @@ pub fn launcher_port(launcher: &str) -> Option<u16> {
             .strip_suffix('"')?
             .parse()
             .ok()
+            .filter(|p| *p != 0)
     })
+}
+
+/// The ports a Windows reinstall must stop a board on: the one the installed
+/// launcher records (or, for an install from before launchers, the default
+/// it most likely ran on), plus the port being installed. Pure.
+pub fn ports_to_stop(installed: Option<u16>, installing: u16) -> Vec<u16> {
+    let mut ports = vec![installed.unwrap_or(DEFAULT_PORT), installing];
+    ports.dedup();
+    ports
 }
 
 /// The port of the installed Windows launcher, if there is one.
@@ -527,11 +540,12 @@ fn installed_launcher_port() -> Option<u16> {
 /// needs administrator rights, which is far too much for a local dashboard.
 pub fn schtasks_create_args(launcher: &Path) -> Result<Vec<String>> {
     let tr = format!("\"{}\"", launcher.display());
-    if tr.chars().count() > SCHTASKS_TR_MAX {
+    // schtasks counts UTF-16 units, so a character outside the BMP is two.
+    let len = tr.encode_utf16().count();
+    if len > SCHTASKS_TR_MAX {
         return Err(msg(format!(
             "the board launcher path is too long for a Scheduled Task \
-             ({} characters; schtasks allows {SCHTASKS_TR_MAX}): {tr}",
-            tr.chars().count()
+             ({len} characters; schtasks /TR allows {SCHTASKS_TR_MAX}): {tr}"
         )));
     }
     Ok(vec![
@@ -712,27 +726,38 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         let create = schtasks_create_args(&launcher)?;
         // Stop the old board before re-registering: `/End` alone may leave
         // bun running (see windows_stop_board), and the new task's bun could
-        // not bind the port it still holds. The old board listens on the port
-        // its launcher baked in, which may not be the one installing now. If
-        // `/Create` then fails, the board stays stopped — the error says so.
-        let old_port = installed_launcher_port();
-        windows_stop_board(old_port.unwrap_or(cfg.port));
-        if old_port.is_some_and(|p| p != cfg.port) {
-            windows_stop_board(cfg.port);
+        // not bind the port it still holds. If anything below then fails, the
+        // board stays stopped — the error says so.
+        let previous = std::fs::read(&launcher).ok();
+        let old_port = previous
+            .as_deref()
+            .and_then(|b| launcher_port(&String::from_utf8_lossy(b)));
+        for port in ports_to_stop(old_port, cfg.port) {
+            windows_stop_board(port);
         }
+        let stopped = |e: crate::error::Error| {
+            msg(format!(
+                "{e} (the previous board was stopped; rerun `amt serve --install`)"
+            ))
+        };
         if let Some(d) = launcher.parent() {
-            std::fs::create_dir_all(d)?;
+            std::fs::create_dir_all(d).map_err(|e| stopped(e.into()))?;
         }
         std::fs::write(
             &launcher,
             render_windows_launcher(&cfg.bun, &cfg.app, &cwd, &log, cfg.port),
-        )?;
+        )
+        .map_err(|e| stopped(e.into()))?;
         let [create, run] = windows_install_steps(create);
-        create.run("schtasks").map_err(|e| {
-            msg(format!(
-                "{e} (the previous board was stopped; rerun `amt serve --install`)"
-            ))
-        })?;
+        if let Err(e) = create.run("schtasks") {
+            // Leave the launcher as it was, so --status, --uninstall, and the
+            // upgrade hint don't describe a board that was never registered.
+            let _ = match &previous {
+                Some(bytes) => std::fs::write(&launcher, bytes),
+                None => std::fs::remove_file(&launcher),
+            };
+            return Err(stopped(e));
+        }
         run.run("schtasks")?;
         return Ok(launcher);
     }
@@ -863,7 +888,8 @@ pub fn status() -> Result<ServeStatus> {
         installed,
         responding: port_responds(port),
         port,
-        unit: unit.filter(|_| installed),
+        // An install from before launchers (AMT-41) has a task but no file.
+        unit: unit.filter(|u| installed && u.exists()),
         log: log_path().ok(),
     })
 }
@@ -1148,6 +1174,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("too long"), "{err}");
+        // schtasks counts UTF-16 units: an emoji is 1 char but 2 units.
+        let emoji = format!("C:\\{}😀.cmd", "x".repeat(259 - 8));
+        assert_eq!(emoji.chars().count(), 259);
+        assert!(schtasks_create_args(Path::new(&emoji)).is_err());
+    }
+
+    #[test]
+    fn reinstall_stops_the_old_board_and_the_new_port() {
+        assert_eq!(ports_to_stop(Some(1776), 1776), vec![1776]);
+        assert_eq!(ports_to_stop(Some(5000), 1776), vec![5000, 1776]);
+        // An install from before launchers recorded no port: its board most
+        // likely ran on the default, whatever port is being installed now.
+        assert_eq!(ports_to_stop(None, 5000), vec![DEFAULT_PORT, 5000]);
+        assert_eq!(ports_to_stop(None, DEFAULT_PORT), vec![DEFAULT_PORT]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unit_is_the_launcher() {
+        let u = unit_path().unwrap();
+        assert!(u.ends_with(r"ametrite\board.cmd"), "{}", u.display());
     }
 
     #[test]
@@ -1170,7 +1217,8 @@ mod tests {
         // chcp before any path line, the port before bun starts.
         assert!(at("chcp 65001") < at("cd /d"));
         assert!(at("set \"AMT_PORT=1777\"") < at("\"C:\\Users\\a\\.bun"));
-        assert!(l.contains("cd /d \"C:\\Users\\a\\AppData\\Local\\ametrite\"\r\n"));
+        assert!(l.contains("cd /d \"C:\\Users\\a\\AppData\\Local\\ametrite\" || exit /b 1\r\n"));
+        assert!(at("setlocal DisableDelayedExpansion") < at("cd /d"));
         assert!(l.contains(
             "\"C:\\Users\\a\\.bun\\bin\\bun.exe\" run \"C:\\Users\\a\\AppData\\Local\\ametrite\\web\\current\\server.ts\" \
              >> \"C:\\Users\\a\\.local\\state\\ametrite\\web.log\" 2>&1\r\n"
@@ -1191,7 +1239,7 @@ mod tests {
         assert!(l.contains("\"C:\\b&n %%PATH%%\\bun.exe\""), "{l}");
         assert!(l.contains("\"C:\\100%%\\web.log\""), "{l}");
         // & ( ) and non-ASCII are literal inside quotes; chcp 65001 covers é.
-        assert!(l.contains("cd /d \"C:\\R&D (é)\""), "{l}");
+        assert!(l.contains("cd /d \"C:\\R&D (é)\" || exit /b 1"), "{l}");
         assert_eq!(launcher_port(&l), Some(1776));
     }
 
@@ -1201,6 +1249,11 @@ mod tests {
         assert_eq!(launcher_port("  set \"AMT_PORT=8080\"  "), Some(8080));
         assert_eq!(launcher_port("set \"AMT_PORT=99999\""), None, "not a u16");
         assert_eq!(launcher_port("set \"AMT_PORT=\""), None);
+        assert_eq!(
+            launcher_port("set \"AMT_PORT=0\""),
+            None,
+            "never a real port"
+        );
         assert_eq!(launcher_port("rem set \"AMT_PORT=1\""), None);
         assert_eq!(launcher_port("@echo off\r\n"), None);
     }
