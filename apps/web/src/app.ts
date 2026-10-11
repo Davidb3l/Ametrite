@@ -2,6 +2,7 @@
 
 import { ago, agoLabel } from "./time";
 import { bindDraft, clearDraft, draftKey } from "./drafts";
+import { labelCounts, withLabel } from "./labels";
 
 type Issue = {
   id: string; title: string; status: string; priority: string;
@@ -27,7 +28,7 @@ const PRIORITIES = ["urgent", "high", "medium", "low", "none"];
 
 const main = document.getElementById("main")!;
 let projects: DocRef[] = [];
-let boardFilter: { project?: string } = {};
+let boardFilter: { project?: string; label?: string } = {};
 let workspaces: any[] = [];
 let currentWs = localStorage.getItem("amt-ws") ?? "";
 
@@ -210,21 +211,42 @@ async function renderBoard() {
   const params = new URLSearchParams({ all: "1" });
   if (boardFilter.project) params.set("project", boardFilter.project);
   const issues: Issue[] = await api(`/api/issues?${params}`);
+  // AMT-44: the label filter runs over the issues already fetched, so the chip
+  // counts (all labels in this view) and the column counts always agree.
+  const shown = withLabel(issues, boardFilter.label);
   const byStatus: Record<string, Issue[]> = {};
   for (const s of STATUSES) byStatus[s] = [];
-  for (const i of issues) (byStatus[i.status] ??= []).push(i);
+  for (const i of shown) (byStatus[i.status] ??= []).push(i);
+
+  const LABEL_CHIPS = 12;
+  const counts = labelCounts(issues, boardFilter.label);
+  const chips = counts
+    .filter((c, n) => n < LABEL_CHIPS || c.label === boardFilter.label)
+    .map((c) => `<span class="chip ${c.label === boardFilter.label ? "on" : ""} ${c.label === "bug" ? "chip-bug" : ""}"
+        data-label="${esc(c.label)}" title="${c.label === boardFilter.label ? "Show all issues" : `Only issues labeled ${esc(c.label)}`}">${esc(c.label)} <span class="n">${c.count}</span></span>`)
+    .join("");
+  const title = [boardFilter.project, boardFilter.label].filter(Boolean).map((t) => ` · ${esc(t!)}`).join("");
 
   main.innerHTML = "";
   main.append(h(`
     <div class="topbar">
-      <h1>Board${boardFilter.project ? ` · ${esc(boardFilter.project)}` : ""}</h1>
-      ${boardFilter.project ? '<a class="crumb" href="#/board" id="clear-filter">clear filter ✕</a>' : ""}
+      <h1>Board${title}</h1>
+      ${title ? '<a class="crumb" href="#/board" id="clear-filter">clear filter ✕</a>' : ""}
       <div class="spacer"></div>
       <button class="primary" id="new-issue">＋ New issue</button>
     </div>
-    <div class="content"><div class="board" id="board"></div></div>
+    <div class="content board-wrap">
+      ${chips ? `<div class="filter-chips board-chips" id="label-chips">${chips}</div>` : ""}
+      <div class="board" id="board"></div>
+    </div>
   `));
-  main.querySelector("#clear-filter")?.addEventListener("click", () => { boardFilter = {}; });
+  main.querySelector("#clear-filter")?.addEventListener("click", () => { boardFilter = {}; renderBoard(); });
+  main.querySelectorAll<HTMLElement>("#label-chips .chip").forEach((chip) =>
+    chip.addEventListener("click", () => {
+      const label = chip.dataset.label!;
+      boardFilter = { ...boardFilter, label: boardFilter.label === label ? undefined : label };
+      renderBoard();
+    }));
   main.querySelector("#new-issue")!.addEventListener("click", () => issueDialog());
 
   const board = main.querySelector("#board")!;
@@ -406,7 +428,7 @@ function card(i: Issue): HTMLElement {
     <a class="title" href="#/issue/${encodeURIComponent(i.id)}">${esc(i.title)}</a>
     <div class="meta">
       ${prioSvg(i.priority)}
-      ${i.labels.slice(0, 3).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}
+      ${i.labels.slice(0, 3).map((l) => `<span class="chip ${l === "bug" ? "chip-bug" : ""}">${esc(l)}</span>`).join("")}
       ${claim}
     </div>`;
   el.dataset.id = i.id;
@@ -751,7 +773,8 @@ async function loadSidebar() {
     `<a class="project-link" href="#/board" data-project="${esc(p.id)}"><span class="dot"></span>${esc(p.title)}</a>`).join("");
   list.querySelectorAll(".project-link").forEach((a) =>
     a.addEventListener("click", () => {
-      boardFilter = { project: (a as HTMLElement).dataset.project };
+      // Keep a label filter across projects: "bugs in this project" is the point.
+      boardFilter = { project: (a as HTMLElement).dataset.project, label: boardFilter.label };
     }));
 }
 

@@ -15,6 +15,10 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 - Community health files: CONTRIBUTING (with a DCO sign-off requirement, checked
   in CI), CODE_OF_CONDUCT, SECURITY, SUPPORT, and issue and pull request
   templates. The README gains a header with badges and links. (AMT-32)
+- Web board: a row of label chips filters the board in one click, with `bug`
+  first and each chip showing its count; click again to clear. Bug labels on
+  cards are tinted so bugs stand out even unfiltered. The label filter is kept
+  when you pick a project. (AMT-44)
 
 ### Fixed
 
