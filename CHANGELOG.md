@@ -22,8 +22,10 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 - `amt claim` and `amt issue list` take `--label` more than once (or
   comma-separated); an issue must carry all of them. `--not-label` excludes,
   e.g. `amt claim --not-label question,owner` skips owner questions. The MCP
-  `list_issues` and `claim_next_issue` tools take the same as comma-separated
-  `label` and `not_label`. (AMT-48)
+  `list_issues` and `claim_next_issue` tools take the same as `label` and
+  `not_label`, each a comma-separated string or an array. An empty label
+  filter (`--label ""`) now means no filter, where it used to match nothing.
+  (AMT-48)
 
 ### Changed
 
