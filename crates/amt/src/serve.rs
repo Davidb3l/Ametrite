@@ -522,12 +522,24 @@ pub fn launcher_port(launcher: &str) -> Option<u16> {
 }
 
 /// The ports a Windows reinstall must stop a board on: the one the installed
-/// launcher records (or, for an install from before launchers, the default
-/// it most likely ran on), plus the port being installed. Pure.
-pub fn ports_to_stop(installed: Option<u16>, installing: u16) -> Vec<u16> {
-    let mut ports = vec![installed.unwrap_or(DEFAULT_PORT), installing];
+/// launcher records (or, when a task from before launchers exists, the
+/// default it most likely ran on), plus the port being installed. With no
+/// task at all nothing else is ours to stop: a bun on the default port then
+/// belongs to someone else. Pure.
+pub fn ports_to_stop(installed: Option<u16>, task_exists: bool, installing: u16) -> Vec<u16> {
+    let old = installed.or(task_exists.then_some(DEFAULT_PORT));
+    let mut ports: Vec<u16> = old.into_iter().chain([installing]).collect();
     ports.dedup();
     ports
+}
+
+/// Whether the board's Scheduled Task is registered.
+fn windows_task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", WINDOWS_TASK])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// The port of the installed Windows launcher, if there is one.
@@ -732,7 +744,7 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         let old_port = previous
             .as_deref()
             .and_then(|b| launcher_port(&String::from_utf8_lossy(b)));
-        for port in ports_to_stop(old_port, cfg.port) {
+        for port in ports_to_stop(old_port, windows_task_exists(), cfg.port) {
             windows_stop_board(port);
         }
         let stopped = |e: crate::error::Error| {
@@ -876,11 +888,7 @@ pub fn status() -> Result<ServeStatus> {
     };
     let unit = unit_path().ok();
     let installed = if cfg!(target_os = "windows") {
-        Command::new("schtasks")
-            .args(["/Query", "/TN", WINDOWS_TASK])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        windows_task_exists()
     } else {
         unit.as_ref().is_some_and(|u| u.exists())
     };
@@ -1182,12 +1190,14 @@ mod tests {
 
     #[test]
     fn reinstall_stops_the_old_board_and_the_new_port() {
-        assert_eq!(ports_to_stop(Some(1776), 1776), vec![1776]);
-        assert_eq!(ports_to_stop(Some(5000), 1776), vec![5000, 1776]);
+        assert_eq!(ports_to_stop(Some(1776), true, 1776), vec![1776]);
+        assert_eq!(ports_to_stop(Some(5000), true, 1776), vec![5000, 1776]);
         // An install from before launchers recorded no port: its board most
         // likely ran on the default, whatever port is being installed now.
-        assert_eq!(ports_to_stop(None, 5000), vec![DEFAULT_PORT, 5000]);
-        assert_eq!(ports_to_stop(None, DEFAULT_PORT), vec![DEFAULT_PORT]);
+        assert_eq!(ports_to_stop(None, true, 5000), vec![DEFAULT_PORT, 5000]);
+        assert_eq!(ports_to_stop(None, true, DEFAULT_PORT), vec![DEFAULT_PORT]);
+        // A first install: a bun on the default port isn't ours to stop.
+        assert_eq!(ports_to_stop(None, false, 5000), vec![5000]);
     }
 
     #[cfg(windows)]
