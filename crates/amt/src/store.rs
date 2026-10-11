@@ -2378,12 +2378,20 @@ pub fn fix_malformed_labels(conn: &mut Connection, author: &str) -> Result<Vec<M
                 params![doc_id, l],
             )?;
         }
+        // Never end this body in "→ <label>": stats and agents count any event
+        // ending in "→ done" as a completion, so a legacy `done,` label would
+        // have been logged as one.
+        let into = if m.fixed.is_empty() {
+            "(removed)".to_string()
+        } else {
+            format!("[{}]", m.fixed.join(", "))
+        };
         append_activity(
             &tx,
             doc_id,
             author,
             "event",
-            &format!("label repaired: '{}' → {}", m.label, m.fixed.join(", ")),
+            &format!("label repaired: split '{}' into {into}", m.label),
         )?;
         touch(&tx, doc_id)?;
     }

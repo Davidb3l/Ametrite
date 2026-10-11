@@ -26,7 +26,8 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   the board) are split into separate labels, so `--label bug` and the board's
   bug filter find them. `amt doctor` reports labels stored that way by earlier
   versions, and `amt doctor --fix` splits them, logging each repair on the
-  issue. (AMT-45)
+  issue, note or project. Until `--fix` runs, a workspace with such labels
+  reports `ok: false` in `amt doctor --json`. (AMT-45)
 - Searching for a document's key (`MSX-269`, `D-142`, a note slug) finds that
   document, listed first. Keys weren't in the full-text index, so search only
   found other documents that mention the key. Applies to `amt search`, the MCP
