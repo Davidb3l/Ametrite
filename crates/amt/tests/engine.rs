@@ -438,6 +438,41 @@ fn status_change_respects_another_agents_live_lease() {
             == "released; status: in_progress → done (forced by bob, lease taken from alice)"));
 }
 
+/// A forced completion is still a completion: stats and agents used to miss
+/// any "→ done (forced by …)" event, so `release --force` to done never
+/// counted (pre-existing), and neither would a forced status change.
+#[test]
+fn forced_completions_count_in_stats_and_agents() {
+    let (_d, mut conn) = workspace();
+    for t in ["One", "Two"] {
+        store::create_issue(&mut conn, new_issue(t, "", "high")).unwrap();
+    }
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    store::claim_issue(&mut conn, "AMT-2", "alice", 900).unwrap();
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "operator",
+        "done",
+        None,
+        store::ReleaseOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    store::update_issue(&mut conn, "AMT-2", set_status("done", true), "operator").unwrap();
+    let stats = store::stats(&conn, None).unwrap();
+    assert_eq!(stats.throughput, 2, "both forced completions count");
+    assert!(stats.integrity.ok);
+    let op = store::agents(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "operator")
+        .expect("operator in roster");
+    assert_eq!(op.completed, 2);
+}
+
 /// An expired lease protects nothing: anyone may move the issue, ending it.
 #[test]
 fn status_change_over_a_stale_lease_needs_no_force() {
