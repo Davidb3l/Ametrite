@@ -27,7 +27,7 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   `bun`, so it missed `bun.exe` and failed with "bun is not on PATH" unless
   you passed `--bun`. It now tries the `PATHEXT` extensions, as Windows
   does. The foreground board's PATH is no longer split on `:`, which broke
-  every `C:\` entry, and the installed board finds `amt` through `AMT_BIN`.
+  `C:\` entries apart, and the installed board finds `amt` through `AMT_BIN`.
   (AMT-55)
 
 ## [0.4.1] - 2026-10-11

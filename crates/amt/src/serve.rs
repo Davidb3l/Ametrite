@@ -247,7 +247,9 @@ fn which_in(
 /// The file names `which` tries in each PATH directory. Pure. On Windows a
 /// command is found by appending each `PATHEXT` extension, in order (AMT-55:
 /// a bare `bun` never matched `bun.exe`, and npm's extensionless `bun` is a
-/// sh script cmd can't run).
+/// sh script cmd can't run). Only the extensions `Command` can start are
+/// kept: PATHEXT also lists `.JS`, `.VBS`, and often `.PS1`, and npm writes a
+/// `bun.ps1`, which would fail with "not a valid Win32 application".
 pub fn exe_names(name: &str, windows: bool, pathext: Option<&str>) -> Vec<String> {
     if !windows {
         return vec![name.to_string()];
@@ -256,9 +258,9 @@ pub fn exe_names(name: &str, windows: bool, pathext: Option<&str>) -> Vec<String
         .filter(|p| !p.trim().is_empty())
         .unwrap_or(".COM;.EXE;.BAT;.CMD")
         .split(';')
-        .map(str::trim)
-        .filter(|e| e.starts_with('.'))
-        .map(|e| format!("{name}{}", e.to_ascii_lowercase()))
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| matches!(e.as_str(), ".com" | ".exe" | ".bat" | ".cmd"))
+        .map(|e| format!("{name}{e}"))
         .collect()
 }
 
@@ -974,20 +976,22 @@ mod tests {
     fn child_path_puts_amt_and_bun_first() {
         // The board shells out to `amt`; a service manager's bare PATH would
         // otherwise leave it readable but unable to write.
-        let p = child_path(
+        let p = child_path_on(
             Some(Path::new("/opt/amt/bin")),
             Some(Path::new("/home/u/.bun/bin")),
             "/usr/bin:/bin",
+            false,
         );
         assert_eq!(p, "/opt/amt/bin:/home/u/.bun/bin:/usr/bin:/bin");
     }
 
     #[test]
     fn child_path_does_not_duplicate_entries() {
-        let p = child_path(
+        let p = child_path_on(
             Some(Path::new("/usr/bin")),
             Some(Path::new("/usr/bin")),
             "/usr/bin:/bin",
+            false,
         );
         assert_eq!(p, "/usr/bin:/bin");
     }
@@ -1014,8 +1018,9 @@ mod tests {
             vec!["bun.com", "bun.exe", "bun.bat", "bun.cmd"]
         );
         assert_eq!(
-            exe_names("bun", true, Some(".EXE;.CMD;;.JS ; junk")),
-            vec!["bun.exe", "bun.cmd", "bun.js"]
+            exe_names("bun", true, Some(".PS1;.EXE;.CMD;;.JS ; junk;.VBS")),
+            vec!["bun.exe", "bun.cmd"],
+            "order kept; only what Command can start"
         );
         assert_eq!(
             exe_names("bun", true, Some("  ")).len(),
@@ -1048,9 +1053,9 @@ mod tests {
 
     #[test]
     fn child_path_survives_an_empty_environment() {
-        let p = child_path(Some(Path::new("/opt/amt/bin")), None, "");
+        let p = child_path_on(Some(Path::new("/opt/amt/bin")), None, "", false);
         assert_eq!(p, "/opt/amt/bin");
-        assert_eq!(child_path(None, None, "/bin"), "/bin");
+        assert_eq!(child_path_on(None, None, "/bin", false), "/bin");
     }
 
     #[test]
