@@ -19,6 +19,11 @@ struct Cli {
     /// Emit JSON instead of human-readable output
     #[arg(long, global = true)]
     json: bool,
+    /// Who is acting: the author of everything this command writes, and the
+    /// lease holder for claim/release (default: $AMT_AGENT, then $USER).
+    /// Accepted by every command, before or after it; `--author` is an alias
+    #[arg(long, global = true, alias = "author")]
+    agent: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -52,9 +57,6 @@ enum Cmd {
         /// Claim a specific issue instead of the best available
         #[arg(long)]
         issue: Option<String>,
-        /// Agent name (default: $AMT_AGENT or $USER)
-        #[arg(long)]
-        agent: Option<String>,
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
@@ -78,8 +80,6 @@ enum Cmd {
     /// Release a claimed issue with a final status
     Release {
         id: String,
-        #[arg(long)]
-        agent: Option<String>,
         #[arg(long, default_value = "in_review")]
         status: String,
         #[arg(long, short = 'm')]
@@ -108,9 +108,6 @@ enum Cmd {
         /// Mark an earlier decision as superseded by this one
         #[arg(long)]
         supersedes: Option<String>,
-        /// Author (default: $AMT_AGENT or $USER)
-        #[arg(long)]
-        author: Option<String>,
     },
     /// Browse recorded decisions
     Decision {
@@ -159,10 +156,6 @@ enum Cmd {
     /// what just happened and why, the latest handoff note, and what to claim
     /// next (read-only — takes no lease and writes no activity)
     Brief {
-        /// Agent to scope "my work" and the claim-order preview to
-        /// (default: $AMT_AGENT or $USER)
-        #[arg(long)]
-        agent: Option<String>,
         /// Window for recent activity + decisions: an ISO-8601 instant or a
         /// duration like 24h / 7d (default: 72h)
         #[arg(long)]
@@ -232,9 +225,6 @@ enum Cmd {
         /// Number of issues to create
         #[arg(long, default_value_t = 1000)]
         count: usize,
-        /// Author for the seeded activity (default: $AMT_AGENT or $USER)
-        #[arg(long)]
-        agent: Option<String>,
     },
     /// Run the web board, or install it as a login service that outlives this
     /// session (`--install`)
@@ -390,8 +380,6 @@ struct CommentArgs {
     id: String,
     #[arg(long, short = 'm')]
     body: String,
-    #[arg(long)]
-    author: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -466,9 +454,12 @@ enum ProjectCmd {
 }
 
 fn identity(explicit: Option<String>) -> String {
-    explicit
-        .or_else(|| std::env::var("AMT_AGENT").ok())
-        .or_else(|| std::env::var("USER").ok())
+    // An empty value is unset, at every step: `AMT_AGENT=` used to record an
+    // empty author instead of falling through to $USER (AMT-36).
+    let set = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    set(explicit)
+        .or_else(|| set(std::env::var("AMT_AGENT").ok()))
+        .or_else(|| set(std::env::var("USER").ok()))
         .unwrap_or_else(|| "user".into())
 }
 
@@ -539,8 +530,8 @@ fn open_workspace(cli_workspace: &Option<PathBuf>) -> Result<Connection> {
     db::open(&db_path)
 }
 
-fn comment(conn: &mut Connection, json: bool, args: &CommentArgs) -> Result<()> {
-    store::add_comment(conn, &args.id, &identity(args.author.clone()), &args.body)?;
+fn comment(conn: &mut Connection, json: bool, actor: &str, args: &CommentArgs) -> Result<()> {
+    store::add_comment(conn, &args.id, actor, &args.body)?;
     if json {
         print_json(&serde_json::json!({ "ok": true }));
     } else {
@@ -887,6 +878,9 @@ fn print_brief(b: &Brief) {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // One identity for the whole command (AMT-47): --agent (alias --author),
+    // then $AMT_AGENT, then $USER.
+    let actor = identity(cli.agent.clone());
     match cli.cmd {
         Cmd::Init { name, prefix } => {
             let dir = cli.workspace.clone().unwrap_or(std::env::current_dir()?);
@@ -1022,7 +1016,7 @@ fn run(cli: Cli) -> Result<()> {
                     // --blocked-by key would otherwise leave an orphan issue
                     // behind after the command exits non-zero. A brand-new issue
                     // can't cycle or self-block, so existence is the only risk.
-                    let me = identity(None);
+                    let me = actor.clone();
                     for b in blocked_by.iter().chain(blocks) {
                         store::get_issue(&conn, b)
                             .map_err(|_| amt::error::msg(format!("no issue '{b}' to depend on")))?;
@@ -1126,7 +1120,7 @@ fn run(cli: Cli) -> Result<()> {
                         v.as_ref()
                             .map(|s| if s.is_empty() { None } else { Some(s.clone()) })
                     };
-                    let me = identity(None);
+                    let me = actor.clone();
                     // A status change another agent's live lease forbids must
                     // fail before the edges below commit (AMT-46).
                     if let Some(s) = status {
@@ -1166,19 +1160,19 @@ fn run(cli: Cli) -> Result<()> {
                         println!("updated {}", issue_line(&issue));
                     }
                 }
-                IssueCmd::Comment(args) => comment(&mut conn, cli.json, args)?,
+                IssueCmd::Comment(args) => comment(&mut conn, cli.json, &actor, args)?,
             }
             Ok(())
         }
         Cmd::Comment(ref args) => {
             let mut conn = open_workspace(&cli.workspace)?;
-            comment(&mut conn, cli.json, args)
+            comment(&mut conn, cli.json, &actor, args)
         }
         Cmd::Dep { ref cmd } => {
             let mut conn = open_workspace(&cli.workspace)?;
             match cmd {
                 DepCmd::Add { blocker, blocked } => {
-                    store::add_block(&mut conn, blocker, blocked, &identity(None))?;
+                    store::add_block(&mut conn, blocker, blocked, &actor)?;
                     if cli.json {
                         print_json(&serde_json::json!({
                             "ok": true, "blocker": blocker, "blocked": blocked
@@ -1188,7 +1182,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DepCmd::Rm { blocker, blocked } => {
-                    store::remove_block(&mut conn, blocker, blocked, &identity(None))?;
+                    store::remove_block(&mut conn, blocker, blocked, &actor)?;
                     if cli.json {
                         print_json(&serde_json::json!({
                             "ok": true, "blocker": blocker, "blocked": blocked
@@ -1236,7 +1230,6 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Claim {
             issue,
-            agent,
             project,
             label,
             peek,
@@ -1245,7 +1238,7 @@ fn run(cli: Cli) -> Result<()> {
             cooldown,
             all_workspaces,
         } => {
-            let agent = identity(agent);
+            let agent = actor.clone();
             // `--issue KEY` is inherently single-workspace; combining it with
             // --all-workspaces is a mistake, so reject it rather than silently
             // ignoring the flag and claiming from the local workspace.
@@ -1338,7 +1331,6 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Release {
             id,
-            agent,
             status,
             comment,
             force,
@@ -1355,7 +1347,7 @@ fn run(cli: Cli) -> Result<()> {
             let issue = store::release_issue(
                 &mut conn,
                 &id,
-                &identity(agent),
+                &actor.clone(),
                 &status,
                 final_comment.as_deref(),
                 store::ReleaseOpts { force, no_cooldown },
@@ -1373,7 +1365,6 @@ fn run(cli: Cli) -> Result<()> {
             body,
             status,
             supersedes,
-            author,
         } => {
             let mut conn = open_workspace(&cli.workspace)?;
             let decision = store::record_decision(
@@ -1384,7 +1375,7 @@ fn run(cli: Cli) -> Result<()> {
                     resolves: issue,
                     status,
                     supersedes,
-                    author: identity(author),
+                    author: actor.clone(),
                 },
             )?;
             if cli.json {
@@ -1475,7 +1466,7 @@ fn run(cli: Cli) -> Result<()> {
                             body: body.clone(),
                             tags: tags.clone(),
                             doc_type: "note".into(),
-                            author: identity(None),
+                            author: actor.clone(),
                         },
                     )?;
                     if cli.json {
@@ -1527,7 +1518,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 NoteCmd::Append { id, body } => {
-                    let doc = store::append_to_doc(&mut conn, id, body, &identity(None))?;
+                    let doc = store::append_to_doc(&mut conn, id, body, &actor)?;
                     if cli.json {
                         print_json(&doc);
                     } else {
@@ -1558,7 +1549,7 @@ fn run(cli: Cli) -> Result<()> {
                             body: body.clone(),
                             tags: Vec::new(),
                             doc_type: "project".into(),
-                            author: identity(None),
+                            author: actor.clone(),
                         },
                     )?;
                     if cli.json {
@@ -1651,13 +1642,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Brief {
-            agent,
-            since,
-            budget,
-        } => {
+        Cmd::Brief { since, budget } => {
             let conn = open_workspace(&cli.workspace)?;
-            let agent = identity(agent);
+            let agent = actor.clone();
             let brief = store::brief(&conn, &agent, since.as_deref(), budget)?;
             if cli.json {
                 print_json(&brief);
@@ -1684,7 +1671,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut conn = open_workspace(&cli.workspace)?;
             let mut fixed = serde_json::Value::Null;
             if fix {
-                let me = identity(None);
+                let me = actor.clone();
                 let labels = store::fix_malformed_labels(&mut conn, &me)?;
                 let leases = store::fix_closed_leases(&mut conn, &me)?;
                 if !cli.json {
@@ -2012,8 +1999,8 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Seed { count, agent } => {
-            let me = identity(agent);
+        Cmd::Seed { count } => {
+            let me = actor.clone();
             let mut conn = open_workspace(&cli.workspace)?;
             let start = std::time::Instant::now();
             let n = store::seed(&mut conn, count, &me)?;
@@ -2113,7 +2100,7 @@ fn run(cli: Cli) -> Result<()> {
                         &mut conn,
                         &archive_path,
                         days,
-                        &identity(None),
+                        &actor,
                     )?)
                 }
                 None => None,

@@ -116,8 +116,11 @@ fn strings(args: &Value, key: &str) -> Vec<String> {
 }
 
 fn agent_of(args: &Value) -> String {
-    opt_s(args, "agent")
-        .or_else(|| std::env::var("AMT_AGENT").ok())
+    // Empty is unset, as in the CLI's identity() (AMT-36): an `"agent": ""`
+    // argument or `AMT_AGENT=` must not record an empty author.
+    let set = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    set(opt_s(args, "agent"))
+        .or_else(|| set(std::env::var("AMT_AGENT").ok()))
         .unwrap_or_else(|| "agent".into())
 }
 

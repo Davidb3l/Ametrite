@@ -20,6 +20,15 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   cards are tinted so bugs stand out even unfiltered. The label filter is kept
   when you pick a project. (AMT-44)
 
+### Changed
+
+- `--agent` is accepted by every command, before or after it, with
+  `--author` as an alias, so every write records who did it. `issue
+  create/update`, `note create/append` and `dep add/rm` used to accept
+  neither and silently recorded `$USER`. An empty `--agent` or `AMT_AGENT`
+  now falls through to `$USER` instead of recording an empty author, and a
+  blank comment is refused. (AMT-47, AMT-36)
+
 ### Fixed
 
 - Labels written comma-joined (`--label "bug,ui"`, or the same through MCP or
