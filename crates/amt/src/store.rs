@@ -590,6 +590,11 @@ pub fn update_issue(
 }
 
 pub fn add_comment(conn: &mut Connection, id: &str, author: &str, body: &str) -> Result<()> {
+    // A blank comment is a mistake (a lost variable, an empty -m), never a
+    // record worth keeping; refuse it rather than log nothing (AMT-36).
+    if body.trim().is_empty() {
+        return Err(msg("comment body is empty"));
+    }
     let tx = immediate(conn)?;
     let doc_id = doc_id_of(&tx, id)?;
     append_activity(&tx, doc_id, author, "comment", body)?;

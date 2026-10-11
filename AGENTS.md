@@ -5,7 +5,8 @@ This workspace is shared between humans and AI agents. Follow this etiquette.
 ## Setup
 
 - MCP: `claude mcp add ametrite -- amt mcp` (or run `amt mcp` from any MCP client).
-- CLI: every command accepts `--json`. Set `AMT_AGENT=<your-name>` or pass `--agent`.
+- CLI: every command accepts `--json` and `--agent <you>` (alias `--author`). Set
+  `AMT_AGENT=<your-name>` once instead, or pass `--agent` on any command.
 - Always use a **stable, unique agent name** (e.g. `claude-refactor-1`) so activity
   logs and claims are attributable.
 

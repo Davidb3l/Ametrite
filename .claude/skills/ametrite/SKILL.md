@@ -40,7 +40,7 @@ After bootstrap, just start working — the sections below are the conventions.
 
 ## Identity
 
-Set `AMT_AGENT=<stable-name>` (e.g. `claude-main`) or pass `--agent`/`--author`
+Set `AMT_AGENT=<stable-name>` (e.g. `claude-main`) or pass `--agent` (alias `--author`) — every command accepts it
 on every command. Attribution matters — humans read the activity log.
 
 ## Core commands
