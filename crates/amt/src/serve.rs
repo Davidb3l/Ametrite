@@ -223,10 +223,43 @@ pub fn extract_embedded_web_app(dir: &Path) -> Result<PathBuf> {
 
 /// First match for `name` on PATH.
 fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(name))
+    which_in(
+        name,
+        &std::env::var_os("PATH")?,
+        cfg!(windows),
+        std::env::var("PATHEXT").ok().as_deref(),
+    )
+}
+
+/// [`which`] with PATH and the platform explicit, so it is testable.
+fn which_in(
+    name: &str,
+    path: &std::ffi::OsStr,
+    windows: bool,
+    pathext: Option<&str>,
+) -> Option<PathBuf> {
+    let names = exe_names(name, windows, pathext);
+    std::env::split_paths(path)
+        .flat_map(|d| names.iter().map(move |n| d.join(n)))
         .find(|p| p.is_file())
+}
+
+/// The file names `which` tries in each PATH directory. Pure. On Windows a
+/// command is found by appending each `PATHEXT` extension, in order (AMT-55:
+/// a bare `bun` never matched `bun.exe`, and npm's extensionless `bun` is a
+/// sh script cmd can't run).
+pub fn exe_names(name: &str, windows: bool, pathext: Option<&str>) -> Vec<String> {
+    if !windows {
+        return vec![name.to_string()];
+    }
+    pathext
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .map(str::trim)
+        .filter(|e| e.starts_with('.'))
+        .map(|e| format!("{name}{}", e.to_ascii_lowercase()))
+        .collect()
 }
 
 /// PATH for the server process, with the directories holding `amt` and `bun`
@@ -235,6 +268,18 @@ fn which(name: &str) -> Option<PathBuf> {
 /// fine but silently can't write. (Learned the hard way installing this by
 /// hand.) Pure so the ordering is testable.
 pub fn child_path(exe_dir: Option<&Path>, bun_dir: Option<&Path>, current: &str) -> String {
+    child_path_on(exe_dir, bun_dir, current, cfg!(windows))
+}
+
+/// [`child_path`] with the platform explicit: PATH is `;`-separated on
+/// Windows, where `C:\…` makes `:` part of every entry (AMT-55).
+fn child_path_on(
+    exe_dir: Option<&Path>,
+    bun_dir: Option<&Path>,
+    current: &str,
+    windows: bool,
+) -> String {
+    let sep = if windows { ';' } else { ':' };
     let mut parts: Vec<String> = Vec::new();
     for d in [exe_dir, bun_dir].into_iter().flatten() {
         let s = d.to_string_lossy().into_owned();
@@ -242,12 +287,12 @@ pub fn child_path(exe_dir: Option<&Path>, bun_dir: Option<&Path>, current: &str)
             parts.push(s);
         }
     }
-    for p in current.split(':').filter(|p| !p.is_empty()) {
+    for p in current.split(sep).filter(|p| !p.is_empty()) {
         if !parts.contains(&p.to_string()) {
             parts.push(p.to_string());
         }
     }
-    parts.join(":")
+    parts.join(&sep.to_string())
 }
 
 /// The directory three levels above `server.ts` — the repo root for a
@@ -474,7 +519,11 @@ const SCHTASKS_TR_MAX: usize = 261;
 /// The batch file the Windows logon task runs. Pure so the exact file is
 /// testable. Like the plist and the systemd unit, it carries everything
 /// resolved at install time, including the port (AMT-41: the task used to
-/// take `AMT_PORT` from the logon environment, not the one `--install` saw).
+/// take `AMT_PORT` from the logon environment, not the one `--install` saw)
+/// and the `amt` the board shells out to for every write. That one goes in as
+/// `AMT_BIN`, which `server.ts` checks first, rather than as a PATH edit:
+/// expanding `%PATH%` inside a batch line breaks on entries with quotes
+/// (AMT-55).
 /// The task runs this file instead of an inline `cmd /c` line because
 /// `schtasks` caps `/TR` at 261 characters, which the four paths plus the
 /// port setting can exceed for a long user name.
@@ -484,6 +533,7 @@ const SCHTASKS_TR_MAX: usize = 261;
 /// because cmd expands `%…%` even inside quotes; with delayed expansion off,
 /// nothing else in a path is special within quotes.
 pub fn render_windows_launcher(
+    amt: &Path,
     bun: &Path,
     app: &Path,
     cwd: &Path,
@@ -501,6 +551,7 @@ pub fn render_windows_launcher(
         "chcp 65001 >nul".to_string(),
         format!("cd /d \"{}\" || exit /b 1", q(cwd)),
         format!("set \"AMT_PORT={port}\""),
+        format!("set \"AMT_BIN={}\"", q(amt)),
         format!("\"{}\" run \"{}\" >> \"{}\" 2>&1", q(bun), q(app), q(log)),
         String::new(),
     ]
@@ -762,7 +813,7 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
         }
         std::fs::write(
             &launcher,
-            render_windows_launcher(&cfg.bun, &cfg.app, &cwd, &log, cfg.port),
+            render_windows_launcher(&exe, &cfg.bun, &cfg.app, &cwd, &log, cfg.port),
         )
         .map_err(|e| stopped(e.into()))?;
         let [create, run] = windows_install_steps(create);
@@ -942,6 +993,60 @@ mod tests {
     }
 
     #[test]
+    fn child_path_uses_semicolons_on_windows() {
+        let p = child_path_on(
+            Some(Path::new(r"C:\Users\a\.cargo\bin")),
+            Some(Path::new(r"C:\Users\a\.bun\bin")),
+            r"C:\Windows\system32;C:\Windows;;C:\Users\a\.cargo\bin",
+            true,
+        );
+        assert_eq!(
+            p,
+            r"C:\Users\a\.cargo\bin;C:\Users\a\.bun\bin;C:\Windows\system32;C:\Windows"
+        );
+    }
+
+    #[test]
+    fn exe_names_follow_pathext_on_windows() {
+        assert_eq!(exe_names("bun", false, Some(".EXE")), vec!["bun"]);
+        assert_eq!(
+            exe_names("bun", true, None),
+            vec!["bun.com", "bun.exe", "bun.bat", "bun.cmd"]
+        );
+        assert_eq!(
+            exe_names("bun", true, Some(".EXE;.CMD;;.JS ; junk")),
+            vec!["bun.exe", "bun.cmd", "bun.js"]
+        );
+        assert_eq!(
+            exe_names("bun", true, Some("  ")).len(),
+            4,
+            "blank = default"
+        );
+        // Never the bare name on Windows: npm's extensionless `bun` is a sh script.
+        assert!(!exe_names("bun", true, None).contains(&"bun".to_string()));
+    }
+
+    #[test]
+    fn which_finds_bun_exe_but_not_a_bare_shim_on_windows() {
+        let shims = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        // npm's extensionless sh script comes first on PATH; cmd can't run it.
+        std::fs::write(shims.path().join("bun"), b"#!/bin/sh").unwrap();
+        std::fs::write(bins.path().join("bun.exe"), b"").unwrap();
+        let path = std::env::join_paths([shims.path(), bins.path()]).unwrap();
+        assert_eq!(
+            which_in("bun", &path, true, Some(".COM;.EXE;.BAT;.CMD")),
+            Some(bins.path().join("bun.exe"))
+        );
+        // Elsewhere the bare name is the command.
+        assert_eq!(
+            which_in("bun", &path, false, None),
+            Some(shims.path().join("bun"))
+        );
+        assert_eq!(which_in("nope", &path, true, None), None);
+    }
+
+    #[test]
     fn child_path_survives_an_empty_environment() {
         let p = child_path(Some(Path::new("/opt/amt/bin")), None, "");
         assert_eq!(p, "/opt/amt/bin");
@@ -1033,6 +1138,7 @@ mod tests {
         .contains("AMT_PORT=4242"));
         // AMT-41: Windows used to drop it and take the logon environment's.
         assert!(render_windows_launcher(
+            Path::new("C:\\amt.exe"),
             Path::new("C:\\bun.exe"),
             Path::new("C:\\app.ts"),
             Path::new("C:\\r"),
@@ -1221,6 +1327,7 @@ mod tests {
     #[test]
     fn windows_launcher_bakes_in_the_port_and_every_path() {
         let l = render_windows_launcher(
+            Path::new("C:\\Users\\a\\.cargo\\bin\\amt.exe"),
             Path::new("C:\\Users\\a\\.bun\\bin\\bun.exe"),
             Path::new("C:\\Users\\a\\AppData\\Local\\ametrite\\web\\current\\server.ts"),
             Path::new("C:\\Users\\a\\AppData\\Local\\ametrite"),
@@ -1245,11 +1352,15 @@ mod tests {
              >> \"C:\\Users\\a\\.local\\state\\ametrite\\web.log\" 2>&1\r\n"
         ));
         assert_eq!(launcher_port(&l), Some(1777));
+        // The board finds amt through AMT_BIN, set before bun starts (AMT-55).
+        assert!(l.contains("set \"AMT_BIN=C:\\Users\\a\\.cargo\\bin\\amt.exe\"\r\n"));
+        assert!(at("set \"AMT_BIN=") < at("\"C:\\Users\\a\\.bun"));
     }
 
     #[test]
     fn windows_launcher_escapes_percent_and_keeps_other_characters() {
         let l = render_windows_launcher(
+            Path::new("C:\\50%\\amt.exe"),
             Path::new("C:\\b&n %PATH%\\bun.exe"),
             Path::new("C:\\R&D (é)\\server.ts"),
             Path::new("C:\\R&D (é)"),
@@ -1259,6 +1370,7 @@ mod tests {
         // cmd expands %…% even inside quotes, so a literal % is doubled.
         assert!(l.contains("\"C:\\b&n %%PATH%%\\bun.exe\""), "{l}");
         assert!(l.contains("\"C:\\100%%\\web.log\""), "{l}");
+        assert!(l.contains("set \"AMT_BIN=C:\\50%%\\amt.exe\""), "{l}");
         // & ( ) and non-ASCII are literal inside quotes; chcp 65001 covers é.
         assert!(l.contains("cd /d \"C:\\R&D (é)\" || exit /b 1"), "{l}");
         assert_eq!(launcher_port(&l), Some(1776));
