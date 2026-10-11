@@ -87,24 +87,25 @@ fn detect_on(
 /// Whether cargo's install record (`$CARGO_HOME/.crates.toml` or
 /// `.crates2.json`) lists the `amt` package. `cargo install` writes both; a
 /// dist installer writes neither. Keys look like `amt 0.4.1 (git+https://…)`.
-/// Either file counts: cargo treats `.crates.toml` as the source of truth and
-/// re-syncs `.crates2.json` from it, so they only disagree after a hand edit
-/// or an old cargo. Pure.
+/// Cargo treats `.crates.toml` as the source of truth and rebuilds
+/// `.crates2.json` from it (an old cargo's uninstall can leave a stale
+/// `.crates2.json` entry), so the toml decides when it exists and the json
+/// only stands in when it doesn't. Pure.
 fn cargo_lists_amt(crates2_json: Option<&str>, crates_toml: Option<&str>) -> bool {
     let is_amt = |key: &str| key.starts_with("amt ");
-    let in_json = crates2_json
+    if let Some(t) = crates_toml {
+        return t
+            .lines()
+            .any(|l| l.trim_start().strip_prefix('"').is_some_and(is_amt));
+    }
+    crates2_json
         .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
         .and_then(|v| {
             v.get("installs")?
                 .as_object()
                 .map(|i| i.keys().any(|k| is_amt(k)))
         })
-        .unwrap_or(false);
-    in_json
-        || crates_toml.is_some_and(|t| {
-            t.lines()
-                .any(|l| l.trim_start().strip_prefix('"').is_some_and(is_amt))
-        })
+        .unwrap_or(false)
 }
 
 /// Whether `path` lies inside `dir`. Windows paths compare case-insensitively,
@@ -412,11 +413,15 @@ mod tests {
             None,
             Some("[v1]\n\"amtool 1.0.0 (x)\" = [\"amt\"]\n")
         ));
-        // Either file counts (cargo re-syncs .crates2.json from .crates.toml).
+        // .crates.toml decides when present (cargo rebuilds .crates2.json from it).
         assert!(cargo_lists_amt(Some(r#"{"installs":{}}"#), Some(toml)));
-        assert!(cargo_lists_amt(Some(json), Some("[v1]\n")));
+        assert!(
+            !cargo_lists_amt(Some(json), Some("[v1]\n")),
+            "a stale .crates2.json entry"
+        );
         assert!(cargo_lists_amt(Some("not json"), Some(toml)));
-        assert!(!cargo_lists_amt(Some(r#"{"installs":{}}"#), Some("[v1]\n")));
+        // .crates2.json stands in only when .crates.toml is missing.
+        assert!(!cargo_lists_amt(Some("not json"), None));
         assert!(!cargo_lists_amt(None, None));
     }
 
