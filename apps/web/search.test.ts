@@ -20,6 +20,7 @@ beforeEach(() => {
   add.run("MSX-279", "issue", "Go-live dry run", "Blocked on MSX-269 credentials.");
   add.run("D-142", "decision", "PITR uses WAL-G", "Unverified until **MSX-269**.");
   add.run("handoff-2026-10-10", "note", "Handoff 2026-10-10", "Live work needs MSX-269.");
+  add.run("MSX-300", "issue", "Self-referencing", "See MSX-300 for the plan.");
 });
 const ids = (q: string, extra: Record<string, string> = {}) =>
   search(db, new URLSearchParams({ q, ...extra })).map((h) => h.id);
@@ -41,6 +42,12 @@ test("exact ids match case-insensitively, for decisions and notes too", () => {
 test("the pinned hit has a one-line snippet from its body", () => {
   const [top] = search(db, new URLSearchParams({ q: "msx-269" }));
   expect(top.snippet).toBe("Railway and Stripe keys.");
+});
+
+test("a document that mentions its own key appears once, first", () => {
+  const hits = ids("msx-300");
+  expect(hits[0]).toBe("MSX-300");
+  expect(hits.filter((id) => id === "MSX-300")).toHaveLength(1);
 });
 
 test("filters apply to the exact match too", () => {

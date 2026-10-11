@@ -630,7 +630,7 @@ fn tool_defs() -> Vec<Value> {
             json!({ "tag": s("Only notes carrying this tag, e.g. 'handoff'") }), &[]),
         tool("read_doc", "Read any document (issue, note, project, or decision) by id, key, or title.",
             json!({ "id": s("Document id, issue key, or title") }), &["id"]),
-        tool("search", "Full-text search (FTS5/BM25) across all issues, notes, and projects. No embeddings — exact terms work best; last term is prefix-matched.",
+        tool("search", "Full-text search (FTS5/BM25) across all issues, notes, and projects. No embeddings — exact terms work best; last term is prefix-matched. A query that is exactly a document id (e.g. AMT-7, D-3) lists that document first.",
             json!({ "query": s("Search terms"), "type": json!({ "type": "string", "enum": ["issue","note","project"] }),
                     "status": status, "tag": s("Filter by tag/label"), "project": s("Filter by project"),
                     "limit": i("Max results, default 25") }),
