@@ -321,8 +321,8 @@ fn doctor_reports_and_fixes_legacy_comma_joined_labels() {
 fn label_filters_and_include_and_exclude_on_list_and_claim() {
     let (_d, mut conn) = workspace();
     for (title, prio, labels) in [
-        ("UI bug", "urgent", vec!["bug", "ui"]),
-        ("API bug", "high", vec!["bug", "api"]),
+        ("UI bug", "high", vec!["bug", "ui"]),
+        ("API bug", "medium", vec!["bug", "api"]),
         ("Owner question", "urgent", vec!["question", "ui"]),
         ("Plain", "low", vec![]),
     ] {
@@ -351,9 +351,47 @@ fn label_filters_and_include_and_exclude_on_list_and_claim() {
     assert_eq!(titles(&["ui"], &["question"]), vec!["UI bug"]);
     assert!(!titles(&[], &["question"]).contains(&"Owner question".to_string()));
     assert!(titles(&["bug", "nope"], &[]).is_empty());
+    // Every exclusion applies, not just the first.
+    let mut rest = titles(&[], &["question", "api"]);
+    rest.sort();
+    assert_eq!(rest, vec!["Plain", "UI bug"]);
 
-    // Claim: the urgent owner question would win on priority; --not-label
-    // skips it, and peek agrees with claim.
+    // The no-work explanation counts only issues the filter admits.
+    let bug = vec!["bug".to_string()];
+    let none: Vec<String> = vec![];
+    let only_bugs = store::ClaimFilter {
+        labels: &bug,
+        ..Default::default()
+    };
+    let no_bugs = store::ClaimFilter {
+        not_labels: &bug,
+        labels: &none,
+        ..Default::default()
+    };
+    assert_eq!(
+        store::no_work_reason(&conn, "w", 0, &only_bugs)
+            .unwrap()
+            .counts
+            .candidates,
+        2
+    );
+    assert_eq!(
+        store::no_work_reason(&conn, "w", 0, &no_bugs)
+            .unwrap()
+            .counts
+            .candidates,
+        2
+    );
+
+    // Claim: the urgent owner question wins on priority unfiltered;
+    // --not-label skips it, and peek agrees with claim.
+    assert_eq!(
+        store::peek_next(&conn, "worker", 0, &any())
+            .unwrap()
+            .unwrap()
+            .title,
+        "Owner question"
+    );
     let not = vec!["question".to_string()];
     let f = store::ClaimFilter {
         not_labels: &not,

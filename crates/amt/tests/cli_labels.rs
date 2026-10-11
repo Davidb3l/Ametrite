@@ -188,3 +188,77 @@ fn label_filters_take_several_labels_and_exclusions() {
     ));
     assert_eq!(claimed["title"], "API bug");
 }
+
+/// MCP label filters accept an array as well as a comma string: an array
+/// `not_label` used to be dropped silently, so the agent claimed the very
+/// issue it excluded (AMT-48 review).
+#[test]
+fn mcp_label_filters_accept_arrays() {
+    use std::io::Write;
+    let (_root, reg, repo) = workspace();
+    for (title, prio, labels) in [
+        ("Owner question", "urgent", "question,owner"),
+        ("UI bug", "high", "bug,ui"),
+    ] {
+        json(&amt(
+            &repo,
+            &reg,
+            &[
+                "issue",
+                "create",
+                "--title",
+                title,
+                "--priority",
+                prio,
+                "--label",
+                labels,
+                "--json",
+            ],
+        ));
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amt"))
+        .current_dir(&repo)
+        .env("AMT_REGISTRY", &reg)
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let call = |id: u64, args: serde_json::Value| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"claim_next_issue","arguments":args}})
+    };
+    for line in [
+        serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        call(
+            1,
+            serde_json::json!({"agent":"w","peek":true,"not_label":["question","owner"]}),
+        ),
+        call(
+            2,
+            serde_json::json!({"agent":"w","peek":true,"not_label":"question"}),
+        ),
+        call(
+            3,
+            serde_json::json!({"agent":"w","peek":true,"label":["bug","ui"]}),
+        ),
+    ] {
+        writeln!(stdin, "{line}").unwrap();
+    }
+    drop(stdin);
+    let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    let titles: Vec<String> = out
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["id"].as_u64().is_some_and(|i| i > 0))
+        .map(|v| {
+            let text = v["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str::<serde_json::Value>(text).unwrap()["title"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(titles, vec!["UI bug", "UI bug", "UI bug"], "{out}");
+}

@@ -126,10 +126,15 @@ fn strings(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A label filter argument: a comma-separated string, all of which must match
-/// (AMT-48), normalized like label writes. Absent or empty = no filter.
+/// A label filter argument, as a comma-separated string or an array of
+/// strings (other list args in this API are arrays, so agents send both —
+/// silently dropping an array `not_label` would claim the very work it
+/// excludes). Normalized like label writes; absent or empty = no filter.
 fn labels_arg(args: &Value, key: &str) -> Vec<String> {
-    store::split_labels(&[opt_s(args, key).unwrap_or_default()])
+    match args.get(key) {
+        Some(Value::Array(_)) => store::split_labels(&strings(args, key)),
+        _ => store::split_labels(&[opt_s(args, key).unwrap_or_default()]),
+    }
 }
 
 fn agent_of(args: &Value) -> String {
@@ -602,8 +607,8 @@ fn tool_defs() -> Vec<Value> {
             &["title"]),
         tool("list_issues", "List issues with filters. Excludes done/canceled unless include_closed.",
             json!({ "status": status, "assignee": s("Filter by assignee"), "project": s("Filter by project slug"),
-                    "label": s("Only issues with ALL of these labels (comma-separated, e.g. 'bug,ui')"),
-                    "not_label": s("Exclude issues with ANY of these labels (comma-separated)"),
+                    "label": s("Only issues with ALL of these labels: a comma-separated string ('bug,ui') or an array"),
+                    "not_label": s("Exclude issues with ANY of these labels: a comma-separated string or an array"),
                     "claimed": b("Filter by claimed state"),
                     "claimed_by": s("Only issues currently claimed by this agent"),
                     "include_closed": b("Include done/canceled"), "limit": i("Max results (default 50)") }),
@@ -613,8 +618,8 @@ fn tool_defs() -> Vec<Value> {
         tool("claim_next_issue", "Atomically claim the highest-priority claimable issue (todo/backlog, unclaimed or expired lease). Sets status to in_progress with a lease. Race-free across agents. When nothing is claimable, returns {claimed:false} with a reason, counts, and retry_after.",
             json!({ "agent": s("Your agent name (required for meaningful attribution)"),
                     "project": s("Only from this project"),
-                    "label": s("Only issues with ALL of these labels (comma-separated)"),
-                    "not_label": s("Never issues with ANY of these labels (comma-separated), e.g. 'question,owner'"),
+                    "label": s("Only issues with ALL of these labels: a comma-separated string or an array"),
+                    "not_label": s("Never issues with ANY of these labels: a comma-separated string or an array, e.g. 'question,owner'"),
                     "peek": b("Report the best claimable issue WITHOUT taking a lease or writing activity; result has 'peek': true"),
                     "stages": arr("Restrict claimable stages (subset of ['backlog','todo']); default both"),
                     "from": s("Comma-list alternative to stages, e.g. 'todo,backlog'"),
