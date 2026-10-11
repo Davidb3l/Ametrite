@@ -23,6 +23,12 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   exists, reinstalling, `--uninstall`, and `--status` use the port it
   records; the first reinstall over an older task also stops a board left on
   the default port. Re-run `amt serve --install` to pick this up. (AMT-41)
+- Windows: `amt serve` now finds Bun. It looked only for a file named
+  `bun`, so it missed `bun.exe` and failed with "bun is not on PATH" unless
+  you passed `--bun`. It now tries the `PATHEXT` extensions, as Windows
+  does. The foreground board's PATH is no longer split on `:`, which broke
+  every `C:\` entry, and the installed board finds `amt` through `AMT_BIN`.
+  (AMT-55)
 
 ## [0.4.1] - 2026-10-11
 
