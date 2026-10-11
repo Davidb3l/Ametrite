@@ -249,6 +249,32 @@ fn comma_joined_labels_are_split_on_every_write() {
     );
 }
 
+/// The repair is logged as an event, and stats/agents count any event ending
+/// in "→ done" as a completion: a legacy `done,` label must not turn the repair
+/// into one (review finding on AMT-45).
+#[test]
+fn repairing_a_done_label_is_not_a_completion() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Open", "", "low")).unwrap();
+    conn.execute(
+        "INSERT INTO tags(doc_id, tag, src)
+         SELECT doc_id, 'done,', 'label' FROM documents WHERE id = 'AMT-1'",
+        [],
+    )
+    .unwrap();
+    let before = store::stats(&conn, None).unwrap().throughput;
+    store::fix_malformed_labels(&mut conn, "doctor").unwrap();
+    assert_eq!(store::stats(&conn, None).unwrap().throughput, before);
+    assert!(store::agents(&conn)
+        .unwrap()
+        .iter()
+        .all(|a| a.completed == 0));
+    assert_eq!(
+        store::get_issue(&conn, "AMT-1").unwrap().labels,
+        vec!["done"]
+    );
+}
+
 /// AMT-45: labels written before the fix are reported by doctor and split by
 /// `doctor --fix`, which logs each repair and is idempotent.
 #[test]
@@ -278,9 +304,11 @@ fn doctor_reports_and_fixes_legacy_comma_joined_labels() {
     labels.sort();
     assert_eq!(labels, vec!["bug", "ui"], "split, and no duplicate bug");
     let log = store::activity(&conn, &issue.id).unwrap();
-    assert!(log
-        .iter()
-        .any(|a| a.author == "doctor" && a.body.contains("label repaired: 'bug,ui' → bug, ui")));
+    assert!(
+        log.iter()
+            .any(|a| a.author == "doctor"
+                && a.body == "label repaired: split 'bug,ui' into [bug, ui]")
+    );
     assert!(store::doctor(&conn).unwrap().ok);
     assert!(store::fix_malformed_labels(&mut conn, "doctor")
         .unwrap()
