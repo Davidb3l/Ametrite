@@ -124,6 +124,13 @@ fn searching_a_document_id_puts_that_document_first() {
         new_issue("Dry run", "Blocked on AMT-1 credentials.", "low"),
     )
     .unwrap(); // AMT-2
+               // An issue that mentions its own key is both the exact match and an FTS
+               // hit: it must still appear once, first.
+    store::create_issue(
+        &mut conn,
+        new_issue("Self-referencing", "See AMT-3 for the plan.", "low"),
+    )
+    .unwrap(); // AMT-3
     let note = store::create_doc(
         &mut conn,
         store::NewNote {
@@ -174,6 +181,18 @@ fn searching_a_document_id_puts_that_document_first() {
         ..Default::default()
     };
     assert_eq!(ids("amt-1", &one), vec!["AMT-1".to_string()]);
+
+    let hits = ids("amt-3", &all);
+    assert_eq!(hits[0], "AMT-3");
+    assert_eq!(
+        hits.iter().filter(|id| *id == "AMT-3").count(),
+        1,
+        "deduplicated"
+    );
+
+    // Related-doc recall (context_pack) is untouched: no pinning there.
+    let related = store::search_related(&conn, "amt-1", &all).unwrap();
+    assert!(related.iter().all(|h| h.id != "AMT-1"));
 
     // A multi-word query is plain full-text search.
     assert!(!ids("amt-1 credentials", &all).contains(&"AMT-1".to_string()));
