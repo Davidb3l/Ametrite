@@ -120,9 +120,10 @@ function wsOf(req: Request): Workspace {
 function findAmt(): string {
   if (process.env.AMT_BIN) return process.env.AMT_BIN;
   const repo = dirname(import.meta.dir);
+  const exe = process.platform === "win32" ? "amt.exe" : "amt";
   for (const candidate of [
-    join(dirname(repo), "target", "release", "amt"),
-    join(dirname(repo), "target", "debug", "amt"),
+    join(dirname(repo), "target", "release", exe),
+    join(dirname(repo), "target", "debug", exe),
   ]) {
     if (existsSync(candidate)) return candidate;
   }
