@@ -620,6 +620,7 @@ a.wikilink.xws::before { content: "▸ "; opacity: 0.7; }
 .board-wrap .board { flex: 1; min-height: 0; height: auto; }
 .board-chips { flex-wrap: wrap; margin: 0 0 12px; }
 .board-chips .chip .n { color: var(--text-3); margin-left: 2px; }
+.board-chips .chip.more { color: var(--text-3); border-style: dashed; }
 .chip.chip-bug { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
 .filter-chips .chip.chip-bug.on { background: color-mix(in srgb, var(--red) 16%, transparent); color: var(--red); border-color: var(--red); }
 .hit {

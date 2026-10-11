@@ -23,7 +23,31 @@ export function labelCounts(issues: { labels: string[] }[], active?: string): La
   };
   return [...counts]
     .map(([label, count]) => ({ label, count }))
-    .sort((a, b) => pin(a.label) - pin(b.label) || b.count - a.count || a.label.localeCompare(b.label));
+    .sort(
+      (a, b) =>
+        pin(a.label) - pin(b.label) ||
+        b.count - a.count ||
+        a.label.localeCompare(b.label, undefined, { numeric: true }),
+    );
+}
+
+/** How many chips the board shows before a "+N more" toggle. */
+export const LABEL_CHIPS = 12;
+
+/**
+ * The chips to show: the first `limit` (unless expanded), plus the active
+ * label wherever it ranks, so a filter is always visible and clearable.
+ * `hidden` is how many labels the "+N more" toggle would reveal.
+ */
+export function visibleLabels(
+  counts: LabelCount[],
+  active?: string,
+  expanded = false,
+  limit = LABEL_CHIPS,
+): { shown: LabelCount[]; hidden: number } {
+  if (expanded) return { shown: counts, hidden: 0 };
+  const shown = counts.filter((c, n) => n < limit || c.label === active);
+  return { shown, hidden: counts.length - shown.length };
 }
 
 /** The issues carrying `label`, or all of them when no label is selected. */
