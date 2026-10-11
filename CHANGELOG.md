@@ -17,11 +17,15 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 - **Behavior change for agents:** while another agent holds a live lease
   on an issue, only that agent can change the issue's status. Others are
   refused (operators can use `amt issue update --force`). Leaving
-  in_progress now ends the lease.
+  in_progress now ends the lease. On the web board, dragging a card another
+  agent is actively working on is refused with a message; the board has no
+  override, so use `amt issue update --force` if you mean it.
 - **Run `amt doctor --fix` once in each workspace.** It splits labels that
   earlier versions stored comma-joined (e.g. `bug,ui`, which `--label bug`
   couldn't find) and ends leases that closed issues still hold. `amt doctor`
-  lists both first if you want to look before fixing.
+  lists both first if you want to look before fixing. Until you do,
+  `amt doctor --json` reports `ok: false` for a workspace that has either
+  (the exit code stays 0), which tools gating on doctor will notice.
 - **If you run the web board,** restart it to get the new search and label
   filter: `amt serve --install` (service) or restart `amt serve`.
 
@@ -38,13 +42,17 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   comma-separated); an issue must carry all of them. `--not-label` excludes,
   e.g. `amt claim --not-label question,owner` skips owner questions. The MCP
   `list_issues` and `claim_next_issue` tools take the same as `label` and
-  `not_label`, each a comma-separated string or an array. An empty label
-  filter (`--label ""`) now means no filter, where it used to match nothing.
-  (AMT-48)
+  `not_label`, each a comma-separated string or an array. (AMT-48)
 
 ### Changed
 
-- `--agent` is accepted by every command, before or after it, with
+- Only the holder of a live lease can change its issue's status; others are
+  refused, and an operator can override with `amt issue update --force`,
+  which is logged. (AMT-46)
+- An empty label filter (`--label ""`) now means no filter, where it used to
+  match nothing. (AMT-48)
+- `--agent` is accepted by every command except `amt serve` (which refuses
+  it, since the board records each request's author), before or after it, with
   `--author` as an alias, so every write records who did it. `issue
   create/update`, `note create/append` and `dep add/rm` used to accept
   neither and silently recorded `$USER`. `amt mcp --agent X` makes `X` the
@@ -63,10 +71,10 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   reports `ok: false` in `amt doctor --json`. (AMT-45)
 - Changing an issue's status ends its lease when it leaves in_progress, so
   done issues no longer stay claimed (including cards dragged on the board).
-  Only the lease holder can change the status while the lease is live; an
-  operator can override with `amt issue update --force`, which is logged.
   `amt doctor` reports closed issues still holding a lease, and `--fix` ends
-  those leases. (AMT-46)
+  those leases. In `amt doctor --json` these are the `malformed_labels` and
+  `closed_leases` checks, and `--fix` adds a `fixed` object listing what it
+  changed. (AMT-45, AMT-46)
 - `amt stats` and `amt agents` count forced completions (`release --force`
   to done, and the new forced status change). They used to miss any
   completion logged as forced, including ones already in your history,
