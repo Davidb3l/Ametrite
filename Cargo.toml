@@ -24,7 +24,7 @@ strip = true
 # contents:write on Davidb3l/homebrew-tap) — the default GITHUB_TOKEN cannot
 # write to another repository.
 [workspace.metadata.dist]
-cargo-dist-version = "0.32.0"
+cargo-dist-version = "0.33.0"
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
 targets = [
