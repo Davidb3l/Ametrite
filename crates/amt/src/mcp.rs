@@ -600,7 +600,7 @@ fn tool_defs() -> Vec<Value> {
         tool("release_issue", "Release your claim, setting a final status (default in_review) and optional closing comment.",
             json!({ "id": s("Issue key"), "agent": s("Your agent name"), "status": status, "comment": s("Closing comment") }),
             &["id", "agent"]),
-        tool("update_issue", "Update issue fields. Only provided fields change.",
+        tool("update_issue", "Update issue fields. Only provided fields change. While another agent holds a live lease, only that agent can change the status: pass your `agent` name.",
             json!({ "id": s("Issue key"), "title": s("New title"), "description": s("New markdown body"),
                     "status": status, "priority": priority, "project": s("Project slug (empty/null clears)"),
                     "assignee": s("Assignee (null clears)"), "parent": s("Parent key"), "due": s("Due date"),

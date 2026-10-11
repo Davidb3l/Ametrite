@@ -543,7 +543,9 @@ async function renderIssue(id: string) {
       ? fieldRow("Claim", `<span class="claim ${isStale(i) ? "stale" : ""}">🔒 ${esc(i.claimed_by)}</span>`)
       : "");
   fields.querySelector("#f-status")!.addEventListener("change", async (e) => {
-    await patch(`/api/issues/${encodeURIComponent(i.id)}`, { status: (e.target as HTMLSelectElement).value });
+    // A refused change (e.g. another agent's live lease, AMT-46) has already
+    // toasted; re-render either way so the dropdown shows the real status.
+    await patch(`/api/issues/${encodeURIComponent(i.id)}`, { status: (e.target as HTMLSelectElement).value }).catch(() => {});
     render();
   });
   fields.querySelector("#f-priority")!.addEventListener("change", async (e) => {
