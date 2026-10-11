@@ -107,8 +107,11 @@ fn doctor_fix_splits_legacy_labels_and_keeps_one_json_object() {
     // --fix --json: one object, the repaired state, and what changed.
     let env = json(&amt(&repo, &reg, &["doctor", "--fix", "--json"]));
     assert_eq!(env["ok"], true);
-    assert_eq!(env["fixed"][0]["id"], "LB-1");
-    assert_eq!(env["fixed"][0]["fixed"], serde_json::json!(["bug", "ui"]));
+    assert_eq!(env["fixed"]["labels"][0]["id"], "LB-1");
+    assert_eq!(
+        env["fixed"]["labels"][0]["fixed"],
+        serde_json::json!(["bug", "ui"])
+    );
     let bugs = json(&amt(
         &repo,
         &reg,

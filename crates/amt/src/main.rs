@@ -179,8 +179,9 @@ enum Cmd {
     /// Check workspace health (unresolved links, stale claims, missing refs,
     /// malformed labels)
     Doctor {
-        /// Repair what is safe to repair: split comma-joined labels such as
-        /// `bug,ui` into `bug` and `ui` (logged on each issue)
+        /// Repair what is safe to repair, logged on each issue: split
+        /// comma-joined labels such as `bug,ui`, and end leases that done or
+        /// canceled issues still hold
         #[arg(long)]
         fix: bool,
     },
@@ -373,6 +374,10 @@ enum IssueCmd {
         /// Add a dependent: issue key(s) this one blocks (repeatable)
         #[arg(long = "blocks")]
         blocks: Vec<String>,
+        /// Operator override: change the status of an issue another agent
+        /// holds a live lease on (audit-logged)
+        #[arg(long)]
+        force: bool,
     },
     /// Add a comment to an issue (also available as `amt comment`)
     Comment(CommentArgs),
@@ -595,6 +600,7 @@ fn doctor_envelope(report: &DoctorReport, ui_port: u16) -> serde_json::Value {
             check("dangling_decisions", report.dangling_decisions.len()),
             check("dependency_cycles", report.dependency_cycles.len()),
             check("malformed_labels", report.malformed_labels.len()),
+            check("closed_leases", report.closed_leases.len()),
         ],
         "report": report,
     })
@@ -1114,6 +1120,7 @@ fn run(cli: Cli) -> Result<()> {
                     remove_labels,
                     blocked_by,
                     blocks,
+                    force,
                 } => {
                     let clearable = |v: &Option<String>| -> Option<Option<String>> {
                         v.as_ref()
@@ -1143,6 +1150,7 @@ fn run(cli: Cli) -> Result<()> {
                             due: clearable(due),
                             add_labels: add_labels.clone(),
                             remove_labels: remove_labels.clone(),
+                            force: *force,
                         },
                         &me,
                     )?;
@@ -1669,11 +1677,13 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Doctor { fix } => {
             let mut conn = open_workspace(&cli.workspace)?;
-            let mut fixed = Vec::new();
+            let mut fixed = serde_json::Value::Null;
             if fix {
-                fixed = store::fix_malformed_labels(&mut conn, &identity(None))?;
+                let me = identity(None);
+                let labels = store::fix_malformed_labels(&mut conn, &me)?;
+                let leases = store::fix_closed_leases(&mut conn, &me)?;
                 if !cli.json {
-                    for m in &fixed {
+                    for m in &labels {
                         println!(
                             "fixed label: {} '{}' → {}",
                             m.id,
@@ -1681,7 +1691,14 @@ fn run(cli: Cli) -> Result<()> {
                             m.fixed.join(", ")
                         );
                     }
+                    for c in &leases {
+                        println!(
+                            "ended lease: {} ({}) was still held by {}",
+                            c.id, c.status, c.claimed_by
+                        );
+                    }
                 }
+                fixed = serde_json::json!({ "labels": labels, "leases": leases });
             }
             let report = store::doctor(&conn)?;
             if cli.json {
@@ -1689,7 +1706,7 @@ fn run(cli: Cli) -> Result<()> {
                 // and `fixed` (additive, --fix only) lists what changed.
                 let mut env = doctor_envelope(&report, ui_port());
                 if fix {
-                    env["fixed"] = serde_json::json!(fixed);
+                    env["fixed"] = fixed;
                 }
                 print_json(&env);
             } else if report.ok {
@@ -1718,6 +1735,12 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 for c in &report.dependency_cycles {
                     println!("dependency cycle: {}", c.cycle.join(" → "));
+                }
+                for c in &report.closed_leases {
+                    println!(
+                        "closed issue still leased: {} ({}) held by {} (amt doctor --fix ends it)",
+                        c.id, c.status, c.claimed_by
+                    );
                 }
                 for m in &report.malformed_labels {
                     println!(
@@ -2204,6 +2227,7 @@ mod tests {
             dangling_decisions: vec![],
             dependency_cycles: vec![],
             malformed_labels: vec![],
+            closed_leases: vec![],
             ok: true,
         }
     }
@@ -2223,7 +2247,7 @@ mod tests {
         assert_eq!(v["ui"], "http://localhost:1776");
         // §3: checks are {name, ok, detail} rows with stable snake_case names.
         let checks = v["checks"].as_array().expect("checks array");
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 8);
         for c in checks {
             assert!(c["name"].is_string());
             assert!(c["ok"].is_boolean());

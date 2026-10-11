@@ -360,6 +360,126 @@ fn expired_lease_is_stealable() {
     assert_eq!(stolen.unwrap().claimed_by.as_deref(), Some("agent-b"));
 }
 
+fn set_status(status: &str, force: bool) -> store::IssuePatch {
+    store::IssuePatch {
+        status: Some(status.into()),
+        force,
+        ..Default::default()
+    }
+}
+
+/// AMT-46: a status change that leaves in_progress ends the lease (it used to
+/// leave it behind), logged as a release so the integrity audit stays clean.
+#[test]
+fn status_change_by_the_holder_ends_the_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    let done = store::update_issue(&mut conn, "AMT-1", set_status("done", false), "alice").unwrap();
+    assert_eq!(done.status, "done");
+    assert!(done.claimed_by.is_none() && done.claim_expires_at.is_none());
+    let log = store::activity(&conn, "AMT-1").unwrap();
+    assert!(log
+        .iter()
+        .any(|a| a.body == "released; status: in_progress → done"));
+    assert!(store::doctor(&conn).unwrap().closed_leases.is_empty());
+
+    // Reopened and claimed by someone else: no overlap in the integrity replay.
+    store::update_issue(&mut conn, "AMT-1", set_status("todo", false), "alice").unwrap();
+    store::claim_next(&mut conn, "bob", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    assert!(store::stats(&conn, None).unwrap().integrity.ok);
+
+    // Moving within in_progress keeps the lease; non-status edits don't touch it.
+    let i = store::get_issue(&conn, "AMT-1").unwrap();
+    assert_eq!(i.claimed_by.as_deref(), Some("bob"));
+}
+
+/// AMT-46: only the holder may change the status while the lease is live;
+/// operators override with force, which is audit-logged.
+#[test]
+fn status_change_respects_another_agents_live_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "alice", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+
+    let err =
+        store::update_issue(&mut conn, "AMT-1", set_status("done", false), "bob").unwrap_err();
+    assert!(err.to_string().contains("claimed by alice"), "{err}");
+    let i = store::get_issue(&conn, "AMT-1").unwrap();
+    assert_eq!(
+        (i.status.as_str(), i.claimed_by.as_deref()),
+        ("in_progress", Some("alice"))
+    );
+
+    // Other fields stay editable by anyone.
+    let prio = store::IssuePatch {
+        priority: Some("low".into()),
+        ..Default::default()
+    };
+    let i = store::update_issue(&mut conn, "AMT-1", prio, "bob").unwrap();
+    assert_eq!(
+        (i.priority.as_str(), i.claimed_by.as_deref()),
+        ("low", Some("alice"))
+    );
+
+    // Forced: allowed, the lease ends, and the log says who took it from whom.
+    let i = store::update_issue(&mut conn, "AMT-1", set_status("done", true), "bob").unwrap();
+    assert_eq!(i.status, "done");
+    assert!(i.claimed_by.is_none());
+    let log = store::activity(&conn, "AMT-1").unwrap();
+    assert!(log.iter().any(|a| a.author == "bob"
+        && a.body
+            == "released; status: in_progress → done (forced by bob, lease taken from alice)"));
+}
+
+/// An expired lease protects nothing: anyone may move the issue, ending it.
+#[test]
+fn status_change_over_a_stale_lease_needs_no_force() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "crashed", -10, 0, &any())
+        .unwrap()
+        .unwrap();
+    let i = store::update_issue(&mut conn, "AMT-1", set_status("todo", false), "bob").unwrap();
+    assert_eq!(i.status, "todo");
+    assert!(i.claimed_by.is_none());
+}
+
+/// Leases closed issues kept before AMT-46 are reported, and --fix ends them.
+#[test]
+fn doctor_reports_and_fixes_leases_on_closed_issues() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Task", "", "high")).unwrap();
+    store::claim_next(&mut conn, "claude-main", 900, 0, &any())
+        .unwrap()
+        .unwrap();
+    // What a pre-AMT-46 status change left behind.
+    conn.execute("UPDATE issues SET status = 'done'", [])
+        .unwrap();
+
+    let report = store::doctor(&conn).unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.closed_leases.len(), 1);
+    assert_eq!(report.closed_leases[0].claimed_by, "claude-main");
+
+    let fixed = store::fix_closed_leases(&mut conn, "doctor").unwrap();
+    assert_eq!(fixed.len(), 1);
+    let i = store::get_issue(&conn, "AMT-1").unwrap();
+    assert!(i.claimed_by.is_none());
+    assert_eq!(i.status, "done", "status untouched");
+    assert!(store::doctor(&conn).unwrap().ok);
+    assert!(store::stats(&conn, None).unwrap().integrity.ok);
+    assert!(store::fix_closed_leases(&mut conn, "doctor")
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn release_sets_status_and_clears_claim() {
     let (_d, mut conn) = workspace();

@@ -30,6 +30,9 @@ pub struct IssuePatch {
     pub due: Option<Option<String>>,
     pub add_labels: Vec<String>,
     pub remove_labels: Vec<String>,
+    /// Operator override: change the status of an issue another agent holds
+    /// a live lease on (audit-logged, like `release --force`).
+    pub force: bool,
 }
 
 #[derive(Default)]
@@ -411,17 +414,56 @@ pub fn update_issue(
             )));
         }
         if *status != before.status {
-            tx.execute(
-                "UPDATE issues SET status = ?1 WHERE doc_id = ?2",
-                params![status, doc_id],
-            )?;
-            append_activity(
-                &tx,
-                doc_id,
-                author,
-                "event",
-                &format!("status: {} → {}", before.status, status),
-            )?;
+            // AMT-46: a lease protects work in progress, so only its holder may
+            // move the issue while the lease is live (operators: --force, as
+            // with `release --force`). Leaving in_progress ends the lease — a
+            // status change used to leave it behind, so done issues still
+            // counted as claimed.
+            let now = db::now(&tx)?;
+            let mut displaced: Option<&str> = None;
+            if let (Some(holder), Some(expires)) = (&before.claimed_by, &before.claim_expires_at) {
+                if holder != author && *expires >= now {
+                    if !patch.force {
+                        return Err(msg(format!(
+                            "'{}' is claimed by {holder} until {expires}; only the holder can \
+                             change its status (use --force to override)",
+                            before.id
+                        )));
+                    }
+                    displaced = Some(holder);
+                }
+            }
+            let ends_lease = before.claimed_by.is_some() && status != "in_progress";
+            let event = if ends_lease {
+                tx.execute(
+                    "UPDATE issues SET status = ?1, claimed_by = NULL, claim_expires_at = NULL,
+                        last_released_by = ?2, last_released_at = ?3
+                     WHERE doc_id = ?4",
+                    params![status, author, now, doc_id],
+                )?;
+                // Same "released; status:" prefix as release_issue, so the
+                // claim-integrity replay sees the lease end here.
+                match displaced {
+                    Some(holder) => format!(
+                        "released; status: {} → {status} (forced by {author}, lease taken from {holder})",
+                        before.status
+                    ),
+                    None => format!("released; status: {} → {status}", before.status),
+                }
+            } else {
+                tx.execute(
+                    "UPDATE issues SET status = ?1 WHERE doc_id = ?2",
+                    params![status, doc_id],
+                )?;
+                match displaced {
+                    Some(holder) => format!(
+                        "status: {} → {status} (forced by {author}; {holder} keeps the lease)",
+                        before.status
+                    ),
+                    None => format!("status: {} → {}", before.status, status),
+                }
+            };
+            append_activity(&tx, doc_id, author, "event", &event)?;
             // Closing this issue may free dependents whose last blocker it was.
             if is_terminal(status) && !is_terminal(&before.status) {
                 emit_unblock_events(&tx, &before.id, author)?;
@@ -2318,6 +2360,7 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
 
     let dependency_cycles = find_dependency_cycles(conn)?;
     let malformed_labels = malformed_labels(conn)?;
+    let closed_leases = closed_leases(conn)?;
 
     let ok = unresolved_links.is_empty()
         && stale_claims.is_empty()
@@ -2325,7 +2368,8 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
         && missing_projects.is_empty()
         && dangling_decisions.is_empty()
         && dependency_cycles.is_empty()
-        && malformed_labels.is_empty();
+        && malformed_labels.is_empty()
+        && closed_leases.is_empty();
     Ok(DoctorReport {
         unresolved_links,
         stale_claims,
@@ -2334,8 +2378,56 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
         dangling_decisions,
         dependency_cycles,
         malformed_labels,
+        closed_leases,
         ok,
     })
+}
+
+/// Done/canceled issues still holding a lease — left behind by status
+/// changes before AMT-46 (they count as claims in `agents` forever).
+fn closed_leases(conn: &Connection) -> Result<Vec<ClosedLease>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id, i.status, i.claimed_by FROM issues i JOIN documents d ON d.doc_id = i.doc_id
+         WHERE i.claimed_by IS NOT NULL AND i.status IN ('done','canceled') ORDER BY d.id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ClosedLease {
+                id: r.get(0)?,
+                status: r.get(1)?,
+                claimed_by: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// `amt doctor --fix`: end the leases closed issues still hold, logged as a
+/// release (the integrity replay's lease-end marker). Idempotent.
+pub fn fix_closed_leases(conn: &mut Connection, author: &str) -> Result<Vec<ClosedLease>> {
+    let tx = immediate(conn)?;
+    let found = closed_leases(&tx)?;
+    for c in &found {
+        let doc_id = doc_id_of(&tx, &c.id)?;
+        tx.execute(
+            "UPDATE issues SET claimed_by = NULL, claim_expires_at = NULL WHERE doc_id = ?1",
+            [doc_id],
+        )?;
+        append_activity(
+            &tx,
+            doc_id,
+            author,
+            "event",
+            &format!(
+                "released; status: {s} → {s} (lease left by {} cleared by doctor --fix)",
+                c.claimed_by,
+                s = c.status
+            ),
+        )?;
+        touch(&tx, doc_id)?;
+    }
+    tx.commit()?;
+    Ok(found)
 }
 
 /// Explicit labels/tags that `split_labels` would have rewritten, e.g. the

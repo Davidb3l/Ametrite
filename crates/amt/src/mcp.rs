@@ -336,6 +336,9 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
                 due: clearable("due"),
                 add_labels: strings(&args, "add_labels"),
                 remove_labels: strings(&args, "remove_labels"),
+                // No operator override over MCP, as with release_issue: an
+                // agent can't move another agent's live claim.
+                force: false,
             };
             let issue = run!(store::update_issue(
                 conn,

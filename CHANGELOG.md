@@ -28,6 +28,12 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
   versions, and `amt doctor --fix` splits them, logging each repair on the
   issue, note or project. Until `--fix` runs, a workspace with such labels
   reports `ok: false` in `amt doctor --json`. (AMT-45)
+- Changing an issue's status ends its lease when it leaves in_progress, so
+  done issues no longer stay claimed (including cards dragged on the board).
+  Only the lease holder can change the status while the lease is live; an
+  operator can override with `amt issue update --force`, which is logged.
+  `amt doctor` reports closed issues still holding a lease, and `--fix` ends
+  those leases. (AMT-46)
 - Searching for a document's key (`MSX-269`, `D-142`, a note slug) finds that
   document, listed first. Keys weren't in the full-text index, so search only
   found other documents that mention the key. Applies to `amt search`, the MCP

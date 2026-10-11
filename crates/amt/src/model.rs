@@ -191,7 +191,17 @@ pub struct DoctorReport {
     /// Labels written comma-joined or padded before AMT-45 (e.g. `bug,ui`),
     /// invisible to `--label bug`; `amt doctor --fix` splits them.
     pub malformed_labels: Vec<MalformedLabel>,
+    /// Done/canceled issues still holding a lease (pre-AMT-46 status changes
+    /// left them); `amt doctor --fix` ends them.
+    pub closed_leases: Vec<ClosedLease>,
     pub ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClosedLease {
+    pub id: String,
+    pub status: String,
+    pub claimed_by: String,
 }
 
 /// One malformed label and what `doctor --fix` rewrites it to.
