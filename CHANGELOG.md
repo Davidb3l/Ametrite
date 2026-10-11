@@ -10,6 +10,17 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: `amt serve --install` now bakes the board's port into the logon
+  task, as it already did on macOS and Linux. The task used to take
+  `AMT_PORT` from the logon environment instead, so a port set only in the
+  installing shell was ignored. The task now runs a small launcher,
+  `%LOCALAPPDATA%\ametrite\board.cmd`, which also keeps it under the
+  261-character command limit of Scheduled Tasks for long user names.
+  Reinstalling, `--uninstall`, and `--status` use the installed board's
+  port. Re-run `amt serve --install` to pick this up. (AMT-41)
+
 ## [0.4.1] - 2026-10-11
 
 A maintenance release: no behavior changes. It updates the bundled SQLite
