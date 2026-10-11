@@ -9,10 +9,21 @@ use crate::store;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::sync::OnceLock;
+
+/// `amt mcp --agent X`: the author for tool calls that pass no `agent` of
+/// their own, ahead of $AMT_AGENT (AMT-47). Set once at startup.
+static DEFAULT_AGENT: OnceLock<String> = OnceLock::new();
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub fn serve(mut conn: Connection) -> Result<()> {
+pub fn serve(mut conn: Connection, default_agent: Option<String>) -> Result<()> {
+    if let Some(a) = default_agent
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+    {
+        let _ = DEFAULT_AGENT.set(a);
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -120,6 +131,7 @@ fn agent_of(args: &Value) -> String {
     // argument or `AMT_AGENT=` must not record an empty author.
     let set = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     set(opt_s(args, "agent"))
+        .or_else(|| DEFAULT_AGENT.get().cloned())
         .or_else(|| set(std::env::var("AMT_AGENT").ok()))
         .unwrap_or_else(|| "agent".into())
 }
