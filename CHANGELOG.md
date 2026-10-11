@@ -10,6 +10,21 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-11
+
+**Upgrade notes.**
+
+- **Behavior change for agents:** while another agent holds a live lease
+  on an issue, only that agent can change the issue's status. Others are
+  refused (operators can use `amt issue update --force`). Leaving
+  in_progress now ends the lease.
+- **Run `amt doctor --fix` once in each workspace.** It splits labels that
+  earlier versions stored comma-joined (e.g. `bug,ui`, which `--label bug`
+  couldn't find) and ends leases that closed issues still hold. `amt doctor`
+  lists both first if you want to look before fixing.
+- **If you run the web board,** restart it to get the new search and label
+  filter: `amt serve --install` (service) or restart `amt serve`.
+
 ### Added
 
 - Community health files: CONTRIBUTING (with a DCO sign-off requirement, checked
@@ -136,5 +151,6 @@ running, or it uses another port.
   every request until a restart. The stale connection is reopened and the read
   retried once. (AMT-27; f1ef40b)
 
-[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Davidb3l/Ametrite/compare/v0.2.0...v0.3.0
