@@ -10,6 +10,16 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+### Changed
+
+- The bundled SQLite engine moves from 3.46.0 to 3.53.2 (rusqlite 0.40).
+  Existing workspaces open as they are, with no migration, and a database
+  written by this version still opens in v0.4.0 and in the web board.
+  (AMT-52)
+- Release binaries are built with Rust 1.99.0 and cargo-dist 0.33.0, with
+  patch updates to clap, regex, serde, and serde_json. CI now pins Bun 1.4.3
+  instead of floating to the newest release. (AMT-52)
+
 ## [0.4.0] - 2026-10-11
 
 **Upgrade notes.**
