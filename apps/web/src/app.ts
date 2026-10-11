@@ -2,7 +2,7 @@
 
 import { ago, agoLabel } from "./time";
 import { bindDraft, clearDraft, draftKey } from "./drafts";
-import { labelCounts, withLabel } from "./labels";
+import { labelCounts, visibleLabels, withLabel } from "./labels";
 
 type Issue = {
   id: string; title: string; status: string; priority: string;
@@ -29,6 +29,7 @@ const PRIORITIES = ["urgent", "high", "medium", "low", "none"];
 const main = document.getElementById("main")!;
 let projects: DocRef[] = [];
 let boardFilter: { project?: string; label?: string } = {};
+let allLabelChips = false; // the board's "+N more" label toggle
 let workspaces: any[] = [];
 let currentWs = localStorage.getItem("amt-ws") ?? "";
 
@@ -194,6 +195,7 @@ async function crossWorkspace(arg: string) {
   if (alias !== currentWs) {
     currentWs = alias;
     localStorage.setItem("amt-ws", currentWs);
+    boardFilter = {}; // filters belong to the workspace they were set in
     await loadSidebar();
   }
   location.hash = key ? `#/doc/${encodeURIComponent(key)}` : "#/board";
@@ -218,13 +220,13 @@ async function renderBoard() {
   for (const s of STATUSES) byStatus[s] = [];
   for (const i of shown) (byStatus[i.status] ??= []).push(i);
 
-  const LABEL_CHIPS = 12;
-  const counts = labelCounts(issues, boardFilter.label);
-  const chips = counts
-    .filter((c, n) => n < LABEL_CHIPS || c.label === boardFilter.label)
+  const { shown: chipLabels, hidden } = visibleLabels(labelCounts(issues, boardFilter.label), boardFilter.label, allLabelChips);
+  const chips = chipLabels
     .map((c) => `<span class="chip ${c.label === boardFilter.label ? "on" : ""} ${c.label === "bug" ? "chip-bug" : ""}"
         data-label="${esc(c.label)}" title="${c.label === boardFilter.label ? "Show all issues" : `Only issues labeled ${esc(c.label)}`}">${esc(c.label)} <span class="n">${c.count}</span></span>`)
-    .join("");
+    .join("") +
+    (hidden ? `<span class="chip more" id="more-labels">+${hidden} more</span>`
+      : allLabelChips ? `<span class="chip more" id="more-labels">fewer</span>` : "");
   const title = [boardFilter.project, boardFilter.label].filter(Boolean).map((t) => ` · ${esc(t!)}`).join("");
 
   main.innerHTML = "";
@@ -241,7 +243,8 @@ async function renderBoard() {
     </div>
   `));
   main.querySelector("#clear-filter")?.addEventListener("click", () => { boardFilter = {}; renderBoard(); });
-  main.querySelectorAll<HTMLElement>("#label-chips .chip").forEach((chip) =>
+  main.querySelector("#more-labels")?.addEventListener("click", () => { allLabelChips = !allLabelChips; renderBoard(); });
+  main.querySelectorAll<HTMLElement>("#label-chips .chip[data-label]").forEach((chip) =>
     chip.addEventListener("click", () => {
       const label = chip.dataset.label!;
       boardFilter = { ...boardFilter, label: boardFilter.label === label ? undefined : label };
@@ -455,10 +458,10 @@ function issueDialog(status?: string) {
         </select>
         <select name="project">
           <option value="">no project</option>
-          ${projects.map((p) => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join("")}
+          ${projects.map((p) => `<option value="${esc(p.id)}" ${p.id === boardFilter.project ? "selected" : ""}>${esc(p.title)}</option>`).join("")}
         </select>
       </div>
-      <input name="labels" placeholder="labels, comma separated" />
+      <input name="labels" placeholder="labels, comma separated" value="${esc(boardFilter.label ?? "")}" />
       <textarea name="body" placeholder="Description — markdown, [[wikilinks]] and #tags supported"></textarea>
       <div class="dlg-actions">
         <button type="button" class="cancel">Cancel</button>
@@ -775,6 +778,8 @@ async function loadSidebar() {
     a.addEventListener("click", () => {
       // Keep a label filter across projects: "bugs in this project" is the point.
       boardFilter = { project: (a as HTMLElement).dataset.project, label: boardFilter.label };
+      // Already on the board, the #/board link fires no hashchange: re-render.
+      if (route().view === "board") renderBoard();
     }));
 }
 
