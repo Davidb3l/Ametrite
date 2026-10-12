@@ -15,7 +15,8 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 Windows fixes. On Windows, `amt serve` now finds Bun, the board service
 keeps the port you installed it with, and `amt upgrade` recognizes how
 `amt` was installed. If you installed the board service on Windows, run
-`amt serve --install` again after upgrading. Nothing changes on macOS or
+`amt serve --install` again after upgrading, with `AMT_PORT` set as it was
+when you first installed if you chose a port. Nothing changes on macOS or
 Linux beyond `amt upgrade`'s detection.
 
 ### Fixed
@@ -28,9 +29,11 @@ Linux beyond `amt upgrade`'s detection.
   under the 261-character limit of `schtasks /TR` for long user names.
   `--install` prints the launcher's path (the `unit` field in `--json`), and
   `--status` no longer shows a Linux unit path on Windows. Once a launcher
-  exists, reinstalling, `--uninstall`, and `--status` use the port it
-  records; the first reinstall over an older task also stops a board left on
-  the default port. Re-run `amt serve --install` to pick this up. (AMT-41)
+  exists, a reinstall stops the board on the port it records, and
+  `--uninstall` and `--status` use that port; the first reinstall over an
+  older task also stops a board left on the default port. A reinstall binds
+  the current `AMT_PORT` (or 1776), as on macOS and Linux. Re-run
+  `amt serve --install` to pick this up. (AMT-41)
 - Windows: `amt serve` now finds Bun. It looked only for a file named
   `bun`, so it missed `bun.exe` and failed with "bun is not on PATH" unless
   you passed `--bun`. It now tries the `PATHEXT` extensions, as Windows
