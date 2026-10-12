@@ -10,6 +10,14 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-11
+
+Windows fixes. On Windows, `amt serve` now finds Bun, the board service
+keeps the port you installed it with, and `amt upgrade` recognizes how
+`amt` was installed. If you installed the board service on Windows, run
+`amt serve --install` again after upgrading. Nothing changes on macOS or
+Linux beyond `amt upgrade`'s detection.
+
 ### Fixed
 
 - Windows: `amt serve --install` now bakes the board's port into the logon
@@ -210,7 +218,8 @@ running, or it uses another port.
   every request until a restart. The stale connection is reopened and the read
   retried once. (AMT-27; f1ef40b)
 
-[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Davidb3l/Ametrite/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Davidb3l/Ametrite/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Davidb3l/Ametrite/compare/v0.2.0...v0.3.0
