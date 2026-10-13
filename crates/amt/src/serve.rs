@@ -70,12 +70,12 @@ pub fn resolve(
     if !app.is_file() {
         return Err(msg(format!("web app not found at {}", app.display())));
     }
-    let app = app.canonicalize().unwrap_or(app);
+    // Plain `C:\...` form, not the `\\?\C:\...` verbatim one canonicalize
+    // returns: this path goes into a batch file, and cmd rejects verbatim paths.
+    let app = crate::paths::canonicalize(&app).unwrap_or(app);
     let bun = match bun_override {
         Some(p) => p.to_path_buf(),
-        None => which("bun").ok_or_else(|| {
-            msg("`bun` is not on PATH — the web board is a Bun app (see https://bun.sh)")
-        })?,
+        None => find_bun()?,
     };
     if !bun.is_file() {
         return Err(msg(format!("bun not found at {}", bun.display())));
@@ -221,17 +221,70 @@ pub fn extract_embedded_web_app(dir: &Path) -> Result<PathBuf> {
     Ok(dir.join("server.ts"))
 }
 
-/// First match for `name` on PATH.
-fn which(name: &str) -> Option<PathBuf> {
-    which_in(
-        name,
-        &std::env::var_os("PATH")?,
-        cfg!(windows),
-        std::env::var("PATHEXT").ok().as_deref(),
+/// Locate `bun`: PATH first, then where Bun's own installer puts it, since a
+/// fresh install may not be on this shell's PATH yet (and a service or agent
+/// shell often has a minimal one). Order: PATH, `$BUN_INSTALL/bin`,
+/// `~/.bun/bin`.
+fn find_bun() -> Result<PathBuf> {
+    let windows = cfg!(windows);
+    let pathext = std::env::var("PATHEXT").ok();
+    let bun_install = std::env::var_os("BUN_INSTALL")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let home = home_dir().ok();
+    find_bun_in(
+        std::env::var_os("PATH").as_deref(),
+        windows,
+        pathext.as_deref(),
+        bun_install.as_deref(),
+        home.as_deref(),
     )
 }
 
-/// [`which`] with PATH and the platform explicit, so it is testable.
+/// [`find_bun`] with every input explicit, so the probe order is testable.
+fn find_bun_in(
+    path: Option<&std::ffi::OsStr>,
+    windows: bool,
+    pathext: Option<&str>,
+    bun_install: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(found) = path.and_then(|p| which_in("bun", p, windows, pathext)) {
+        return Ok(found);
+    }
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    if let Some(b) = bun_install {
+        dirs.push(("$BUN_INSTALL/bin".into(), b.join("bin")));
+    }
+    if let Some(h) = home {
+        dirs.push(("~/.bun/bin".into(), h.join(".bun").join("bin")));
+    }
+    let names = exe_names("bun", windows, pathext);
+    for (_, dir) in &dirs {
+        if let Some(found) = names.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
+            return Ok(found);
+        }
+    }
+    let mut searched = vec!["PATH".to_string()];
+    searched.extend(
+        dirs.iter()
+            .map(|(label, dir)| format!("{label} ({})", dir.display())),
+    );
+    if bun_install.is_none() {
+        searched.push("$BUN_INSTALL/bin (BUN_INSTALL is not set)".into());
+    }
+    if home.is_none() {
+        searched.push("~/.bun/bin (no home directory)".into());
+    }
+    Err(msg(format!(
+        "`bun` not found (searched: {}). The web board is a Bun app (see https://bun.sh); \
+         install it, or pass --bun <path>",
+        searched.join(", ")
+    )))
+}
+
+/// First match for `name` in the PATH-style list `path`, with the platform
+/// explicit so it is testable.
 fn which_in(
     name: &str,
     path: &std::ffi::OsStr,
@@ -306,7 +359,7 @@ pub fn project_root(app: &Path) -> PathBuf {
     app.parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .map(Path::to_path_buf)
+        .map(crate::paths::simplified)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -542,7 +595,15 @@ pub fn render_windows_launcher(
     log: &Path,
     port: u16,
 ) -> String {
-    let q = |p: &Path| p.display().to_string().replace('%', "%%");
+    // cmd rejects `\\?\` verbatim paths as a current directory ("CMD does not
+    // support UNC paths as current directories"), so every path in the file is
+    // written in its plain form.
+    let q = |p: &Path| {
+        crate::paths::simplified(p)
+            .display()
+            .to_string()
+            .replace('%', "%%")
+    };
     [
         "@echo off".to_string(),
         "rem Ametrite web board, started at logon by the \"Ametrite Web\" task.".to_string(),
@@ -829,6 +890,17 @@ pub fn install(cfg: &ServeConfig) -> Result<PathBuf> {
             return Err(stopped(e));
         }
         run.run("schtasks")?;
+        // `schtasks /Run` only queues the task; a launcher that dies at once
+        // (a bad path, a missing bun) would otherwise "install" cleanly.
+        if !wait_for_port(cfg.port, std::time::Duration::from_secs(10)) {
+            return Err(msg(format!(
+                "the board task was registered and started, but nothing answered on port {} \
+                 within 10s; see the log at {} and the launcher at {}",
+                cfg.port,
+                log.display(),
+                launcher.display()
+            )));
+        }
         return Ok(launcher);
     }
     let unit = unit_path()?;
@@ -958,6 +1030,20 @@ pub fn status() -> Result<ServeStatus> {
         unit: unit.filter(|u| installed && u.exists()),
         log: log_path().ok(),
     })
+}
+
+/// Poll until something accepts connections on `port`, up to `timeout`.
+fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if port_responds(port) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// True if something accepts a TCP connection on the board's port.
@@ -1379,6 +1465,115 @@ mod tests {
         // & ( ) and non-ASCII are literal inside quotes; chcp 65001 covers é.
         assert!(l.contains("cd /d \"C:\\R&D (é)\" || exit /b 1"), "{l}");
         assert_eq!(launcher_port(&l), Some(1776));
+    }
+
+    #[test]
+    fn windows_launcher_never_contains_a_verbatim_path() {
+        // `canonicalize` returns `\\?\C:\...`; cmd rejects that as a current
+        // directory ("CMD does not support UNC paths as current directories").
+        let l = render_windows_launcher(
+            Path::new(r"\\?\C:\Users\a\.cargo\bin\amt.exe"),
+            Path::new(r"\\?\C:\Users\a\.bun\bin\bun.exe"),
+            Path::new(r"\\?\C:\Users\a\repo\apps\web\server.ts"),
+            Path::new(r"\\?\C:\Users\a\repo"),
+            Path::new(r"\\?\UNC\srv\share\web.log"),
+            1776,
+        );
+        assert!(!l.contains(r"\\?\"), "{l}");
+        assert!(
+            l.contains("cd /d \"C:\\Users\\a\\repo\" || exit /b 1"),
+            "{l}"
+        );
+        assert!(l.contains(r"\\srv\share\web.log"), "{l}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_root_of_a_verbatim_app_path_is_plain() {
+        assert_eq!(
+            project_root(Path::new(r"\\?\C:\Users\a\repo\apps\web\server.ts")),
+            PathBuf::from(r"C:\Users\a\repo")
+        );
+    }
+
+    #[test]
+    fn bun_is_found_on_path_then_bun_install_then_home() {
+        let path_dir = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let on_path = path_dir.path().join("bun");
+        let in_install = install.path().join("bin").join("bun");
+        let in_home = home.path().join(".bun").join("bin").join("bun");
+        for p in [&in_install, &in_home] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        }
+        let path = std::env::join_paths([path_dir.path()]).unwrap();
+        let find = |path: &std::ffi::OsStr, install: Option<&Path>, home: Option<&Path>| {
+            find_bun_in(Some(path), false, None, install, home)
+        };
+        // Everything present: PATH wins.
+        std::fs::write(&on_path, b"").unwrap();
+        assert_eq!(
+            find(&path, Some(install.path()), Some(home.path())).unwrap(),
+            on_path
+        );
+        // Not on PATH: $BUN_INSTALL/bin beats ~/.bun/bin.
+        std::fs::remove_file(&on_path).unwrap();
+        assert_eq!(
+            find(&path, Some(install.path()), Some(home.path())).unwrap(),
+            in_install
+        );
+        // No BUN_INSTALL (or it has no bun): fall back to ~/.bun/bin.
+        assert_eq!(find(&path, None, Some(home.path())).unwrap(), in_home);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            find(&path, Some(empty.path()), Some(home.path())).unwrap(),
+            in_home
+        );
+        // No PATH at all still reaches the probes.
+        assert_eq!(
+            find_bun_in(None, false, None, None, Some(home.path())).unwrap(),
+            in_home
+        );
+    }
+
+    #[test]
+    fn bun_probe_uses_exe_names_on_windows() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".bun").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("bun.exe"), b"").unwrap();
+        assert_eq!(
+            find_bun_in(None, true, Some(".COM;.EXE"), None, Some(home.path())).unwrap(),
+            bin.join("bun.exe")
+        );
+    }
+
+    #[test]
+    fn missing_bun_error_lists_every_location_searched() {
+        let home = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let err = find_bun_in(
+            Some(std::ffi::OsStr::new("")),
+            false,
+            None,
+            Some(install.path()),
+            Some(home.path()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("PATH"), "{err}");
+        assert!(err.contains("$BUN_INSTALL/bin"), "{err}");
+        assert!(err.contains(&install.path().join("bin").display().to_string()));
+        assert!(err.contains("~/.bun/bin"), "{err}");
+        assert!(err.contains(&home.path().join(".bun").join("bin").display().to_string()));
+        assert!(err.contains("--bun"), "{err}");
+        // Unset inputs are named too, so the user knows they were considered.
+        let err = find_bun_in(None, false, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BUN_INSTALL is not set"), "{err}");
     }
 
     #[test]

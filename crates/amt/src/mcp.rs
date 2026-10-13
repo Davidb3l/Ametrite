@@ -26,12 +26,26 @@ pub fn serve(mut conn: Connection, default_agent: Option<String>) -> Result<()> 
     }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut input = stdin.lock();
+    let mut raw = Vec::new();
+    loop {
+        // Read bytes, not `lines()`: one line that is not valid UTF-8 must not
+        // end the whole session. It gets a JSON-RPC parse error and we go on.
+        raw.clear();
+        if input.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            write_msg(
+                &stdout,
+                &rpc_err(Value::Null, -32700, "parse error: input is not valid UTF-8"),
+            )?;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let msg: Value = match serde_json::from_str(&line) {
+        let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 write_msg(&stdout, &rpc_err(Value::Null, -32700, "parse error"))?;
@@ -218,9 +232,14 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
         "claim_next_issue" => {
             let agent = agent_of(&args);
             let ttl = opt_i(&args, "ttl_seconds").unwrap_or(900);
+            let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !peek {
+                if let Err(e) = store::check_ttl(ttl) {
+                    return tool_error(id, &e.to_string());
+                }
+            }
             let cooldown =
                 opt_i(&args, "cooldown_seconds").unwrap_or(crate::model::DEFAULT_COOLDOWN_SECS);
-            let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
             let any_ws = args
                 .get("any_workspace")
                 .and_then(|v| v.as_bool())
@@ -322,13 +341,24 @@ fn handle_call(conn: &mut Connection, id: Value, params: &Value) -> Value {
             }
         }
         "claim_issue" => {
-            let issue = run!(store::claim_issue(
+            let ttl = match store::check_ttl(opt_i(&args, "ttl_seconds").unwrap_or(900)) {
+                Ok(t) => t,
+                Err(e) => return tool_error(id, &e.to_string()),
+            };
+            let cooldown =
+                opt_i(&args, "cooldown_seconds").unwrap_or(crate::model::DEFAULT_COOLDOWN_SECS);
+            match run!(store::try_claim_issue(
                 conn,
                 &try_arg!(req("id")),
                 &agent_of(&args),
-                opt_i(&args, "ttl_seconds").unwrap_or(900)
-            ));
-            text_result(id, &issue)
+                ttl,
+                cooldown
+            )) {
+                store::IssueClaim::Claimed(issue) => text_result(id, &issue),
+                store::IssueClaim::Refused(reason) => {
+                    text_result(id, &json!({ "claimed": false, "reason": reason }))
+                }
+            }
         }
         "release_issue" => {
             let issue = run!(store::release_issue(
@@ -623,12 +653,12 @@ fn tool_defs() -> Vec<Value> {
                     "peek": b("Report the best claimable issue WITHOUT taking a lease or writing activity; result has 'peek': true"),
                     "stages": arr("Restrict claimable stages (subset of ['backlog','todo']); default both"),
                     "from": s("Comma-list alternative to stages, e.g. 'todo,backlog'"),
-                    "ttl_seconds": i("Lease duration, default 900. Re-claim to renew before it expires."),
+                    "ttl_seconds": i("Lease duration in seconds (>= 1), default 900. Re-claim to renew before it expires."),
                     "cooldown_seconds": i("Won't re-serve an issue you released within this window (default 3600; 0 disables)"),
                     "any_workspace": b("Claim (or peek) across every registered workspace, globally priority-first; the result includes a 'workspace' field") }),
             &["agent"]),
-        tool("claim_issue", "Claim a specific issue, or renew your existing lease (heartbeat).",
-            json!({ "id": s("Issue key"), "agent": s("Your agent name"), "ttl_seconds": i("Lease duration, default 900") }),
+        tool("claim_issue", "Claim a specific issue, or renew your existing live lease (heartbeat). A fresh claim follows claim_next_issue's rules (claimable stage, no open blocker, no other live lease, not in your cooldown); otherwise returns {claimed:false, reason} and changes nothing.",
+            json!({ "id": s("Issue key"), "agent": s("Your agent name"), "ttl_seconds": i("Lease duration in seconds (>= 1), default 900"), "cooldown_seconds": i("Requeue cooldown applied to a fresh claim, default 3600; renewing your own live lease ignores it") }),
             &["id", "agent"]),
         tool("release_issue", "Release your claim, setting a final status (default in_review) and optional closing comment.",
             json!({ "id": s("Issue key"), "agent": s("Your agent name"), "status": status, "comment": s("Closing comment") }),

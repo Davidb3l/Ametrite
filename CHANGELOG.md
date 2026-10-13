@@ -10,6 +10,71 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+Hardening for fleets that drive `amt` from a foreman. `claim --issue` can no
+longer reopen finished work, the Windows board launcher stops tripping over
+verbatim paths, and the registry and schema migration are safe when several
+`amt` processes start at once. `amt doctor`'s `ok` no longer flips for stale
+claims or unresolved links.
+
+### Changed
+
+- `amt doctor --json`: top-level `ok` (and `report.ok`) is now true when every
+  gating check passes. `stale_claims` and `unresolved_links` are reported but
+  no longer flip `ok`; they are normal states of a busy fleet (a crashed
+  agent's lease, a link to a note not written yet), and gates that trust `ok`
+  used to flap on them. Every entry in `checks` gains a boolean `gating`
+  (`false` for those two, `true` for the other six: `missing_parents`,
+  `missing_projects`, `dangling_decisions`, `dependency_cycles`,
+  `malformed_labels`, `closed_leases`). `schemaVersion` stays 1 (additive), and
+  the exit code is unchanged. Plain `amt doctor` still lists every finding, and
+  only says "workspace healthy" when there are none.
+- `claim --ttl` (and the MCP `ttl_seconds`) must be at least 1 second. `--ttl 0`
+  used to create a lease that was already expired.
+
+### Fixed
+
+- `claim --issue` (and the MCP `claim_issue`) reopened work. A done or
+  in_review issue became in_progress again, a dependency-blocked issue could be
+  claimed, and a heartbeat sent after the lease holder moved the issue to
+  in_review (which ends the lease) put it back in progress with a fresh lease.
+  Now it renews only a live lease you hold on an in_progress issue. A fresh
+  claim of a named issue follows the rules `claim` applies to the queue: a
+  claimable stage (or a stalled in_progress lease), no open blocker, no other
+  agent's live lease, and outside your requeue cooldown. Anything else is
+  refused with exit 0 and `{"claimed": false, "reason": "..."}`, the same shape
+  as "no work", which Sirius Forester reads as "lease lost". Taking an issue
+  another agent holds used to be an error (non-zero exit); it is now that
+  refusal too. `claim --issue` no longer bypasses the cooldown; pass
+  `--cooldown 0` to claim an issue you just released. The MCP `claim_issue` tool
+  takes `cooldown_seconds` as well.
+- Windows: `amt serve --install` wrote `cd /d "\\?\C:\..."` into the board
+  launcher, which `cmd` rejects ("CMD does not support UNC paths as current
+  directories"), so the board never started. `\\?\` prefixes are now stripped
+  (`\\?\C:\x` becomes `C:\x`, `\\?\UNC\srv\share` becomes `\\srv\share`)
+  before paths reach the launcher. `--install` also waits up to 10 seconds for
+  the board to answer on its port and reports an error, with the log and
+  launcher paths, if it does not. Re-run `amt serve --install` to pick up the
+  fixed launcher.
+- Windows: the workspace registry stored `\\?\` paths. New entries use the
+  plain form; entries already in the file are read in the plain form too, so
+  an existing registry keeps working and is cleaned up the next time it is
+  written.
+- Two `amt` processes opening an older workspace at the same moment could both
+  run the same schema migration step, and the second failed with "table ...
+  already exists". Each step now re-reads the schema version under the write
+  lock and skips steps already applied.
+- The workspace registry lost entries when several `amt init` or `amt ws add`
+  commands ran at once (each read the old file, and the last write won), and a
+  crash mid-write could leave a truncated file. Changes now hold a lock file
+  (`registry.json.lock` next to the registry) and are written to a temporary
+  file and renamed into place.
+- `amt mcp` exited on the first stdin line that was not valid UTF-8. It now
+  answers that line with a JSON-RPC parse error (-32700) and keeps serving.
+- `amt serve` looks for Bun in more places. After PATH it tries
+  `$BUN_INSTALL/bin` and `~/.bun/bin` (where Bun's installer puts it, often not
+  yet on PATH), and when none has it, the error lists every location it
+  searched.
+
 ## [0.4.2] - 2026-10-11
 
 Windows fixes. On Windows, `amt serve` now finds Bun, the board service

@@ -327,25 +327,66 @@ pub fn open_ro(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
+/// Bring the schema up to [`SCHEMA_VERSION`], starting from `version`.
+///
+/// `version` is only a hint, read before any lock was held. Another process may
+/// have migrated the database since, so each step takes the write lock
+/// (`BEGIN IMMEDIATE`), re-reads `schema_version` under it, and skips steps
+/// that are already applied; otherwise two openers would race into the same
+/// step and the loser would die on "table ... already exists".
+pub fn migrate(conn: &Connection, mut version: i64) -> Result<()> {
     while version < SCHEMA_VERSION {
-        match version {
-            1 => {
-                // The table swap must not fire FK actions; foreign_keys cannot
-                // change inside a transaction, so toggle it around one.
-                conn.pragma_update(None, "foreign_keys", "OFF")?;
-                let result = conn.execute_batch(&format!("BEGIN;{MIGRATE_V1_V2}COMMIT;"));
-                conn.pragma_update(None, "foreign_keys", "ON")?;
-                result?;
-            }
-            2 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V2_V3}COMMIT;"))?,
-            3 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V3_V4}COMMIT;"))?,
-            4 => conn.execute_batch(&format!("BEGIN;{MIGRATE_V4_V5}COMMIT;"))?,
-            v => return Err(msg(format!("no migration path from schema v{v}"))),
+        // The v1→v2 table swap must not fire FK actions; foreign_keys cannot
+        // change inside a transaction, so toggle it around one.
+        let fk_off = version == 1;
+        if fk_off {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
         }
-        version += 1;
+        let result = migrate_step(conn, version);
+        if fk_off {
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        version = result?;
     }
     Ok(())
+}
+
+/// One locked step of [`migrate`]. Returns the schema version afterwards.
+fn migrate_step(conn: &Connection, expected: i64) -> Result<i64> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = (|| -> Result<i64> {
+        let current: i64 = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )?
+            .parse()
+            .map_err(|_| msg("corrupt meta.schema_version"))?;
+        if current != expected {
+            // Someone else got here first (or the hint was stale): nothing to do.
+            return Ok(current);
+        }
+        let sql = match current {
+            1 => MIGRATE_V1_V2,
+            2 => MIGRATE_V2_V3,
+            3 => MIGRATE_V3_V4,
+            4 => MIGRATE_V4_V5,
+            v => return Err(msg(format!("no migration path from schema v{v}"))),
+        };
+        conn.execute_batch(sql)?;
+        Ok(current + 1)
+    })();
+    match step {
+        Ok(next) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(next)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
 }
 
 /// Rows archived out of the live `activity` table live here, keyed by issue
