@@ -194,7 +194,42 @@ pub struct DoctorReport {
     /// Done/canceled issues still holding a lease (pre-AMT-46 status changes
     /// left them); `amt doctor --fix` ends them.
     pub closed_leases: Vec<ClosedLease>,
+    /// True when every GATING check passes (`DoctorReport::GATING`). Stale
+    /// claims and unresolved links are reported but never flip this: they are
+    /// normal states of a busy fleet (a crashed agent's lease, a link to a note
+    /// not written yet), and gates that trust `ok` would flap on them.
     pub ok: bool,
+}
+
+impl DoctorReport {
+    /// Checks whose findings make the workspace unhealthy (`ok: false`).
+    pub const GATING: &'static [&'static str] = &[
+        "missing_parents",
+        "missing_projects",
+        "dangling_decisions",
+        "dependency_cycles",
+        "malformed_labels",
+        "closed_leases",
+    ];
+    /// Informational checks: findings are listed but never affect `ok`.
+    pub const INFORMATIONAL: &'static [&'static str] = &["unresolved_links", "stale_claims"];
+
+    /// Whether the named check gates `ok`.
+    pub fn is_gating(check: &str) -> bool {
+        Self::GATING.contains(&check)
+    }
+
+    /// No findings at all, gating or not.
+    pub fn is_clean(&self) -> bool {
+        self.unresolved_links.is_empty()
+            && self.stale_claims.is_empty()
+            && self.missing_parents.is_empty()
+            && self.missing_projects.is_empty()
+            && self.dangling_decisions.is_empty()
+            && self.dependency_cycles.is_empty()
+            && self.malformed_labels.is_empty()
+            && self.closed_leases.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize)]

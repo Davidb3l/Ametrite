@@ -573,15 +573,21 @@ fn ui_port() -> u16 {
 /// by tests: `capabilities` is the spec's string array, the optional top-level
 /// `ui` says where the board is served (§3.2), `checks` carries the spec's
 /// `{name, ok, detail}` rows, and the full workspace report stays available
-/// under `report` (additive).
+/// under `report` (additive). Each check also carries a boolean `gating`
+/// (additive), and top-level `ok` is true iff every gating check passes: stale
+/// claims and unresolved links are reported but never flip it.
 ///
 /// NB: health lives in `ok`, never in the exit code — §3.1 distinguishes
 /// *present-but-unhealthy* (exit 0, `ok: false`) from *absent* (non-zero exit).
 fn doctor_envelope(report: &DoctorReport, ui_port: u16) -> serde_json::Value {
+    // `gating` says whether the check feeds the top-level `ok`. Consumers
+    // trust `ok` (== every gating check passes) and show non-gating findings
+    // as information.
     let check = |name: &str, n: usize| {
         serde_json::json!({
             "name": name,
             "ok": n == 0,
+            "gating": DoctorReport::is_gating(name),
             "detail": format!("{n} found"),
         })
     };
@@ -651,6 +657,15 @@ fn print_no_work(json: bool, nw: &store::NoWork) {
             Some(s) => println!(" (retry after {s}s)"),
             None => println!(),
         }
+    }
+}
+
+/// Render a refused `claim --issue`: `{"claimed": false, "reason": ...}`.
+fn print_refused(json: bool, reason: &str) {
+    if json {
+        print_json(&serde_json::json!({ "claimed": false, "reason": reason }));
+    } else {
+        println!("not claimed: {reason}");
     }
 }
 
@@ -1274,6 +1289,9 @@ fn run(cli: Cli) -> Result<()> {
                     )));
                 }
             }
+            if !peek {
+                store::check_ttl(ttl)?;
+            }
             let stages: Option<&[String]> = if from.is_empty() { None } else { Some(&from) };
             let labels = store::split_labels(&label);
             let not_labels = store::split_labels(&not_label);
@@ -1328,7 +1346,17 @@ fn run(cli: Cli) -> Result<()> {
 
             let mut conn = open_workspace(&cli.workspace)?;
             let claimed = match issue {
-                Some(key) => Some(store::claim_issue(&mut conn, &key, &agent, ttl)?),
+                Some(key) => {
+                    match store::try_claim_issue(&mut conn, &key, &agent, ttl, cooldown)? {
+                        store::IssueClaim::Claimed(i) => Some(i),
+                        // Same exit-0 `{claimed:false, reason}` shape as no-work,
+                        // which suite consumers read as "lease not held".
+                        store::IssueClaim::Refused(reason) => {
+                            print_refused(cli.json, &reason);
+                            return Ok(());
+                        }
+                    }
+                }
                 None => store::claim_next(&mut conn, &agent, ttl, cooldown, &filter)?,
             };
             match claimed {
@@ -1718,7 +1746,7 @@ fn run(cli: Cli) -> Result<()> {
                     env["fixed"] = fixed;
                 }
                 print_json(&env);
-            } else if report.ok {
+            } else if report.is_clean() {
                 println!("workspace healthy ✓");
             } else {
                 for l in &report.unresolved_links {
@@ -2251,6 +2279,15 @@ mod tests {
         }
     }
 
+    fn check<'a>(v: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} check"))
+    }
+
     /// Ametrite is the REFERENCE implementation of the SUITE_CONTRACTS §3
     /// handshake — peers are coded against this exact shape, so pin it.
     #[test]
@@ -2270,6 +2307,7 @@ mod tests {
         for c in checks {
             assert!(c["name"].is_string());
             assert!(c["ok"].is_boolean());
+            assert!(c["gating"].is_boolean());
             assert!(c["detail"].is_string());
         }
         assert_eq!(checks[0]["name"], "unresolved_links");
@@ -2296,6 +2334,44 @@ mod tests {
             .expect("dependency_cycles check");
         assert_eq!(cycles["ok"], false);
         assert_eq!(cycles["detail"], "1 found");
+    }
+
+    /// Every check says whether it gates `ok`: stale claims and unresolved
+    /// links are normal fleet states, so they inform but never fail the
+    /// handshake; the structural checks gate.
+    #[test]
+    fn doctor_envelope_marks_which_checks_gate_ok() {
+        let v = doctor_envelope(&healthy_report(), 1776);
+        for name in ["stale_claims", "unresolved_links"] {
+            assert_eq!(check(&v, name)["gating"], false, "{name}");
+        }
+        for name in [
+            "missing_parents",
+            "missing_projects",
+            "dangling_decisions",
+            "dependency_cycles",
+            "malformed_labels",
+            "closed_leases",
+        ] {
+            assert_eq!(check(&v, name)["gating"], true, "{name}");
+        }
+        // The two lists partition the eight checks in the envelope.
+        let names: Vec<&str> = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        for n in &names {
+            assert!(
+                DoctorReport::GATING.contains(n) != DoctorReport::INFORMATIONAL.contains(n),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            DoctorReport::GATING.len() + DoctorReport::INFORMATIONAL.len()
+        );
     }
 
     /// §3.2: the `ui` field must follow AMT_PORT, and the parse must agree with

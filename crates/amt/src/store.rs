@@ -788,6 +788,32 @@ pub fn peek_claimable(
     keys.iter().map(|k| load_issue(conn, k, false)).collect()
 }
 
+/// The key of `key`'s issue iff it satisfies the claimable predicate right now
+/// (claimable stage or stalled lease, no open blocker, outside `agent`'s
+/// cooldown, matching `f`). Runs inside the caller's transaction so the check
+/// and the claim that follows are one atomic step.
+fn claimable_key_in(
+    tx: &Transaction<'_>,
+    now: &str,
+    key: &str,
+    agent: &str,
+    cooldown_secs: i64,
+    f: &ClaimFilter<'_>,
+) -> Result<Option<String>> {
+    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    claimable_predicate(&mut sql, &mut args, now, agent, cooldown_secs, f);
+    sql.push_str(" AND d.id = ? LIMIT 1");
+    args.push(Box::new(key.to_string()));
+    Ok(tx
+        .query_row(
+            &sql,
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Claim `key` iff it *still* satisfies the claimable predicate. Returns
 /// `Ok(None)` when the issue was taken, closed, or cooled-down in the race
 /// window between peek and claim, so the cross-workspace caller can fall
@@ -802,19 +828,7 @@ pub fn claim_key_guarded(
 ) -> Result<Option<Issue>> {
     let tx = immediate(conn)?;
     let now = db::now(&tx)?;
-    let mut sql = "SELECT d.id FROM documents d JOIN issues i ON i.doc_id = d.doc_id".to_string();
-    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    claimable_predicate(&mut sql, &mut args, &now, agent, cooldown_secs, f);
-    sql.push_str(" AND d.id = ? LIMIT 1");
-    args.push(Box::new(key.to_string()));
-    let found: Option<String> = tx
-        .query_row(
-            &sql,
-            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(found) = found else {
+    let Some(found) = claimable_key_in(&tx, &now, key, agent, cooldown_secs, f)? else {
         return Ok(None);
     };
     do_claim(&tx, &found, agent, ttl_secs)?;
@@ -1053,22 +1067,135 @@ fn secs_until(
     Ok(Some(secs.ceil().max(0.0) as i64))
 }
 
-/// Claim (or renew, when already held by `agent`) a specific issue.
-pub fn claim_issue(conn: &mut Connection, key: &str, agent: &str, ttl_secs: i64) -> Result<Issue> {
+/// Reject a lease TTL below one second. `--ttl 0` (or negative) would create
+/// a lease that is already expired, so the "claim" would protect nothing.
+/// Checked at the CLI and MCP boundaries, not in the store, so engine tests
+/// can still stage expired leases directly.
+pub fn check_ttl(ttl_secs: i64) -> Result<i64> {
+    if ttl_secs < 1 {
+        return Err(msg(format!(
+            "invalid lease TTL {ttl_secs}: must be at least 1 second"
+        )));
+    }
+    Ok(ttl_secs)
+}
+
+/// The result of asking for one specific issue (`claim --issue`).
+#[derive(Debug)]
+// Built once per call and matched immediately; boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum IssueClaim {
+    /// The lease was taken or renewed; the issue as it now stands.
+    Claimed(Issue),
+    /// Refused, with a human-readable reason. The CLI and MCP render this as
+    /// `{"claimed": false, "reason": ...}`, the shape suite consumers (Sirius's
+    /// lease heartbeat) already decode as "you do not hold this lease".
+    Refused(String),
+}
+
+/// Claim or renew a specific issue (`claim --issue KEY`).
+///
+/// * Renewal: allowed iff `agent` holds a LIVE lease on an `in_progress` issue.
+/// * Fresh claim: only if `claim_next` would also serve the issue, via the same
+///   predicate: a claimable stage (or a stalled `in_progress` lease), no open
+///   blocker, no other agent's live lease, outside `agent`'s requeue cooldown.
+///
+/// Anything else is `Refused` rather than an error, so a heartbeat can never
+/// reopen work that was moved to `in_review`/`done` after its lease ended.
+pub fn try_claim_issue(
+    conn: &mut Connection,
+    key: &str,
+    agent: &str,
+    ttl_secs: i64,
+    cooldown_secs: i64,
+) -> Result<IssueClaim> {
     let tx = immediate(conn)?;
     let now = db::now(&tx)?;
     let issue = load_issue(&tx, key, false)?;
-    if let (Some(holder), Some(expires)) = (&issue.claimed_by, &issue.claim_expires_at) {
-        if holder != agent && *expires >= now {
-            return Err(msg(format!(
-                "'{}' is claimed by {holder} until {expires}",
-                issue.id
-            )));
-        }
+    let live_holder = match (&issue.claimed_by, &issue.claim_expires_at) {
+        (Some(holder), Some(expires)) if *expires >= now => Some((holder.as_str(), expires)),
+        _ => None,
+    };
+    let renewal =
+        matches!(live_holder, Some((h, _)) if h == agent) && issue.status == "in_progress";
+    if !renewal
+        && claimable_key_in(
+            &tx,
+            &now,
+            &issue.id,
+            agent,
+            cooldown_secs,
+            &ClaimFilter::any(),
+        )?
+        .is_none()
+    {
+        let reason = refusal_reason(&tx, &issue, agent, live_holder)?;
+        return Ok(IssueClaim::Refused(reason));
     }
     do_claim(&tx, &issue.id, agent, ttl_secs)?;
     tx.commit()?;
-    load_issue(conn, key, true)
+    Ok(IssueClaim::Claimed(load_issue(conn, key, true)?))
+}
+
+/// Why `claim --issue` refused `issue` for `agent`. Mirrors the clauses of
+/// `claimable_predicate` in the order an operator would want to hear them.
+fn refusal_reason(
+    tx: &Transaction<'_>,
+    issue: &Issue,
+    agent: &str,
+    live_holder: Option<(&str, &String)>,
+) -> Result<String> {
+    if let Some((holder, expires)) = live_holder {
+        if holder != agent {
+            return Ok(format!(
+                "'{}' is claimed by {holder} until {expires}",
+                issue.id
+            ));
+        }
+        return Ok(format!(
+            "'{}' is {}, not in_progress; a lease only renews while the issue is in_progress",
+            issue.id, issue.status
+        ));
+    }
+    // A stalled lease is claimable only while `in_progress`; otherwise only an
+    // unclaimed issue in a claimable stage is.
+    let stalled = issue.claimed_by.is_some() && issue.status == "in_progress";
+    if !stalled && !CLAIMABLE_STATUSES.contains(&issue.status.as_str()) {
+        return Ok(format!(
+            "'{}' is {}, not claimable (claimable stages: {})",
+            issue.id,
+            issue.status,
+            CLAIMABLE_STATUSES.join(", ")
+        ));
+    }
+    let mut stmt = tx.prepare(
+        "SELECT b.blocker FROM blocks b JOIN issues bi
+           ON bi.doc_id = (SELECT doc_id FROM documents WHERE id = b.blocker)
+         WHERE b.blocked = ?1 AND bi.status NOT IN ('done','canceled') ORDER BY b.blocker",
+    )?;
+    let open: Vec<String> = stmt
+        .query_map([&issue.id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if !open.is_empty() {
+        return Ok(format!(
+            "'{}' is waiting on open blocker(s): {}",
+            issue.id,
+            open.join(", ")
+        ));
+    }
+    Ok(format!(
+        "'{}' is in your requeue cooldown (you released it recently)",
+        issue.id
+    ))
+}
+
+/// [`try_claim_issue`] with the default cooldown, a refusal as an error.
+/// For callers that want `Result<Issue>` (tests, embedders).
+pub fn claim_issue(conn: &mut Connection, key: &str, agent: &str, ttl_secs: i64) -> Result<Issue> {
+    match try_claim_issue(conn, key, agent, ttl_secs, DEFAULT_COOLDOWN_SECS)? {
+        IssueClaim::Claimed(i) => Ok(i),
+        IssueClaim::Refused(reason) => Err(msg(reason)),
+    }
 }
 
 fn do_claim(tx: &Transaction<'_>, key: &str, agent: &str, ttl_secs: i64) -> Result<()> {
@@ -2409,9 +2536,9 @@ pub fn doctor(conn: &Connection) -> Result<DoctorReport> {
     let malformed_labels = malformed_labels(conn)?;
     let closed_leases = closed_leases(conn)?;
 
-    let ok = unresolved_links.is_empty()
-        && stale_claims.is_empty()
-        && missing_parents.is_empty()
+    // `ok` folds only the gating checks: unresolved links and stale claims are
+    // normal fleet states (see `DoctorReport::GATING`).
+    let ok = missing_parents.is_empty()
         && missing_projects.is_empty()
         && dangling_decisions.is_empty()
         && dependency_cycles.is_empty()

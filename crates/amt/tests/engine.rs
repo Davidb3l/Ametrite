@@ -1159,6 +1159,86 @@ fn cross_workspace_links_are_not_flagged_by_doctor() {
     std::env::remove_var("AMT_REGISTRY");
 }
 
+/// Registries written before verbatim paths were simplified still hold
+/// `\?\C:\...` roots; they load in the plain form, so they compare and
+/// display like new entries, and the next write persists the plain form.
+#[test]
+fn registry_normalizes_verbatim_paths_written_by_older_versions() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    let reg = home.path().join("registry.json");
+    std::env::set_var("AMT_REGISTRY", &reg);
+    std::fs::write(
+        &reg,
+        // JSON-escaped: \\\\?\\C:\\Users\\me\\proj is the string \\?\C:\Users\me\proj.
+        r#"{"workspaces":{"old":"\\\\?\\C:\\Users\\me\\proj","unc":"\\\\?\\UNC\\srv\\share\\p","plain":"C:\\x"}}"#,
+    )
+    .unwrap();
+    let map = registry::load().unwrap();
+    assert_eq!(map["old"], r"C:\Users\me\proj");
+    assert_eq!(map["unc"], r"\\srv\share\p");
+    assert_eq!(map["plain"], r"C:\x");
+
+    // A later write rewrites every entry in the plain form.
+    let repo = TempDir::new().unwrap();
+    db::init(repo.path(), "new", "NEW").unwrap();
+    registry::add("new", repo.path()).unwrap();
+    let text = std::fs::read_to_string(&reg).unwrap();
+    assert!(!text.contains('?'), "{text}");
+    std::env::remove_var("AMT_REGISTRY");
+}
+
+/// Registry read-modify-writes are serialized and atomic: N concurrent adds
+/// must all land (a lost update drops entries) and leave no temp files behind.
+#[test]
+fn concurrent_registry_adds_lose_no_entries() {
+    let _guard = REGISTRY_ENV.lock().unwrap();
+    let home = TempDir::new().unwrap();
+    let reg = home.path().join("registry.json");
+    std::env::set_var("AMT_REGISTRY", &reg);
+
+    const N: usize = 16;
+    let repos: Vec<TempDir> = (0..N)
+        .map(|i| {
+            let d = TempDir::new().unwrap();
+            db::init(d.path(), &format!("ws{i}"), "WS").unwrap();
+            d
+        })
+        .collect();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+    std::thread::scope(|s| {
+        for (i, repo) in repos.iter().enumerate() {
+            let barrier = barrier.clone();
+            s.spawn(move || {
+                barrier.wait();
+                registry::add(&format!("ws{i}"), repo.path()).unwrap();
+            });
+        }
+    });
+    let map = registry::load().unwrap();
+    assert_eq!(map.len(), N, "lost updates: {:?}", map.keys());
+    for i in 0..N {
+        assert!(map.contains_key(&format!("ws{i}")));
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    // Concurrent removes serialize too.
+    std::thread::scope(|s| {
+        for i in 0..N {
+            s.spawn(move || {
+                assert!(registry::remove(&format!("ws{i}")).unwrap());
+            });
+        }
+    });
+    assert!(registry::load().unwrap().is_empty());
+    std::env::remove_var("AMT_REGISTRY");
+}
+
 #[test]
 fn registry_round_trips_and_rejects_non_workspaces() {
     let _guard = REGISTRY_ENV.lock().unwrap();
@@ -1171,13 +1251,14 @@ fn registry_round_trips_and_rejects_non_workspaces() {
     assert_eq!(
         registry::load().unwrap().get("proj").map(String::as_str),
         Some(
-            repo.path()
-                .canonicalize()
+            amt::paths::canonicalize(repo.path())
                 .unwrap()
                 .to_string_lossy()
                 .as_ref()
         )
     );
+    // The stored path is the plain form, never the verbatim one.
+    assert!(!registry::load().unwrap()["proj"].starts_with(r"\\?\"));
 
     // a directory with no .ametrite workspace is rejected
     let empty = TempDir::new().unwrap();
@@ -1234,7 +1315,8 @@ fn requeue_cooldown_blocks_self_but_not_others() {
         .unwrap()
         .unwrap();
     assert_eq!(again.id, "AMT-1");
-    // explicit claim of a specific issue always bypasses cooldown
+    // an explicit claim of a specific issue honors the cooldown too (it must
+    // not be a back door around claim_next's rules)…
     store::release_issue(
         &mut conn,
         "AMT-1",
@@ -1244,8 +1326,179 @@ fn requeue_cooldown_blocks_self_but_not_others() {
         store::ReleaseOpts::default(),
     )
     .unwrap();
-    let explicit = store::claim_issue(&mut conn, "AMT-1", "agent-b", 900).unwrap();
-    assert_eq!(explicit.claimed_by.as_deref(), Some("agent-b"));
+    assert!(matches!(
+        store::try_claim_issue(&mut conn, "AMT-1", "agent-b", 900, 3600).unwrap(),
+        store::IssueClaim::Refused(r) if r.contains("cooldown")
+    ));
+    // …but another agent, or cooldown 0, gets it.
+    assert!(matches!(
+        store::try_claim_issue(&mut conn, "AMT-1", "agent-c", 900, 3600).unwrap(),
+        store::IssueClaim::Claimed(_)
+    ));
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "agent-c",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
+    let explicit = match store::try_claim_issue(&mut conn, "AMT-1", "agent-c", 900, 0).unwrap() {
+        store::IssueClaim::Claimed(i) => i,
+        other => panic!("cooldown 0 should allow the claim: {other:?}"),
+    };
+    assert_eq!(explicit.claimed_by.as_deref(), Some("agent-c"));
+}
+
+/// Claim a specific issue with the requeue cooldown off, asserting it worked.
+fn claim_ignoring_cooldown(conn: &mut rusqlite::Connection, key: &str, agent: &str) {
+    match store::try_claim_issue(conn, key, agent, 900, 0).unwrap() {
+        store::IssueClaim::Claimed(_) => {}
+        store::IssueClaim::Refused(r) => panic!("claim {key} refused: {r}"),
+    }
+}
+
+fn move_to(conn: &mut Connection, key: &str, status: &str, who: &str) {
+    store::update_issue(
+        conn,
+        key,
+        store::IssuePatch {
+            status: Some(status.into()),
+            ..Default::default()
+        },
+        who,
+    )
+    .unwrap();
+}
+
+fn refusal(conn: &mut Connection, key: &str, agent: &str) -> String {
+    match store::try_claim_issue(conn, key, agent, 900, 3600).unwrap() {
+        store::IssueClaim::Refused(r) => r,
+        store::IssueClaim::Claimed(i) => panic!("{key} should be refused, got {i:?}"),
+    }
+}
+
+#[test]
+fn claim_issue_renews_only_a_live_in_progress_lease() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Work", "", "high")).unwrap(); // AMT-1
+    store::claim_issue(&mut conn, "AMT-1", "alice", 60).unwrap();
+    let before = store::get_issue(&conn, "AMT-1").unwrap();
+    // Happy path: the holder's heartbeat extends the lease.
+    let renewed = store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    assert_eq!(renewed.status, "in_progress");
+    assert_eq!(renewed.claimed_by.as_deref(), Some("alice"));
+    assert!(renewed.claim_expires_at > before.claim_expires_at);
+    // Another agent is refused while the lease is live, and the lease is untouched.
+    let why = refusal(&mut conn, "AMT-1", "bob");
+    assert!(why.contains("claimed by alice"), "{why}");
+    assert_eq!(
+        store::get_issue(&conn, "AMT-1")
+            .unwrap()
+            .claimed_by
+            .as_deref(),
+        Some("alice")
+    );
+}
+
+#[test]
+fn claim_issue_does_not_reopen_in_review_or_done_work() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Reviewed", "", "high")).unwrap(); // AMT-1
+    store::create_issue(&mut conn, new_issue("Finished", "", "high")).unwrap(); // AMT-2
+    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    // The holder (a gate) moves it to in_review, which ends the lease; the
+    // heartbeat that follows must not flip it back to in_progress.
+    move_to(&mut conn, "AMT-1", "in_review", "alice");
+    let why = refusal(&mut conn, "AMT-1", "alice");
+    assert!(why.contains("in_review"), "{why}");
+    let after = store::get_issue(&conn, "AMT-1").unwrap();
+    assert_eq!(after.status, "in_review");
+    assert!(after.claimed_by.is_none());
+
+    // A done issue is not claimable by anyone.
+    move_to(&mut conn, "AMT-2", "done", "alice");
+    let why = refusal(&mut conn, "AMT-2", "bob");
+    assert!(why.contains("done"), "{why}");
+    assert_eq!(store::get_issue(&conn, "AMT-2").unwrap().status, "done");
+    // The error-returning wrapper reports the same refusal.
+    assert!(store::claim_issue(&mut conn, "AMT-2", "bob", 900).is_err());
+}
+
+#[test]
+fn claim_issue_refuses_a_dependency_blocked_issue() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap(); // AMT-1
+    store::create_issue(&mut conn, new_issue("Blocked", "", "high")).unwrap(); // AMT-2
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "t").unwrap();
+    let why = refusal(&mut conn, "AMT-2", "alice");
+    assert!(
+        why.contains("waiting on open blocker") && why.contains("AMT-1"),
+        "{why}"
+    );
+    assert_eq!(store::get_issue(&conn, "AMT-2").unwrap().status, "backlog");
+    // Once the blocker closes, the same claim succeeds.
+    move_to(&mut conn, "AMT-1", "done", "t");
+    assert!(matches!(
+        store::try_claim_issue(&mut conn, "AMT-2", "alice", 900, 3600).unwrap(),
+        store::IssueClaim::Claimed(_)
+    ));
+}
+
+#[test]
+fn claim_issue_takes_over_an_expired_lease_but_not_a_cooled_down_issue() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Stalled", "", "high")).unwrap(); // AMT-1
+    store::claim_issue(&mut conn, "AMT-1", "ghost", -1).unwrap();
+    // A stalled in_progress lease is claimable, as claim_next would serve it.
+    assert!(matches!(
+        store::try_claim_issue(&mut conn, "AMT-1", "bob", 900, 3600).unwrap(),
+        store::IssueClaim::Claimed(i) if i.claimed_by.as_deref() == Some("bob")
+    ));
+    store::release_issue(
+        &mut conn,
+        "AMT-1",
+        "bob",
+        "todo",
+        None,
+        store::ReleaseOpts::default(),
+    )
+    .unwrap();
+    let why = refusal(&mut conn, "AMT-1", "bob");
+    assert!(why.contains("cooldown"), "{why}");
+}
+
+/// `ok` is the fold over GATING checks only: a stale claim or a link to a note
+/// that does not exist yet is reported but must not fail health gates.
+#[test]
+fn doctor_ok_ignores_stale_claims_and_unresolved_links() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(
+        &mut conn,
+        new_issue("Linky", "See [[Not Written Yet]]", "high"),
+    )
+    .unwrap(); // AMT-1
+    store::create_issue(&mut conn, new_issue("Stalled", "", "high")).unwrap(); // AMT-2
+    store::claim_issue(&mut conn, "AMT-2", "ghost", -1).unwrap();
+
+    let report = store::doctor(&conn).unwrap();
+    assert_eq!(report.unresolved_links.len(), 1);
+    assert_eq!(report.stale_claims.len(), 1);
+    assert!(report.ok, "informational findings must not flip ok");
+    assert!(!report.is_clean());
+
+    // A gating finding still fails it: a done issue left holding a lease.
+    conn.execute(
+        "UPDATE issues SET status = 'done', claimed_by = 'ghost',
+            claim_expires_at = '2999-01-01T00:00:00.000Z'
+         WHERE doc_id = (SELECT doc_id FROM documents WHERE id = 'AMT-1')",
+        [],
+    )
+    .unwrap();
+    let report = store::doctor(&conn).unwrap();
+    assert_eq!(report.closed_leases.len(), 1);
+    assert!(!report.ok);
 }
 
 fn new_note(title: &str, body: &str) -> store::NewNote {
@@ -1944,12 +2197,13 @@ fn blocked_by_dep_is_disjoint_from_lease_bucket() {
     store::create_issue(&mut conn, new_issue("Blocker", "", "high")).unwrap(); // AMT-1
     store::create_issue(&mut conn, new_issue("Leased+blocked", "", "high")).unwrap(); // AMT-2
     store::create_issue(&mut conn, new_issue("Only blocked", "", "high")).unwrap(); // AMT-3
-                                                                                    // AMT-1 blocks both AMT-2 and AMT-3.
-    store::add_block(&mut conn, "AMT-1", "AMT-2", "t").unwrap();
-    store::add_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
-    // AMT-2 is ALSO held under a live lease; AMT-1 gets claimed too.
+                                                                                    // AMT-2 is held under a live lease (taken before the edge exists: a
+                                                                                    // blocked issue can't be claimed); AMT-1 gets claimed too.
     store::claim_issue(&mut conn, "AMT-2", "other", 900).unwrap();
     store::claim_issue(&mut conn, "AMT-1", "agent-a", 900).unwrap();
+    // AMT-1 blocks both AMT-2 and AMT-3.
+    store::add_block(&mut conn, "AMT-1", "AMT-2", "t").unwrap();
+    store::add_block(&mut conn, "AMT-1", "AMT-3", "t").unwrap();
 
     let nw = store::no_work_reason(&conn, "agent-b", 3600, &any()).unwrap();
     // AMT-1 + AMT-2 are under live leases.
@@ -2102,7 +2356,7 @@ fn agents_completed_dedupes_reopened_issue() {
         "alice",
     )
     .unwrap();
-    store::claim_issue(&mut conn, "AMT-1", "alice", 900).unwrap();
+    claim_ignoring_cooldown(&mut conn, "AMT-1", "alice");
     store::release_issue(
         &mut conn,
         "AMT-1",
@@ -2511,6 +2765,58 @@ fn schema_version_on_disk(path: &std::path::Path) -> String {
             |r| r.get(0),
         )
         .unwrap()
+}
+
+/// A second opener that read the schema version BEFORE a concurrent opener
+/// migrated must find the step already applied and no-op, not re-run it and
+/// die on "table ... already exists".
+#[test]
+fn migrate_skips_steps_a_concurrent_opener_already_applied() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "race", "AMT").unwrap();
+    downgrade_to_v4(&path);
+
+    let conn1 = Connection::open(&path).unwrap();
+    let conn2 = Connection::open(&path).unwrap();
+    // Both openers read version 4; conn1 wins the race and migrates.
+    db::migrate(&conn1, 4).unwrap();
+    assert_eq!(schema_version_on_disk(&path), "5");
+    // conn2 still believes 4: the locked re-read must skip the applied step.
+    db::migrate(&conn2, 4).unwrap();
+    assert_eq!(schema_version_on_disk(&path), "5");
+    // The rollup tables survive untouched (no half-run second attempt).
+    conn2
+        .execute(
+            "INSERT INTO agent_rollup(agent, claims) VALUES ('a', 1)",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn concurrent_opens_of_a_stale_workspace_all_succeed() {
+    let dir = TempDir::new().unwrap();
+    let path = db::init(dir.path(), "race", "AMT").unwrap();
+    downgrade_to_v3(&path);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let (path, barrier) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db::open(&path).map(|_| ()).map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join()
+            .unwrap()
+            .expect("every concurrent open migrates or no-ops");
+    }
+    assert_eq!(
+        schema_version_on_disk(&path),
+        db::SCHEMA_VERSION.to_string()
+    );
 }
 
 #[test]
@@ -3233,7 +3539,7 @@ fn no_cooldown_lets_the_previous_holder_reclaim_immediately() {
     );
 
     // Re-claim and reset properly this time.
-    store::claim_issue(&mut conn, "AMT-1", "sirius/oak", 900).unwrap();
+    claim_ignoring_cooldown(&mut conn, "AMT-1", "sirius/oak");
     store::release_issue(
         &mut conn,
         "AMT-1",

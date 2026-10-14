@@ -7,6 +7,7 @@
 use crate::db;
 use crate::error::{msg, Result};
 use crate::model::{priority_rank, Issue};
+use crate::paths;
 use crate::store;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -36,47 +37,95 @@ pub fn load() -> Result<BTreeMap<String, String>> {
     if let Some(obj) = value.get("workspaces").and_then(|w| w.as_object()) {
         for (alias, root) in obj {
             if let Some(root) = root.as_str() {
-                map.insert(alias.clone(), root.to_string());
+                // Entries written by older versions hold `\\?\C:\...` verbatim
+                // paths (from `canonicalize`); present them in the plain form so
+                // they compare and display like new ones.
+                map.insert(alias.clone(), paths::simplify_str(root));
             }
         }
     }
     Ok(map)
 }
 
+/// Write the registry atomically: a temp file in the same directory, then a
+/// rename over the real file, so a concurrent reader (or a crash) sees either
+/// the old registry or the new one, never a truncated file.
 fn save(map: &BTreeMap<String, String>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let path = registry_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let value = serde_json::json!({ "workspaces": map });
-    std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
-    Ok(())
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "registry.json".into());
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = std::fs::write(&tmp, serde_json::to_string_pretty(&value)?)
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(result?)
+}
+
+/// Run a registry read-modify-write while holding an exclusive OS lock on a
+/// sidecar `<registry>.lock` file, so two `amt init`/`ws add` runs cannot both
+/// read the old map and have the later write erase the earlier entry. The lock
+/// is released when the file handle drops (including on a crash).
+fn with_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let path = registry_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "registry.json".into());
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(format!("{name}.lock")))?;
+    lock.lock()?;
+    let result = f();
+    let _ = lock.unlock();
+    result
 }
 
 /// Register a workspace root under an alias. Overwrites the alias if the
 /// path changed; no-ops if already identical.
 pub fn add(alias: &str, root: &Path) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .map_err(|_| msg(format!("{} does not exist", root.display())))?;
+    let root =
+        paths::canonicalize(root).map_err(|_| msg(format!("{} does not exist", root.display())))?;
     if !root.join(db::DB_DIR).join(db::DB_FILE).is_file() {
         return Err(msg(format!(
             "{} has no .ametrite workspace (run `amt init` there first)",
             root.display()
         )));
     }
-    let mut map = load()?;
-    map.insert(alias.to_string(), root.to_string_lossy().into_owned());
-    save(&map)
+    with_lock(|| {
+        let mut map = load()?;
+        map.insert(alias.to_string(), root.to_string_lossy().into_owned());
+        save(&map)
+    })
 }
 
 pub fn remove(alias: &str) -> Result<bool> {
-    let mut map = load()?;
-    let existed = map.remove(alias).is_some();
-    if existed {
-        save(&map)?;
-    }
-    Ok(existed)
+    with_lock(|| {
+        let mut map = load()?;
+        let existed = map.remove(alias).is_some();
+        if existed {
+            save(&map)?;
+        }
+        Ok(existed)
+    })
 }
 
 /// Best-effort auto-registration (used by `amt init`): never fails the

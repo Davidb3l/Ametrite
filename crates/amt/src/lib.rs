@@ -4,6 +4,7 @@ pub mod export;
 pub mod git;
 pub mod mcp;
 pub mod model;
+pub mod paths;
 pub mod registry;
 pub mod serve;
 pub mod store;
