@@ -10,6 +10,8 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-20
+
 Hardening for fleets that drive `amt` from a foreman. `claim --issue` can no
 longer reopen finished work, the Windows board launcher stops tripping over
 verbatim paths, and the registry and schema migration are safe when several
@@ -290,7 +292,8 @@ running, or it uses another port.
   every request until a restart. The stale connection is reopened and the read
   retried once. (AMT-27; f1ef40b)
 
-[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Davidb3l/Ametrite/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Davidb3l/Ametrite/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Davidb3l/Ametrite/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...v0.4.0
