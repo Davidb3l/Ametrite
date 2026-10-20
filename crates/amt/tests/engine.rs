@@ -1469,6 +1469,33 @@ fn claim_issue_takes_over_an_expired_lease_but_not_a_cooled_down_issue() {
     assert!(why.contains("cooldown"), "{why}");
 }
 
+/// A pre-AMT-46 row: `todo` but still holding a lease. Neither arm of the
+/// claimable predicate accepts it, and the refusal must say so instead of
+/// blaming a cooldown that does not apply.
+#[test]
+fn claim_issue_refusal_names_a_leftover_lease_not_a_cooldown() {
+    let (_d, mut conn) = workspace();
+    store::create_issue(&mut conn, new_issue("Legacy", "", "high")).unwrap(); // AMT-1
+    store::claim_issue(&mut conn, "AMT-1", "ghost", -1).unwrap();
+    conn.execute(
+        "UPDATE issues SET status = 'todo' WHERE doc_id = (SELECT doc_id FROM documents WHERE id = 'AMT-1')",
+        [],
+    )
+    .unwrap();
+    for agent in ["ghost", "bob"] {
+        let why = refusal(&mut conn, "AMT-1", agent);
+        assert!(
+            why.contains("leftover lease") && why.contains("ghost") && why.contains("todo"),
+            "{why}"
+        );
+        assert!(!why.contains("cooldown"), "{why}");
+    }
+    // The issue itself is untouched.
+    let after = store::get_issue(&conn, "AMT-1").unwrap();
+    assert_eq!(after.status, "todo");
+    assert_eq!(after.claimed_by.as_deref(), Some("ghost"));
+}
+
 /// `ok` is the fold over GATING checks only: a stale claim or a link to a note
 /// that does not exist yet is reported but must not fail health gates.
 #[test]
@@ -2793,6 +2820,81 @@ fn migrate_skips_steps_a_concurrent_opener_already_applied() {
         .unwrap();
 }
 
+fn archive_version_on_disk(path: &std::path::Path) -> String {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key='archive_schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Two archive openers both read v1; the loser, once the winner has migrated,
+/// must find the rebuild already applied and no-op (not die on
+/// "table activity_new already exists" or rebuild twice).
+#[test]
+fn migrate_archive_skips_a_step_a_concurrent_opener_already_applied() {
+    let dir = TempDir::new().unwrap();
+    let apath = dir.path().join("archive.db");
+    {
+        let c = Connection::open(&apath).unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES ('archive_schema_version', '1');
+             CREATE TABLE activity (
+               issue_key TEXT NOT NULL, seq INTEGER NOT NULL, at TEXT NOT NULL,
+               author TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+               archived_at TEXT NOT NULL, PRIMARY KEY (issue_key, seq));
+             INSERT INTO activity VALUES
+               ('OLD-1', 1, '2026-01-01T00:00:00.000Z', 'worker', 'event', 'created', 'x');",
+        )
+        .unwrap();
+    }
+    let conn1 = Connection::open(&apath).unwrap();
+    let conn2 = Connection::open(&apath).unwrap();
+    // Both openers read version 1; conn1 wins the race and migrates.
+    db::migrate_archive(&conn1, 1).unwrap();
+    assert_eq!(archive_version_on_disk(&apath), "2");
+    // A row only the v2 key allows, plus a marker index, written between the
+    // two migrations. A stale opener that re-ran the rebuild would drop the
+    // marker (the table is recreated), so its survival proves the step was skipped.
+    conn1
+        .execute(
+            "INSERT INTO activity VALUES ('OLD-1', 1, '2026-02-02T00:00:00.000Z', 'other', 'event', 'second', 'x')",
+            [],
+        )
+        .unwrap();
+    conn1
+        .execute_batch("CREATE INDEX rebuild_marker ON activity(body);")
+        .unwrap();
+    // conn2 still believes v1: the locked re-read must skip the applied step.
+    db::migrate_archive(&conn2, 1).unwrap();
+    assert_eq!(archive_version_on_disk(&apath), "2");
+    let n: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM activity", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "no row lost or duplicated");
+    // No leftover scratch table, and the write lock was released.
+    let scratch: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'activity_new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(scratch, 0);
+    let marker: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'rebuild_marker'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 1, "the second opener must not rebuild the table");
+    conn2.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+}
 #[test]
 fn concurrent_opens_of_a_stale_workspace_all_succeed() {
     let dir = TempDir::new().unwrap();

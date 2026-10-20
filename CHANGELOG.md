@@ -80,6 +80,15 @@ claims or unresolved links.
   `$BUN_INSTALL/bin` and `~/.bun/bin` (where Bun's installer puts it, often not
   yet on PATH), and when none has it, the error lists every location it
   searched.
+- Opening an old (v1) `archive.db` from two `amt` processes at once could fail
+  or rebuild the table twice. The archive upgrade now takes the write lock,
+  re-checks the archive's version under it, skips a step another process
+  already applied, and rolls back on error, as the main database's upgrade
+  already did.
+- `claim --issue` refusals for an issue that carries a lease while not
+  in_progress (rows from before AMT-46) wrongly said it was in your requeue
+  cooldown. The message now names the leftover lease, and says "not claimable
+  right now" if no known cause applies. The refusal itself is unchanged.
 
 ## [0.4.2] - 2026-10-11
 
