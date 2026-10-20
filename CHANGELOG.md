@@ -30,6 +30,10 @@ claims or unresolved links.
   only says "workspace healthy" when there are none.
 - `claim --ttl` (and the MCP `ttl_seconds`) must be at least 1 second. `--ttl 0`
   used to create a lease that was already expired.
+- Release binaries are built with Rust 1.99.1 (was 1.99.0), and the lockfile
+  moves to the latest compatible versions of every dependency (cc, libc, syn,
+  memchr, and others). The bundled SQLite engine is unchanged. No behavior
+  change.
 
 ### Fixed
 
