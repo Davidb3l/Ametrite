@@ -16,7 +16,7 @@ jobs:
       # Keep this ref in lockstep with rust-toolchain.toml — the action
       # overrides the file, and a floating `stable` here once let a new
       # rustfmt drift the tree and break the fmt gate.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -75,6 +75,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --release --example bench

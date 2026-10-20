@@ -10,6 +10,8 @@ break things). Issue keys (`AMT-29`) refer to the project's own Ametrite board.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-20
+
 Hardening for fleets that drive `amt` from a foreman. `claim --issue` can no
 longer reopen finished work, the Windows board launcher stops tripping over
 verbatim paths, and the registry and schema migration are safe when several
@@ -30,6 +32,10 @@ claims or unresolved links.
   only says "workspace healthy" when there are none.
 - `claim --ttl` (and the MCP `ttl_seconds`) must be at least 1 second. `--ttl 0`
   used to create a lease that was already expired.
+- Release binaries are built with Rust 1.99.1 (was 1.99.0), and the lockfile
+  moves to the latest compatible versions of every dependency (cc, libc, syn,
+  memchr, and others). The bundled SQLite engine is unchanged. No behavior
+  change.
 
 ### Fixed
 
@@ -74,6 +80,15 @@ claims or unresolved links.
   `$BUN_INSTALL/bin` and `~/.bun/bin` (where Bun's installer puts it, often not
   yet on PATH), and when none has it, the error lists every location it
   searched.
+- Opening an old (v1) `archive.db` from two `amt` processes at once could fail
+  or rebuild the table twice. The archive upgrade now takes the write lock,
+  re-checks the archive's version under it, skips a step another process
+  already applied, and rolls back on error, as the main database's upgrade
+  already did.
+- `claim --issue` refusals for an issue that carries a lease while not
+  in_progress (rows from before AMT-46) wrongly said it was in your requeue
+  cooldown. The message now names the leftover lease, and says "not claimable
+  right now" if no known cause applies. The refusal itself is unchanged.
 
 ## [0.4.2] - 2026-10-11
 
@@ -286,7 +301,8 @@ running, or it uses another port.
   every request until a restart. The stale connection is reopened and the read
   retried once. (AMT-27; f1ef40b)
 
-[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Davidb3l/Ametrite/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Davidb3l/Ametrite/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Davidb3l/Ametrite/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Davidb3l/Ametrite/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Davidb3l/Ametrite/compare/v0.3.0...v0.4.0

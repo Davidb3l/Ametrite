@@ -438,23 +438,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS activity_row
 UPDATE meta SET value = '2' WHERE key = 'archive_schema_version';
 "#;
 
+/// Read the archive's schema version; a missing or unparseable row is v1.
+fn archive_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key='archive_schema_version'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(1)
+}
+
+/// Bring the archive up to v2, starting from `version`.
+///
+/// Like [`migrate`], `version` is only a hint read before any lock was held:
+/// the step takes the write lock (`BEGIN IMMEDIATE`), re-reads the version
+/// under it, and skips the rebuild if another opener already applied it
+/// (otherwise the loser dies on "table activity_new already exists"). An error
+/// rolls the whole step back.
+pub fn migrate_archive(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 2 {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = if archive_version(conn) < 2 {
+        conn.execute_batch(ARCHIVE_MIGRATE_V1_V2)
+    } else {
+        Ok(())
+    };
+    match step {
+        Ok(()) => Ok(conn.execute_batch("COMMIT;")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e.into())
+        }
+    }
+}
+
 /// Open (creating on first use) the archive side database.
 pub fn open_archive(archive_path: &Path) -> Result<Connection> {
     let conn = Connection::open(archive_path)?;
     conn.pragma_update(None, "busy_timeout", 10_000)?;
     conn.execute_batch(ARCHIVE_SCHEMA)?;
-    let version: i64 = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='archive_schema_version'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    if version < 2 {
-        conn.execute_batch(&format!("BEGIN;{ARCHIVE_MIGRATE_V1_V2}COMMIT;"))?;
-    }
+    migrate_archive(&conn, archive_version(&conn))?;
     Ok(conn)
 }
 

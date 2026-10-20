@@ -1183,10 +1183,27 @@ fn refusal_reason(
             open.join(", ")
         ));
     }
-    Ok(format!(
-        "'{}' is in your requeue cooldown (you released it recently)",
-        issue.id
-    ))
+    // Stage, lease and blockers all allow it. Name the cooldown only if it is
+    // what actually excludes the issue: with the cooldown off, would it pass?
+    let now = db::now(tx)?;
+    if claimable_key_in(tx, &now, &issue.id, agent, 0, &ClaimFilter::any())?.is_some() {
+        return Ok(format!(
+            "'{}' is in your requeue cooldown (you released it recently)",
+            issue.id
+        ));
+    }
+    // Still refused with no cooldown: a leftover lease on an issue that is not
+    // in_progress (rows from before AMT-46), which neither arm of the claimable
+    // predicate accepts.
+    if let (Some(holder), Some(expires)) = (&issue.claimed_by, &issue.claim_expires_at) {
+        return Ok(format!(
+            "'{}' is {} but still carries a leftover lease ({holder}, until {expires}); \
+             a lease only counts while the issue is in_progress, so it can be neither \
+             claimed nor renewed",
+            issue.id, issue.status
+        ));
+    }
+    Ok(format!("'{}' is not claimable right now", issue.id))
 }
 
 /// [`try_claim_issue`] with the default cooldown, a refusal as an error.
